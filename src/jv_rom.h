@@ -5,12 +5,20 @@
 
 namespace jv {
 
-static const int    PATCH_SIZE   = 0x16a;   // 362 = 26 common + 4 * 84 tone
-static const size_t ROM1_BYTES   = 0x8000;
-static const size_t ROM2_BYTES   = 0x40000;
-static const size_t WAVE_BYTES   = 0x200000;
-static const size_t NVRAM_BYTES  = 0x8000;
+static const int    PATCH_SIZE            = 0x16a;   // 362 = 26 common + 4 * 84 tone
+static const size_t ROM1_BYTES            = 0x8000;
+static const size_t ROM2_BYTES            = 0x40000;
+static const size_t WAVE_BYTES            = 0x200000;
+static const size_t NVRAM_BYTES           = 0x8000;
+static const int    PATCHES_PER_BANK      = 64;   // Preset A / Preset B / Internal
+static const int    MAX_EXPANSION_PATCHES = 256;  // sanity bound on a parsed patch_count
 
+// PatchRef::data points into memory owned by the RomSet (for internal
+// patches) or Expansion (for expansion-board patches) that produced it.
+// The pointer is valid only as long as that owning object is alive and has
+// not been reloaded, reassigned, or moved from. In particular, taking
+// PatchRef's from a temporary Expansion (e.g. an rvalue that is never
+// stored) leaves them dangling once the temporary is destroyed.
 struct PatchRef {
     std::string name;       // trimmed 12-char ROM name
     std::string bank;       // "A", "B", "Internal", or board name

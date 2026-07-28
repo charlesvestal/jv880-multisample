@@ -13,6 +13,11 @@ static bool read_file(const std::string &path, std::vector<uint8_t> *out,
     if (!f) { if (err) *err = "cannot open " + path; return false; }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
+    if (sz < 0) {
+        if (err) *err = "ftell failed " + path;
+        fclose(f);
+        return false;
+    }
     fseek(f, 0, SEEK_SET);
     if (expected && (size_t)sz != expected) {
         if (err) *err = "size mismatch " + path;
@@ -31,10 +36,16 @@ bool RomSet::load(const std::string &dir, std::string *err) {
     if (!read_file(dir + "/jv880_rom2.bin",     &rom2,     ROM2_BYTES, err)) return false;
     if (!read_file(dir + "/jv880_waverom1.bin", &waverom1, WAVE_BYTES, err)) return false;
     if (!read_file(dir + "/jv880_waverom2.bin", &waverom2, WAVE_BYTES, err)) return false;
+    // NVRAM is optional; default to 0xFF fill. If present but the wrong size,
+    // say so rather than silently dropping it.
     nvram.assign(NVRAM_BYTES, 0xFF);
     std::vector<uint8_t> nv;
-    if (read_file(dir + "/jv880_nvram.bin", &nv, 0, nullptr) && nv.size() == NVRAM_BYTES)
-        nvram = nv;
+    std::string nv_err;
+    if (read_file(dir + "/jv880_nvram.bin", &nv, NVRAM_BYTES, &nv_err)) {
+        nvram = std::move(nv);
+    } else if (nv_err.rfind("cannot open", 0) != 0) {
+        fprintf(stderr, "warning: %s; using default nvram\n", nv_err.c_str());
+    }
     return true;
 }
 
@@ -51,9 +62,16 @@ std::vector<PatchRef> enumerate_internal(const RomSet &roms) {
         {"B",        0x018ce0},
         {"Internal", 0x008ce0},
     };
+    // Guard against a partially-loaded RomSet (e.g. caller ignored a false
+    // return from RomSet::load): verify every bank fits inside rom2 before
+    // doing any pointer arithmetic on it.
+    for (const auto &b : banks) {
+        size_t need = (size_t)b.off + (size_t)PATCHES_PER_BANK * PATCH_SIZE;
+        if (roms.rom2.size() < need) return {};
+    }
     std::vector<PatchRef> out;
     for (const auto &b : banks) {
-        for (int i = 0; i < 64; i++) {
+        for (int i = 0; i < PATCHES_PER_BANK; i++) {
             const uint8_t *p = roms.rom2.data() + b.off + (uint32_t)i * PATCH_SIZE;
             PatchRef r;
             r.name  = trim_patch_name(p);
@@ -115,13 +133,15 @@ bool load_expansion(const std::string &path, Expansion *out, std::string *err) {
 
     size_t need = (size_t)out->patches_offset +
                   (size_t)out->patch_count * PATCH_SIZE;
-    out->usable = out->patch_count > 0 && out->patch_count <= 256 &&
+    out->usable = out->patch_count > 0 && out->patch_count <= MAX_EXPANSION_PATCHES &&
                   out->patches_offset < out->unscrambled.size() &&
                   need <= out->unscrambled.size();
 
-    if (!out->usable && err)
-        *err = out->name + ": unusable (patch_count=" +
-               std::to_string(out->patch_count) + ")";
+    // usable == false is a legitimate, expected outcome for some boards
+    // (e.g. SR-JV80-97/98 report patch_count == 0) — it is not a load
+    // failure, so `err` is left untouched and the function still returns
+    // true. Callers that want a diagnostic for unusable boards should check
+    // Expansion::usable themselves (scan_expansions does this).
     return true;
 }
 
@@ -135,7 +155,9 @@ std::vector<Expansion> scan_expansions(const std::string &dir) {
         std::string ext = n.substr(n.size() - 4);
         for (auto &c : ext) c = (char)tolower((unsigned char)c);
         if (ext != ".bin") continue;
-        if (n.find("SR-JV80") == std::string::npos) continue;
+        std::string upper = n;
+        for (auto &c : upper) c = (char)toupper((unsigned char)c);
+        if (upper.find("SR-JV80") == std::string::npos) continue;
         files.push_back(dir + "/" + n);
     }
     closedir(d);
@@ -145,8 +167,14 @@ std::vector<Expansion> scan_expansions(const std::string &dir) {
     for (const auto &f : files) {
         Expansion e;
         std::string err;
-        if (load_expansion(f, &e, &err)) out.push_back(std::move(e));
-        else fprintf(stderr, "skip %s: %s\n", f.c_str(), err.c_str());
+        if (!load_expansion(f, &e, &err)) {
+            fprintf(stderr, "skip %s: %s\n", f.c_str(), err.c_str());
+            continue;
+        }
+        if (!e.usable)
+            fprintf(stderr, "unusable: %s (patch_count=%d)\n",
+                    e.name.c_str(), e.patch_count);
+        out.push_back(std::move(e));
     }
     return out;
 }
