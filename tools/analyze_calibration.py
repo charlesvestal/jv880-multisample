@@ -67,6 +67,34 @@ real candidate, at every window/hop tried. Per the task's own instruction
 and explain, rather than inventing a number"), that one entry is omitted
 from chorus_rate_hz with a warning printed, rather than reporting a number
 we know is dominated by a non-chorus artifact.
+
+--- IMPORTANT for anything (Task 6 or otherwise) consuming calibration.json -
+
+1. chorusrate raw=24 is an intentional INTERPOLATION GAP, not a zero and
+   not "no chorus at this setting". A naive `table.get("24")` or `table[24]`
+   read against chorus_rate_hz will come back missing/None -- a consumer
+   that doesn't handle that could silently produce 0 Hz for a setting the
+   real hardware clearly does modulate at some nonzero rate we just
+   couldn't pin down cleanly (see point 4 above). The correct handling is
+   to interpolate between the neighbouring present raw values (16 -> 0.7782
+   Hz, 32 -> 0.9009 Hz), the same way every OTHER raw value in between the
+   sampled step-8/step-16 points already has to be interpolated. Task 6's
+   `interp_table` does this correctly by construction (it interpolates
+   between whatever keys are present); this note exists so a future change
+   to that interpolation logic can't silently start treating a missing key
+   as 0 instead.
+
+2. reverb_rt60 type 4 (Hall1) has a genuine, well-measured (R^2 = 0.88-0.96
+   across 700-900 fit points, reproduced identically across many analysis
+   parameter choices -- not a fitting artifact) local DIP: RT60 at raw=32
+   (1.8122s) is lower than at raw=16 (2.0773s), a ~13% relative decrease.
+   This is real device behaviour, not measurement noise to be smoothed
+   away. Per-raw-value interpolation reproduces the actual hardware
+   faithfully; fitting a smooth monotonic curve through the table instead
+   would trade fidelity for tidiness and make the calibration LESS
+   accurate, not more. Every other reverb type has similar small local
+   dips (see tests/test_calibration.py's RT60_REL_TOL comment) -- none of
+   this should be "corrected."
 """
 import glob
 import json
@@ -118,7 +146,18 @@ def load_lr_diff(path):
     sr, data = wavfile.read(path)
     assert sr == SR, f"unexpected sample rate {sr} in {path}"
     data = data.astype(np.float64)
-    if data.ndim < 2 or data.shape[1] < 2:
+    # Bind shape to a local and check len(shape) rather than data.ndim: at
+    # runtime these are equivalent, but pyright cannot narrow the union type
+    # scipy.io.wavfile.read returns (which includes both a 1-D and a 2-D
+    # ndarray variant) through a `data.ndim < 2 or data.shape[1] < 2`
+    # comparison, so it flags data.shape[1] as indexing past a 1-element
+    # tuple even though the `or` short-circuit makes that path unreachable
+    # at runtime. len(shape) < 2 narrows shape's type directly, which
+    # pyright does understand, so shape[1] below is verifiably safe rather
+    # than merely "safe because of evaluation order nobody is guaranteed to
+    # preserve on a future edit."
+    shape = data.shape
+    if len(shape) < 2 or shape[1] < 2:
         return np.zeros(len(data))
     return data[:, 0] - data[:, 1]
 
@@ -337,7 +376,7 @@ def measure_rt60(mono, hold_seconds=HOLD_SECONDS):
         return None   # tail never decayed through the -5..-35 dB window we need
 
     ts, dbs = t[mask], db[mask]
-    slope, _intercept = np.polyfit(ts, dbs, 1)
+    slope = np.polyfit(ts, dbs, 1)[0]   # degree-1 fit: only the slope is needed
     if slope >= -0.01:
         return None   # not actually decaying (flat/growing) -- can't extrapolate
     return float(-60.0 / slope)
