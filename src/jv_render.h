@@ -25,6 +25,15 @@ struct GridSpec {
 // no wall-clock reads, no RNG. mcu_ is an opaque MCU* (declared in mcu.h,
 // which lives outside this repo under JV_DSP) so this header never needs
 // that include path — only jv_render.cpp does.
+//
+// Call-order contract: init() must be called first and must return true
+// before load_patch_bytes() or render_note() are called — both dereference
+// the MCU that init() allocates, so calling either one first (or after a
+// failed init()) is undefined behavior (a null-pointer dereference in this
+// implementation; debug builds assert on it). init() may be called again on
+// an already-initialized Renderer — e.g. to reset emulator state — without
+// leaking the previous MCU (several MB): it is freed before the new one
+// replaces it.
 class Renderer {
 public:
     Renderer() = default;
@@ -32,12 +41,17 @@ public:
     Renderer(const Renderer &) = delete;
     Renderer &operator=(const Renderer &) = delete;
 
-    bool init(const RomSet &roms);                 // boot + warmup once
+    // Boots the emulator (via MCU::startSC55) and runs the warmup once.
+    // Returns false, and leaves any previously-initialized MCU untouched, if
+    // startSC55 reports failure — callers must check the return value before
+    // calling load_patch_bytes()/render_note().
+    bool init(const RomSet &roms);
 
     // Loads the 362 preprocessed patch bytes into NVRAM, sends the Program
     // Change that makes the firmware reload from NVRAM, then settles once
     // (design note A: the settle belongs here, not in render_note, so it
     // runs once per patch rather than once per rendered cell).
+    // Requires a prior successful init().
     void load_patch_bytes(const std::vector<uint8_t> &patch_bytes,
                           const GridSpec &g);
 
@@ -45,6 +59,7 @@ public:
     // early truncation once the signal sits quietly below the noise floor
     // for a sustained run), then All Notes Off plus a short discarded flush
     // so this cell's decay never bleeds into the next one (design note B).
+    // Requires a prior successful init().
     std::vector<int16_t> render_note(int key, int velocity, const GridSpec &g);
 
 private:

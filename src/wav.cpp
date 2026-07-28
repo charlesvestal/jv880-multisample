@@ -40,7 +40,13 @@ bool wav_write_s16(const std::string &path, const int16_t *interleaved,
         ok &= fwrite(interleaved, sizeof(int16_t), n, f) == n;
     }
 
-    fclose(f);
+    // fclose's result must be folded into the returned status, not just the
+    // fwrite checks above: stdio buffers writes, so a small/short file can
+    // have every fwrite() report success (the data only reached the
+    // userspace buffer) while the real error — e.g. ENOSPC — only surfaces
+    // when fclose() performs the final flush. Ignoring it here would let
+    // this function return true for a file that was never fully written.
+    if (fclose(f) != 0) ok = false;
     return ok;
 }
 

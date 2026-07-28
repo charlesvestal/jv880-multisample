@@ -12,6 +12,7 @@
 #include "wav.h"
 
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +24,10 @@
 using namespace jv;
 
 namespace {
+
+// Named so a typo in either the comparison or the --list header line can't
+// silently break board selection by disagreeing with each other.
+const char *BOARD_INTERNAL = "JV-880 Internal";
 
 const char *NOTE_NAMES[12] = {"C", "C#", "D", "D#", "E", "F",
                               "F#", "G", "G#", "A", "A#", "B"};
@@ -70,12 +75,25 @@ std::string json_escape(const std::string &s) {
     return o;
 }
 
-void mkdirs(const std::string &p) {
+// Recursively creates directory p (like `mkdir -p`). Returns false on the
+// first real failure (anything but EEXIST — each intermediate segment may
+// legitimately already exist). Checking this upfront, before the render,
+// means an unwritable output root is caught immediately instead of only
+// being discovered after paying for a full settle plus a 75-cell render,
+// when the first WAV write fails.
+bool mkdirs(const std::string &p) {
     std::string cur;
     for (size_t i = 0; i < p.size(); i++) {
         cur += p[i];
-        if (p[i] == '/' || i + 1 == p.size()) mkdir(cur.c_str(), 0755);
+        if (p[i] == '/' || i + 1 == p.size()) {
+            if (mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST) {
+                fprintf(stderr, "failed to create directory %s: %s\n",
+                        cur.c_str(), strerror(errno));
+                return false;
+            }
+        }
     }
+    return true;
 }
 
 void usage(const char *prog) {
@@ -124,7 +142,7 @@ int main(int argc, char **argv) {
 
     if (do_list) {
         auto internal = enumerate_internal(roms);
-        printf("JV-880 Internal\t%zu\n", internal.size());
+        printf("%s\t%zu\n", BOARD_INTERNAL, internal.size());
         for (const auto &e : scan_expansions(roms_dir + "/expansions"))
             if (e.usable) printf("%s\t%d\n", e.name.c_str(), e.patch_count);
         return 0;
@@ -146,7 +164,7 @@ int main(int argc, char **argv) {
     // whole render loop below, not just this lookup.
     std::vector<Expansion> expansions;
     std::vector<PatchRef> patches;
-    if (board == "JV-880 Internal") {
+    if (board == BOARD_INTERNAL) {
         patches = enumerate_internal(roms);
     } else {
         expansions = scan_expansions(roms_dir + "/expansions");
@@ -187,7 +205,11 @@ int main(int argc, char **argv) {
         char idx[16];
         snprintf(idx, sizeof(idx), "%03d", (int)pi);
         std::string pdir = out_dir + "/" + idx + "_" + sanitize(pr.name);
-        mkdirs(pdir);
+        if (!mkdirs(pdir)) {
+            fprintf(stderr, "failed to prepare output directory for patch %03d_%s\n",
+                    (int)pi, pr.name.c_str());
+            return 1;
+        }
 
         r.load_patch_bytes(bytes, grid);
 
@@ -213,12 +235,23 @@ int main(int argc, char **argv) {
             }
         }
 
-        FILE *jf = fopen((pdir + "/patch.json").c_str(), "w");
+        std::string json_path = pdir + "/patch.json";
+        FILE *jf = fopen(json_path.c_str(), "w");
         if (!jf) {
-            fprintf(stderr, "failed to write patch.json in %s\n", pdir.c_str());
+            fprintf(stderr, "failed to open patch.json for %03d_%s (%s): %s\n",
+                    (int)pi, pr.name.c_str(), json_path.c_str(), strerror(errno));
             return 1;
         }
-        fprintf(jf,
+        // Every downstream task (5, 6, 7) depends on patch.json existing and
+        // being complete — a silently-dropped or truncated write here is
+        // worse than a loud crash, especially unattended across ~4,197
+        // patches. Check fprintf's return (negative means the stream hit an
+        // error) AND fclose's return: stdio buffers writes, so a small file
+        // like this can have fprintf report success (the data only reached
+        // the userspace buffer) while a late error — e.g. ENOSPC — only
+        // surfaces when fclose performs the final flush. Either failure
+        // means this patch must NOT be reported as complete.
+        int written = fprintf(jf,
             "{\n"
             "  \"name\": \"%s\", \"bank\": \"%s\", \"index\": %d, \"sample_rate\": %d,\n"
             "  \"effects\": {\n"
@@ -244,7 +277,14 @@ int main(int argc, char **argv) {
             d2.strip ? "true" : "false", json_escape(d2.reason).c_str(), lfo_form_name(d2.lfo.form),
             d2.lfo.rate, d2.lfo.delay, d2.lfo.sync, d2.lfo.pitch_depth, d2.lfo.tvf_depth, d2.lfo.tva_depth,
             zones.c_str());
-        fclose(jf);
+        int close_rc = fclose(jf);
+        if (written < 0 || close_rc != 0) {
+            fprintf(stderr,
+                    "failed to write patch.json for %03d_%s (%s): fprintf=%d fclose=%d (%s)\n",
+                    (int)pi, pr.name.c_str(), json_path.c_str(), written, close_rc,
+                    strerror(errno));
+            return 1;
+        }
 
         int n_zones = (int)(((grid.hikey - grid.lokey) / grid.key_step) + 1) *
                       (int)grid.velocities.size();

@@ -1,6 +1,7 @@
 #include "jv_render.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -55,14 +56,26 @@ bool Renderer::init(const RomSet &roms) {
     MCU *m = new MCU();
     std::vector<uint8_t> nv = roms.nvram;
     nv[NVRAM_MODE_OFFSET] = 1;   // patch mode
-    m->startSC55(roms.rom1.data(), roms.rom2.data(),
-                 roms.waverom1.data(), roms.waverom2.data(), nv.data());
+    int rc = m->startSC55(roms.rom1.data(), roms.rom2.data(),
+                          roms.waverom1.data(), roms.waverom2.data(), nv.data());
+    if (rc != 0) {
+        // Leave any previously-initialized mcu_ untouched on failure: a
+        // failed re-init should not destroy a still-good prior instance.
+        delete m;
+        return false;
+    }
     for (int i = 0; i < WARMUP_STEPS; i++) m->updateSC55(1);
+
+    // Guard against double-init() leaking the previous MCU (several MB):
+    // free it before mcu_ is replaced. Safe when mcu_ is still null (delete
+    // on nullptr is a no-op).
+    delete (MCU *)mcu_;
     mcu_ = m;
     return true;
 }
 
 void Renderer::load_patch_bytes(const std::vector<uint8_t> &bytes, const GridSpec &g) {
+    assert(mcu_ != nullptr && "Renderer::load_patch_bytes called before a successful init()");
     MCU *m = (MCU *)mcu_;
     memcpy(&m->nvram[NVRAM_PATCH_OFFSET], bytes.data(), (size_t)PATCH_SIZE);
     m->nvram[NVRAM_MODE_OFFSET] = 1;
@@ -83,16 +96,24 @@ void Renderer::load_patch_bytes(const std::vector<uint8_t> &bytes, const GridSpe
 }
 
 std::vector<int16_t> Renderer::render_note(int key, int velocity, const GridSpec &g) {
+    assert(mcu_ != nullptr && "Renderer::render_note called before a successful init()");
     MCU *m = (MCU *)mcu_;
-    std::vector<int16_t> out;
 
     const int quiet_run_needed = (int)(0.1 * SAMPLE_RATE);   // ~100 ms
+
+    // Hold and tail lengths are both known up front, so the output vector's
+    // max possible size is too (the tail may truncate early, but never
+    // grows past this) — reserve it once instead of letting repeated
+    // push-driven resize()s in drain() reallocate/copy as the note grows.
+    int hold_samples = (int)(g.hold_seconds * SAMPLE_RATE);
+    int tail_samples = (int)(g.tail_seconds * SAMPLE_RATE);
+    std::vector<int16_t> out;
+    out.reserve((size_t)(hold_samples + tail_samples) * 2);
 
     uint8_t note_on[3] = {0x90, (uint8_t)key, (uint8_t)velocity};
     m->postMidiSC55(note_on, 3);
 
     // Hold: always rendered in full (design note C truncates only the tail).
-    int hold_samples = (int)(g.hold_seconds * SAMPLE_RATE);
     int peak = 0;
     for (int pos = 0; pos < hold_samples; pos += CHUNK) {
         int n = std::min(CHUNK, hold_samples - pos);
@@ -109,7 +130,6 @@ std::vector<int16_t> Renderer::render_note(int key, int velocity, const GridSpec
     // Tail: track running peak, stop once a ~100ms run sits below
     // peak * 10^(silence_db/20). Sustained patches simply never hit that
     // run within tail_seconds and render in full.
-    int tail_samples = (int)(g.tail_seconds * SAMPLE_RATE);
     int quiet_run = 0;
     for (int pos = 0; pos < tail_samples; pos += CHUNK) {
         int n = std::min(CHUNK, tail_samples - pos);
