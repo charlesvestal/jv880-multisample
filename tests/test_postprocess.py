@@ -1,8 +1,10 @@
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 import soundfile as sf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -42,13 +44,48 @@ def test_decaying_burst_gets_no_loop():
 
 
 def test_crossfade_bounded():
+    # Fixed numeric expectation for this exact (deterministic) synthetic
+    # input, not a recomputation of the crossfade formula under test -- a
+    # regression to e.g. `length // 3` would still satisfy a
+    # self-referential "crossfade <= min(...)" check computed the same way
+    # the implementation computes it.
+    t = np.arange(int(6.0 * SR)) / SR
+    mono = 0.5 * np.sin(2 * np.pi * 220.0 * t)
+    x = make_stereo(mono)
+    loop = pp.find_loop(x, SR, HOLD)
+    assert loop is not None
+    assert loop["start"] == 48000
+    assert loop["end"] == 60000
+    assert loop["crossfade"] == 2000
+    # This specific case exercises the MAX_XFADE branch of the min(): both
+    # start//4 (12000) and length//4 (3000) exceed MAX_XFADE (2000), so
+    # MAX_XFADE is the binding constraint here.
+    assert loop["crossfade"] == pp.MAX_XFADE
+    # Independent sanity check against the documented bound, using the
+    # loop's own reported values (not a copy of the implementation).
+    length = loop["end"] - loop["start"]
+    assert loop["crossfade"] <= min(pp.MAX_XFADE, loop["start"] // 4, length // 4)
+
+
+def test_find_loop_prefers_longer_loop_when_endpoints_are_comparable():
+    """A clean periodic signal has a near-perfect endpoint match at nearly
+    every candidate n_per from 8 to 60 -- the tiebreak must pull toward the
+    longest such candidate (less perceptible repetition on pads/strings),
+    not just whichever n_per happens to have the single smallest dv.
+    """
     t = np.arange(int(6.0 * SR)) / SR
     mono = 0.5 * np.sin(2 * np.pi * 220.0 * t)
     x = make_stereo(mono)
     loop = pp.find_loop(x, SR, HOLD)
     assert loop is not None
     length = loop["end"] - loop["start"]
-    assert loop["crossfade"] <= min(pp.MAX_XFADE, loop["start"] // 4, length // 4)
+    approx_period = SR / 220.0
+    shortest_candidate = 8 * approx_period
+    assert length > shortest_candidate * 2, (
+        f"loop length {length} is too close to the shortest 8-period "
+        f"candidate ({shortest_candidate:.0f}); longer-loop tiebreak does "
+        "not appear to be working"
+    )
 
 
 def test_resample_ratio():
@@ -336,7 +373,13 @@ def test_main_survives_bad_patch_and_continues(tmp_path, monkeypatch, capsys):
     _make_patch_dir(good_dir, [(60, 100, 1, _sustaining_zone_audio(freq=220.0))])
 
     monkeypatch.setattr(sys, "argv", ["postprocess.py", str(tmp_path)])
-    pp.main()  # must not raise even though one patch is malformed
+
+    # A batch with any failure must exit non-zero (requirement #2) so a
+    # systemic bug can't hide behind an always-0 exit code -- but the
+    # *other*, good patch must still have been fully processed first.
+    with pytest.raises(SystemExit) as exc_info:
+        pp.main()
+    assert exc_info.value.code != 0
 
     captured = capsys.readouterr()
     assert "FAILED" in captured.err
@@ -345,3 +388,152 @@ def test_main_survives_bad_patch_and_continues(tmp_path, monkeypatch, capsys):
     on_disk = json.loads((good_dir / "patch.json").read_text())
     assert on_disk["sample_rate"] == pp.SR_OUT
     assert on_disk["zones"][0]["loop"]["enabled"] is True
+
+    # Machine-readable failure list so a later pass can retry just the
+    # patches/zones that failed.
+    fail_path = tmp_path / "postprocess_failures.json"
+    assert fail_path.exists()
+    failures = json.loads(fail_path.read_text())
+    assert any(f["scope"] == "patch" and f["patch"] == "01_bad" for f in failures)
+
+
+def test_main_exits_cleanly_with_no_failures(tmp_path, monkeypatch):
+    good_dir = tmp_path / "01_good"
+    good_dir.mkdir()
+    _make_patch_dir(good_dir, [(60, 100, 1, _sustaining_zone_audio(freq=220.0))])
+
+    monkeypatch.setattr(sys, "argv", ["postprocess.py", str(tmp_path)])
+    pp.main()  # must NOT raise SystemExit when nothing failed
+
+    fail_path = tmp_path / "postprocess_failures.json"
+    assert fail_path.exists()
+    assert json.loads(fail_path.read_text()) == []
+
+
+def test_main_summary_line_reports_zone_failures(tmp_path, monkeypatch, capsys):
+    good_audio = _sustaining_zone_audio(freq=220.0)
+    good_stereo = np.stack([good_audio, good_audio], axis=1).astype(np.float32)
+    patch_dir = tmp_path / "01_mixed"
+    patch_dir.mkdir()
+    sf.write(str(patch_dir / "good.wav"), good_stereo, pp.SR_IN, subtype="PCM_16")
+
+    patch = _minimal_patch_dict([
+        {"key": 60, "velocity": 100, "layer": 1, "frames": len(good_audio),
+         "file": "good.wav"},
+        {"key": 61, "velocity": 100, "layer": 1, "frames": 0,
+         "file": "missing.wav"},
+    ])
+    (patch_dir / "patch.json").write_text(json.dumps(patch))
+
+    monkeypatch.setattr(sys, "argv", ["postprocess.py", str(tmp_path)])
+    with pytest.raises(SystemExit):
+        pp.main()
+
+    captured = capsys.readouterr()
+    # The per-patch summary line itself must surface the failed count, not
+    # just the aggregate end-of-run total.
+    assert "1/2 FAILED" in captured.out
+
+
+def test_unexpected_filename_gets_marked_unprocessable(tmp_path):
+    # A zone whose "file" was never a .wav to begin with (not an
+    # already-processed .flac either) -- simulates a schema/data problem
+    # upstream. Must not be silently skipped with no kind/loop/release.
+    patch = _minimal_patch_dict([
+        {"key": 60, "velocity": 100, "layer": 1, "frames": 0, "file": "weird.aiff"},
+    ])
+    (tmp_path / "patch.json").write_text(json.dumps(patch))
+
+    meta = pp.process_patch(tmp_path)  # must not raise
+    z = meta["zones"][0]
+
+    assert z["kind"] == "error"
+    assert z["loop"] == {"enabled": False}
+    assert "release" in z
+
+
+def test_flac_name_that_does_not_exist_is_not_treated_as_processed(tmp_path):
+    # A zone whose "file" already says .flac but nothing was ever written
+    # there (corrupt patch.json, hand-edited, whatever) must not be
+    # silently skipped as "already processed" just because of the suffix.
+    patch = _minimal_patch_dict([
+        {"key": 60, "velocity": 100, "layer": 1, "frames": 0, "file": "ghost.flac"},
+    ])
+    (tmp_path / "patch.json").write_text(json.dumps(patch))
+
+    meta = pp.process_patch(tmp_path)  # must not raise
+    z = meta["zones"][0]
+
+    assert z["kind"] == "error"
+    assert z["loop"] == {"enabled": False}
+
+
+def test_zone_failure_after_read_stays_retryable(tmp_path, monkeypatch):
+    """Requirement #5: previously, src.unlink() ran before z["file"] was
+    reassigned and before measure_release, so a failure in measure_release
+    still left z["file"] pointing at the written .flac -- the next run's
+    suffix check would then skip it forever, permanently stranding a zone
+    with valid audio but stale "error" metadata. Verify the reordered
+    "point of no return" (compute everything, THEN write/commit/unlink
+    last) keeps a mid-pipeline failure retryable.
+    """
+    audio = _sustaining_zone_audio(freq=220.0)
+    stereo = np.stack([audio, audio], axis=1).astype(np.float32)
+    sf.write(str(tmp_path / "zone0.wav"), stereo, pp.SR_IN, subtype="PCM_16")
+
+    patch = _minimal_patch_dict([
+        {"key": 60, "velocity": 100, "layer": 1, "frames": len(audio),
+         "file": "zone0.wav"},
+    ])
+    (tmp_path / "patch.json").write_text(json.dumps(patch))
+
+    def boom(*_a, **_k):
+        raise RuntimeError("synthetic failure late in the pipeline")
+
+    monkeypatch.setattr(pp, "measure_release", boom)
+
+    meta = pp.process_patch(tmp_path)  # must not raise
+    z = meta["zones"][0]
+
+    assert z["kind"] == "error"
+    # The critical assertion: z["file"] still points at the ORIGINAL .wav
+    # (not a .flac that got written before the failure), and that .wav
+    # still exists, so the very next process_patch() call retries this
+    # zone from scratch instead of being permanently skipped.
+    assert z["file"] == "zone0.wav"
+    assert (tmp_path / "zone0.wav").exists()
+    assert not (tmp_path / "zone0.flac").exists()
+
+    # Prove it's actually retryable: remove the monkeypatch and rerun.
+    monkeypatch.undo()
+    meta2 = pp.process_patch(tmp_path)
+    z2 = meta2["zones"][0]
+    assert z2["kind"] == "sustaining"
+    assert z2["file"] == "zone0.flac"
+
+
+def test_estimate_period_performance():
+    """Regression guard for the O(n^2) -> O(n log n) fix. The old
+    np.correlate(seg, seg, mode="full") path measured ~7.4s on a
+    117,600-frame region (the size find_loop actually passes in
+    production) and ~8.3s at 120,000 frames. fftconvolve does the same
+    computation in ~5ms. If this ever regresses back to the quadratic
+    path, a multi-thousand-patch batch full of sustaining pads/organs/
+    strings would take hours-to-days longer -- so fail the test well
+    before it'd get anywhere near the old timing.
+    """
+    rng = np.random.default_rng(0)
+    n = 120_000
+    t = np.arange(n) / SR
+    mono = 0.5 * np.sin(2 * np.pi * 220.0 * t) + 0.01 * rng.standard_normal(n)
+
+    start = time.perf_counter()
+    period = pp.estimate_period(mono, SR)
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 1.0, (
+        f"estimate_period took {elapsed:.2f}s on {n} frames -- the old "
+        "quadratic np.correlate path took ~8s at this size, so this "
+        "looks like a performance regression back to it"
+    )
+    assert period > 0
