@@ -230,6 +230,18 @@ different phase per note), and periodic modulation fights loop-point detection.
 Because rendering captures the **sum** of up to 4 tones, per-tone LFO differences cannot
 be separated after the fact.
 
+> **Measured outcome (2026-07-28):** across the 192 internal patches, only **6 are
+> LFO1-strippable and 1 is LFO2-strippable**. Breakdown for LFO1: 130 have no LFO depth
+> at all, 13 use RND1/RND2, and 43 have active tones that genuinely disagree on
+> waveform (15), pitch depth (11), rate (10), or TVF depth (7). The conservative rule
+> below is working as specified — it is simply stricter in practice than it looked on
+> paper, so most LFO-bearing patches keep their modulation baked in.
+>
+> **Decision: ship these defaults unchanged and evaluate the pilot by ear.** Rendering
+> costs only compute time, and whether baked frozen-phase modulation is actually
+> objectionable is a listening question, not an analytical one. Revisit the tolerances
+> only if the pilot reveals a real problem.
+
 **Strip and recreate** when all hold:
 - at least one active tone has non-zero LFO depth to pitch, TVF, or TVA;
 - all active tones agree on LFO settings within these tolerances:
