@@ -28,10 +28,10 @@ add_test(NAME test_jv_rom COMMAND test_jv_rom)
 # target_sources() rather than calling add_library(jv_core ...) again,
 # which errors with "add_library cannot create target ... because another
 # target with the same name already exists".
-# target_sources(jv_core PRIVATE src/jv_patch.cpp src/wav.cpp)
-# add_executable(test_jv_patch tests/test_jv_patch.cpp)
-# target_link_libraries(test_jv_patch jv_core)
-# add_test(NAME test_jv_patch COMMAND test_jv_patch)
+target_sources(jv_core PRIVATE src/jv_patch.cpp)
+add_executable(test_jv_patch tests/test_jv_patch.cpp)
+target_link_libraries(test_jv_patch jv_core)
+add_test(NAME test_jv_patch COMMAND test_jv_patch)
 
 # Task 3: grid renderer, links the schwung-jv880 emulator core via JV_DSP.
 # Uncomment once src/jv_render.cpp, src/jv_sampler.cpp, src/wav.cpp exist.
