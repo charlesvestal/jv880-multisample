@@ -1,6 +1,5 @@
 #include "jv_patch.h"
-#include <stdlib.h>
-#include <string.h>
+#include <assert.h>
 
 namespace jv {
 
@@ -9,6 +8,17 @@ static int bits(const uint8_t *p, int off, int shift, int width) {
 }
 
 static const uint8_t *tone_ptr(const uint8_t *patch, int tone) {
+    // tone must be in [0, TONE_COUNT). Tasks 3/4/6 call tone_active() and
+    // read_tone_lfo() with their own loop indices; an out-of-range tone
+    // would otherwise silently read into the START OF A NEIGHBORING PATCH
+    // (or before this one) — no crash, no signal, just wrong data. assert()
+    // catches the mistake immediately in debug builds; the clamp keeps
+    // release builds (this project defaults CMAKE_BUILD_TYPE to Release,
+    // which compiles asserts out) inside this patch's own bytes instead of
+    // reading someone else's.
+    assert(tone >= 0 && tone < TONE_COUNT);
+    if (tone < 0) tone = 0;
+    else if (tone >= TONE_COUNT) tone = TONE_COUNT - 1;
     return patch + TONE_BASE + tone * TONE_STRIDE;
 }
 
@@ -65,9 +75,31 @@ ToneLfo read_tone_lfo(const uint8_t *patch, int tone, int lfo_index) {
     return l;
 }
 
-static bool same_sign(int a, int b) {
-    if (a == 0 && b == 0) return true;
-    return (a >= 0) == (b >= 0);
+// True when every value in `vals` falls within a window of `tol` of every
+// OTHER value (max - min <= tol) — i.e. compared pairwise against each
+// other, not just against vals[0]. A "star" comparison (everything vs a
+// single reference) lets two non-reference values drift up to 2x the
+// stated tolerance apart while each still individually reads as "within
+// tolerance of the reference".
+//
+// When check_sign is true, also require that not both a strictly positive
+// and a strictly negative value are present. A value of exactly 0 sets
+// neither has_pos nor has_neg, so a 0 depth never conflicts with a
+// same-tolerance-window nonzero depth of either sign — a 0 measurement
+// imposes no direction, so it shouldn't have a direction to be wrong
+// about (this is the bug: comparing "a >= 0" made 0 read as "positive").
+static bool spread_ok(const std::vector<int> &vals, int tol, bool check_sign) {
+    int mn = vals[0], mx = vals[0];
+    bool has_pos = false, has_neg = false;
+    for (int v : vals) {
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+        if (v > 0) has_pos = true;
+        if (v < 0) has_neg = true;
+    }
+    if (mx - mn > tol) return false;
+    if (check_sign && has_pos && has_neg) return false;
+    return true;
 }
 
 LfoDecision decide_lfo_strip(const uint8_t *patch, int lfo_index) {
@@ -86,17 +118,26 @@ LfoDecision decide_lfo_strip(const uint8_t *patch, int lfo_index) {
         if (l.form >= 4) { d.reason = "random waveform"; return d; }  // RND1/RND2
 
     const ToneLfo &ref = active[0];
+    // Waveform and sync require exact equality, so comparing each tone
+    // against the first is fine here: equality is transitive (if every
+    // tone equals ref, every tone equals every other tone), unlike the
+    // numeric tolerance checks below.
     for (const auto &l : active) {
-        if (l.form != ref.form)         { d.reason = "waveform mismatch"; return d; }
-        if (l.sync != ref.sync)         { d.reason = "sync mismatch";     return d; }
-        if (abs(l.rate - ref.rate) > 4) { d.reason = "rate mismatch";     return d; }
-        if (abs(l.pitch_depth - ref.pitch_depth) > 6 ||
-            !same_sign(l.pitch_depth, ref.pitch_depth)) { d.reason = "pitch depth mismatch"; return d; }
-        if (abs(l.tvf_depth - ref.tvf_depth) > 6 ||
-            !same_sign(l.tvf_depth, ref.tvf_depth))     { d.reason = "tvf depth mismatch";   return d; }
-        if (abs(l.tva_depth - ref.tva_depth) > 6 ||
-            !same_sign(l.tva_depth, ref.tva_depth))     { d.reason = "tva depth mismatch";   return d; }
+        if (l.form != ref.form) { d.reason = "waveform mismatch"; return d; }
+        if (l.sync != ref.sync) { d.reason = "sync mismatch";     return d; }
     }
+
+    std::vector<int> rates, pitch, tvf, tva;
+    for (const auto &l : active) {
+        rates.push_back(l.rate);
+        pitch.push_back(l.pitch_depth);
+        tvf.push_back(l.tvf_depth);
+        tva.push_back(l.tva_depth);
+    }
+    if (!spread_ok(rates, 4, /*check_sign=*/false)) { d.reason = "rate mismatch";        return d; }
+    if (!spread_ok(pitch, 6, /*check_sign=*/true))  { d.reason = "pitch depth mismatch"; return d; }
+    if (!spread_ok(tvf,   6, /*check_sign=*/true))  { d.reason = "tvf depth mismatch";   return d; }
+    if (!spread_ok(tva,   6, /*check_sign=*/true))  { d.reason = "tva depth mismatch";   return d; }
 
     long rate = 0, del = 0, fade = 0, pd = 0, fd = 0, ad = 0;
     for (const auto &l : active) {
@@ -133,18 +174,24 @@ std::vector<uint8_t> preprocess(const uint8_t *patch,
     return out;
 }
 
+// reverbtype is a 4-bit field (0-15) but only 0-7 are named Roland reverb
+// types; chorustype is 2-bit (0-3) but only 0-2 are named; lfoform is
+// 3-bit (0-7) but only 0-5 are named forms. The remaining values are
+// reserved/undocumented on real hardware and should never silently read
+// back as a plausible-looking name (that would render into Task 6's
+// preset metadata as if it were a deliberate, meaningful value).
 const char *reverb_type_name(int t) {
     static const char *n[] = {"Room1","Room2","Stage1","Stage2",
                               "Hall1","Hall2","Delay","Pan-Dly"};
-    return (t >= 0 && t < 8) ? n[t] : "Room1";
+    return (t >= 0 && t < 8) ? n[t] : "Unknown";
 }
 const char *chorus_type_name(int t) {
     static const char *n[] = {"Chorus1","Chorus2","Chorus3"};
-    return (t >= 0 && t < 3) ? n[t] : "Chorus1";
+    return (t >= 0 && t < 3) ? n[t] : "Unknown";
 }
 const char *lfo_form_name(int f) {
     static const char *n[] = {"TRI","SIN","SAW","SQU","RND1","RND2"};
-    return (f >= 0 && f < 6) ? n[f] : "TRI";
+    return (f >= 0 && f < 6) ? n[f] : "Unknown";
 }
 
 } // namespace jv

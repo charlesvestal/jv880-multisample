@@ -35,12 +35,18 @@ struct LfoDecision {
     ToneLfo lfo;   // representative (mean of active tones) when strip is true
 };
 
+// Every `patch` pointer below must point to at least PATCH_SIZE (see
+// jv_rom.h) readable bytes — a full 362-byte patch image, whether taken
+// from PatchRef::data or a synthetic test buffer. None of these functions
+// validate the buffer length themselves; the caller owns that guarantee
+// (matching the pointer contract documented on jv_rom.h's PatchRef).
 Effects     read_effects(const uint8_t *patch);
 ToneLfo     read_tone_lfo(const uint8_t *patch, int tone, int lfo_index /*1 or 2*/);
 bool        tone_active(const uint8_t *patch, int tone);
 LfoDecision decide_lfo_strip(const uint8_t *patch, int lfo_index);
 
 // Render-ready bytes: dry, portamento off, LFOs stripped per decision.
+// `patch` must point to at least PATCH_SIZE readable bytes (see above).
 std::vector<uint8_t> preprocess(const uint8_t *patch,
                                 const LfoDecision &lfo1,
                                 const LfoDecision &lfo2);
