@@ -1,0 +1,54 @@
+#pragma once
+#include <stdint.h>
+#include <string>
+#include <vector>
+#include "jv_rom.h"
+#include "jv_patch.h"
+
+namespace jv {
+
+static const int SAMPLE_RATE   = 64000;
+static const int WARMUP_STEPS  = 100000;
+static const int NVRAM_PATCH_OFFSET = 0x0d70;
+static const int NVRAM_MODE_OFFSET  = 0x11;
+
+struct GridSpec {
+    int lokey = 24, hikey = 96, key_step = 3;   // C1..C7 every 3 semitones
+    std::vector<int> velocities = {32, 72, 110};
+    double hold_seconds   = 3.5;
+    double tail_seconds   = 2.5;
+    double settle_seconds = 0.5;
+    double silence_db     = -72.0;
+};
+
+// Drives the JV-880 emulator headlessly and deterministically: no threads,
+// no wall-clock reads, no RNG. mcu_ is an opaque MCU* (declared in mcu.h,
+// which lives outside this repo under JV_DSP) so this header never needs
+// that include path — only jv_render.cpp does.
+class Renderer {
+public:
+    Renderer() = default;
+    ~Renderer();
+    Renderer(const Renderer &) = delete;
+    Renderer &operator=(const Renderer &) = delete;
+
+    bool init(const RomSet &roms);                 // boot + warmup once
+
+    // Loads the 362 preprocessed patch bytes into NVRAM, sends the Program
+    // Change that makes the firmware reload from NVRAM, then settles once
+    // (design note A: the settle belongs here, not in render_note, so it
+    // runs once per patch rather than once per rendered cell).
+    void load_patch_bytes(const std::vector<uint8_t> &patch_bytes,
+                          const GridSpec &g);
+
+    // Renders one key/velocity cell: note-on, hold, note-off, tail (with
+    // early truncation once the signal sits quietly below the noise floor
+    // for a sustained run), then All Notes Off plus a short discarded flush
+    // so this cell's decay never bleeds into the next one (design note B).
+    std::vector<int16_t> render_note(int key, int velocity, const GridSpec &g);
+
+private:
+    void *mcu_ = nullptr;   // opaque MCU*
+};
+
+} // namespace jv

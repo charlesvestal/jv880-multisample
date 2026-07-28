@@ -34,16 +34,17 @@ target_link_libraries(test_jv_patch jv_core)
 add_test(NAME test_jv_patch COMMAND test_jv_patch)
 
 # Task 3: grid renderer, links the schwung-jv880 emulator core via JV_DSP.
-# Uncomment once src/jv_render.cpp, src/jv_sampler.cpp, src/wav.cpp exist.
-# add_library(jv_emu STATIC
-#     ${JV_DSP}/mcu.cpp ${JV_DSP}/mcu_opcodes.cpp ${JV_DSP}/pcm.cpp)
-# target_include_directories(jv_emu PUBLIC ${JV_DSP})
-#
-# add_library(jv_render STATIC src/jv_render.cpp)
-# target_link_libraries(jv_render jv_core jv_emu)
-#
-# add_executable(jv_sampler src/jv_sampler.cpp)
-# target_link_libraries(jv_sampler jv_render)
+add_library(jv_emu STATIC
+    ${JV_DSP}/mcu.cpp ${JV_DSP}/mcu_opcodes.cpp ${JV_DSP}/pcm.cpp)
+target_include_directories(jv_emu PUBLIC ${JV_DSP})
+
+target_sources(jv_core PRIVATE src/wav.cpp)
+
+add_library(jv_render STATIC src/jv_render.cpp)
+target_link_libraries(jv_render jv_core jv_emu)
+
+add_executable(jv_sampler src/jv_sampler.cpp)
+target_link_libraries(jv_sampler jv_render)
 
 # Task 4: effect calibration (tools/calibrate.cpp).
 # Uncomment once that source exists.
