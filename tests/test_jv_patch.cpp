@@ -132,6 +132,24 @@ int main(int argc, char **argv) {
     check(!jv::decide_lfo_strip(p, 1).strip,
           "(-5, +5) depths blocked: spread of 10 exceeds the tolerance of 6");
 
+    // The sign gate must do independent work, not merely be implied by
+    // the spread check: -2 and +3 have a spread of 5, well inside the
+    // +/-6 tolerance, so only the sign gate can block this pair. Without
+    // this case the sign gate could be silently deleted and every other
+    // test above would still pass (the earlier (-5,+5) case fails on
+    // spread alone and proves nothing about sign specifically).
+    t0[33] = (uint8_t)(int8_t)-2;
+    t1[33] = (uint8_t)(int8_t)3;
+    check(!jv::decide_lfo_strip(p, 1).strip,
+          "(-2, +3) depths blocked by sign alone: spread of 5 is within the +/-6 tolerance");
+
+    // Same idea right at the tolerance boundary: -3 and +3 have a spread
+    // of exactly 6 (still within tolerance) but opposite sign.
+    t0[33] = (uint8_t)(int8_t)-3;
+    t1[33] = (uint8_t)(int8_t)3;
+    check(!jv::decide_lfo_strip(p, 1).strip,
+          "(-3, +3) depths blocked by sign alone: spread of 6 is at the tolerance boundary");
+
     t0[33] = (uint8_t)(int8_t)20;
     t1[33] = (uint8_t)(int8_t)20;
 
@@ -198,11 +216,16 @@ int main(int argc, char **argv) {
     // sign fix; both fixes were confirmed correct via direct reproduction
     // of the reviewer's cases, but neither changed these counts on this
     // specific 192-patch ROM corpus -- no factory patch happens to hit
-    // the star-topology or zero-sign edge cases). If this count ever
-    // needs to change, the tolerance semantics changed and the new value
-    // must be reviewed deliberately -- this is the assertion that should
-    // catch a regression of the star-topology bug on real data, so it
-    // must never degrade back into a tautology.
+    // the star-topology or zero-sign edge cases, so old and new code give
+    // IDENTICAL results here). This assertion pins the aggregate outcome
+    // across all 192 real patches so any future tolerance/semantics
+    // change must be consciously acknowledged and re-verified, rather
+    // than silently drifting -- it must never degrade back into a
+    // tautology like `strippable >= 0 && strippable <= 192`. It is NOT a
+    // star-topology regression guard: since old and new code agree on
+    // this corpus, this assertion cannot by itself detect that bug
+    // reappearing. The synthetic 56/64-vs-60 test above (search
+    // "star-topology") is what actually guards that behavior.
     check(strippable1 == 6, "LFO1 strippable count pinned to corrected tolerance semantics (6/192)");
     check(strippable2 == 1, "LFO2 strippable count pinned to corrected tolerance semantics (1/192)");
 
