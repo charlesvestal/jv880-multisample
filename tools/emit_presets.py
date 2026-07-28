@@ -101,6 +101,59 @@ LFO_RATE_HZ_MIN = 0.05
 LFO_RATE_HZ_MAX = 10.0
 LFO_DELAY_MAX_S = 2.0
 
+# --- LFO binding targets: verified 2026-07-28 against the official
+# DecentSampler developer guide (Appendix B: The <binding> element,
+# https://decentsampler-developers-guide.readthedocs.io/en/latest/
+# appendix-b-the-binding-element.html), NOT assumed from the design doc's
+# capability table -- see this file's module docstring for what changed
+# after verification.
+#
+# Group Volume:  type="amp" level="group" parameter="AMP_VOLUME"
+#                range 0.0-16.0, Modulatable: Yes, requires groupIndex.
+# Group Tuning:  type="amp" level="group" parameter="GROUP_TUNING"
+#                range -36.0-36.0 (semitones), Modulatable: Yes, requires
+#                groupIndex.
+# Both confirmed correct (my original parameter *names* were right); what
+# was wrong was `type="generic"` for tuning (real type is "amp", same as
+# volume) and `level="voice"` for volume ("voice" is not a valid `level`
+# value at all -- valid values are ui/instrument/group/tag/midi -- and
+# groupIndex is a required companion attribute I had omitted).
+#
+# TVF -> a filter cutoff target (FX_FILTER_FREQUENCY) is real
+# (type="effect" level="instrument", requires effectIndex naming an
+# actual filter effect in the <effects> chain) -- but this pipeline's
+# build_effects() NEVER emits a filter/lowpass effect: the JV's own TVF
+# filter is already baked into the rendered audio, not reconstructed as a
+# DecentSampler effect (see design doc's "What stays baked" section).
+# There is therefore no real effect index this preset could honestly
+# point at -- binding to effectIndex=0 would silently modulate whatever
+# happens to be first in OUR chain (reverb/delay or chorus), which is
+# actively wrong, not just absent. Per instruction: a silently-ignored
+# (or silently-WRONG) binding is worse than no binding, so TVF depth is
+# deliberately dropped -- there is no valid DecentSampler equivalent in
+# this pipeline's output, full stop.
+GROUP_INDEX = "0"  # this module always emits exactly one <group>
+
+# modBehavior="modulate": the LFO adds a zero-centered delta around the
+# target's current/base value (the correct semantic for tremolo/vibrato).
+# The alternative, "set" (the DecentSampler default), would force the
+# parameter to literally EQUAL the LFO's instantaneous value each cycle,
+# discarding whatever base value the group would otherwise have.
+LFO_MOD_BEHAVIOR = "modulate"
+
+# translationOutputMin/Max define each binding's own +/- swing at full
+# LFO excursion (see module docstring) -- these are the values that
+# actually encode "how deep", since a single <lfo> element's own
+# modAmount is shared across every one of its bindings and can't
+# represent independent per-target depths on its own (see
+# _lfo_binding_range's docstring).
+#
+# Neither range is calibrated (same caveat as LFO_RATE_HZ_*: JV's tva/
+# pitch LFO depth was never swept by calibrate.cpp), so these are
+# documented, musically-reasoned choices, not measurements:
+TVA_MOD_RANGE = 0.5           # +/- linear gain delta at full tva depth
+GROUP_TUNING_MOD_RANGE_ST = 0.5  # +/- semitones at full pitch depth
+
 
 def interp_table(table, raw):
     """Linear interpolation over a ``{str(raw): value}`` calibration table.
@@ -262,16 +315,36 @@ def _lfo_delay_seconds(raw):
     return round((max(0, min(127, raw)) / 127.0) * LFO_DELAY_MAX_S, 4)
 
 
+def _lfo_binding_range(depth, full_scale_range):
+    """+/- output swing for one binding, scaled from a JV -63..63 depth.
+
+    A single <lfo> element's own `modAmount` attribute (0-1) is shared
+    across ALL of its <binding> children -- it can't represent "this LFO
+    modulates pitch a little but volume a lot" on its own. Real per-target
+    depth therefore has to live in EACH binding's own translationOutputMin/
+    Max (its individual +/- swing at modAmount=1.0, DecentSampler's
+    default), which is what this returns. `<binding>` itself has no
+    modAmount attribute at all (verified against Appendix B's attribute
+    list -- confirming an earlier mistake where I'd put modAmount on the
+    binding instead of, correctly, leaving the shared one on <lfo>).
+    """
+    depth_frac = _clamp01(abs(depth) / 63.0)
+    return round(depth_frac * full_scale_range, 4)
+
+
 def build_lfo_modulator(lfo_meta):
     """Build an in-memory modulator description for one stripped LFO, or
     None if this LFO shouldn't emit a <lfo> element at all (not stripped,
     RND1/RND2 waveform, or stripped-but-zero-depth-everywhere).
 
     Returns {"shape", "frequency", "scope", "delayTime", "bindings": [...]}
-    where each binding is {"type", "level", "parameter", "modAmount"}.
-    A stripped LFO can bind MULTIPLE targets at once (pitch/TVF/TVA are
-    independent depths on the same LFO), each with its own modAmount
-    scaled from the JV's -63..63 depth range.
+    where each binding is {"type", "level", "groupIndex"?, "parameter",
+    "modBehavior", "translationOutputMin", "translationOutputMax"}.
+
+    A stripped LFO can bind MULTIPLE targets at once (pitch/TVA are
+    independent depths on the same LFO); TVF depth is deliberately never
+    bound to anything -- see GROUP_INDEX's neighbouring comment block for
+    why FX_FILTER_FREQUENCY has no honest target in this pipeline's output.
     """
     if not lfo_meta or not lfo_meta.get("stripped"):
         return None
@@ -281,20 +354,30 @@ def build_lfo_modulator(lfo_meta):
 
     bindings = []
     tva = lfo_meta.get("tva", 0)
-    tvf = lfo_meta.get("tvf", 0)
     pitch = lfo_meta.get("pitch", 0)
+    # tvf is intentionally never read here -- see the GROUP_INDEX comment
+    # block above for why TVF has no valid DecentSampler binding target in
+    # this pipeline's output.
     if tva:
-        bindings.append({"type": "amp", "level": "voice", "parameter": "AMP_VOLUME",
-                          "modAmount": round(_clamp01(abs(tva) / 63.0), 4)})
-    if tvf:
-        bindings.append({"type": "effect", "level": "instrument",
-                          "parameter": "FX_FILTER_FREQUENCY",
-                          "modAmount": round(_clamp01(abs(tvf) / 63.0), 4)})
+        delta = _lfo_binding_range(tva, TVA_MOD_RANGE)
+        bindings.append({
+            "type": "amp", "level": "group", "groupIndex": GROUP_INDEX,
+            "parameter": "AMP_VOLUME", "modBehavior": LFO_MOD_BEHAVIOR,
+            "translation": "linear",
+            "translationOutputMin": -delta, "translationOutputMax": delta,
+        })
     if pitch:
-        bindings.append({"type": "generic", "level": "group", "parameter": "GROUP_TUNING",
-                          "modAmount": round(_clamp01(abs(pitch) / 63.0), 4)})
+        delta = _lfo_binding_range(pitch, GROUP_TUNING_MOD_RANGE_ST)
+        bindings.append({
+            "type": "amp", "level": "group", "groupIndex": GROUP_INDEX,
+            "parameter": "GROUP_TUNING", "modBehavior": LFO_MOD_BEHAVIOR,
+            "translation": "linear",
+            "translationOutputMin": -delta, "translationOutputMax": delta,
+        })
     if not bindings:
         return None  # stripped, valid waveform, but nothing left to bind
+        # (either all depths were zero, or TVF was the only nonzero depth
+        # and it has no valid binding target -- see above)
 
     return {
         "shape": shape,
@@ -335,23 +418,6 @@ def build_dspreset(meta, cal, sample_prefix):
         "attack": "0.001", "decay": "0.001", "sustain": "1.0",
     })
 
-    lfo_mods = [m for m in (build_lfo_modulator(meta.get("lfo1", {})),
-                            build_lfo_modulator(meta.get("lfo2", {}))) if m]
-    if lfo_mods:
-        modulators_el = ET.SubElement(group_el, "modulators")
-        for lm in lfo_mods:
-            lfo_el = ET.SubElement(modulators_el, "lfo", {
-                "shape": lm["shape"],
-                "frequency": str(lm["frequency"]),
-                "scope": lm["scope"],
-                "delayTime": str(lm["delayTime"]),
-            })
-            for b in lm["bindings"]:
-                ET.SubElement(lfo_el, "binding", {
-                    "type": b["type"], "level": b["level"],
-                    "parameter": b["parameter"], "modAmount": str(b["modAmount"]),
-                })
-
     by_key = _group_zones_by_key(zones)
     for key, lo, hi in key_ranges(by_key.keys()):
         layer_zones = sorted(by_key[key], key=lambda z: z["velocity"])
@@ -361,16 +427,15 @@ def build_dspreset(meta, cal, sample_prefix):
                 "rootNote": str(key),
                 "loNote": str(lo), "hiNote": str(hi),
                 "loVel": str(vlo), "hiVel": str(vhi),
-                # NOTE: ampegRelease is NOT in the pre-verified <sample>
-                # attribute list this task was given (path/rootNote/loNote/
-                # hiNote/loVel/hiVel/start/end/tuning/volume/pan/loopStart/
-                # loopEnd/loopEnabled/loopCrossfade). It is added anyway
-                # because the design doc requires .dspreset "full fidelity:
-                # reverb, chorus, LFOs, loops, release" and ampegRelease is
-                # a standard, widely-used DecentSampler per-sample envelope
-                # attribute -- but since it wasn't in the supplied verified
-                # list, flag it for a quick doc/spot-check before shipping.
-                "ampegRelease": str(z.get("release", 0.1)),
+                # DecentSampler's per-sample envelope release attribute is
+                # simply `release` (alongside attack/decay/sustain) --
+                # confirmed against the official developer guide. An
+                # earlier version of this code used `ampegRelease`, which
+                # is not a real DecentSampler attribute at all: it would
+                # have been silently ignored, discarding every per-zone
+                # release time measured in postprocess.py's
+                # measure_release without any error.
+                "release": str(z.get("release", 0.1)),
             }
             loop = z.get("loop") or {}
             if loop.get("enabled"):
@@ -388,6 +453,45 @@ def build_dspreset(meta, cal, sample_prefix):
     for etype, eattrs in build_effects(meta, cal):
         ET.SubElement(effects_el, "effect",
                       {"type": etype, **{k: str(v) for k, v in eattrs.items()}})
+
+    # <modulators> is a TOP-LEVEL element, a sibling of <groups> and
+    # <effects> directly under <DecentSampler> -- confirmed against the
+    # official developer guide's own words: "This section lives below the
+    # top-level <DecentSampler> element". An earlier version of this code
+    # nested it inside <group>, which real DecentSampler does not
+    # recognize as a modulator container at all -- the LFO would have been
+    # silently dropped, exactly the "looks like it works but doesn't"
+    # failure mode this verification pass was meant to catch. Placement
+    # here has no bearing on scope="voice" vs "global": that's controlled
+    # purely by the <lfo>'s own `scope` attribute, not by where the
+    # <modulators> block sits in the tree.
+    lfo_mods = [m for m in (build_lfo_modulator(meta.get("lfo1", {})),
+                            build_lfo_modulator(meta.get("lfo2", {}))) if m]
+    if lfo_mods:
+        modulators_el = ET.SubElement(root, "modulators")
+        for lm in lfo_mods:
+            lfo_el = ET.SubElement(modulators_el, "lfo", {
+                "shape": lm["shape"],
+                "frequency": str(lm["frequency"]),
+                "scope": lm["scope"],
+                "delayTime": str(lm["delayTime"]),
+                # Left at the DecentSampler default (1.0): per-target depth
+                # is expressed via each binding's own translationOutputMin/
+                # Max instead (see _lfo_binding_range's docstring for why).
+                "modAmount": "1.0",
+            })
+            for b in lm["bindings"]:
+                battrs = {
+                    "type": b["type"], "level": b["level"],
+                    "parameter": b["parameter"],
+                    "modBehavior": b["modBehavior"],
+                    "translation": b["translation"],
+                    "translationOutputMin": str(b["translationOutputMin"]),
+                    "translationOutputMax": str(b["translationOutputMax"]),
+                }
+                if "groupIndex" in b:
+                    battrs["groupIndex"] = b["groupIndex"]
+                ET.SubElement(lfo_el, "binding", battrs)
 
     ET.indent(root, space="  ")
     return ET.tostring(root, encoding="unicode", xml_declaration=True)
@@ -493,7 +597,16 @@ def main():
     for pdir in patch_dirs:
         meta = json.loads((pdir / "patch.json").read_text())
         meta = _check_zone_files_exist(meta, pdir)
-        sample_prefix = f"Samples/{pdir.name}"
+        # NOTE: no "Samples/" wrapper. The real on-disk layout produced by
+        # jv_sampler + postprocess.py is flat -- FLACs live directly in
+        # <out_dir>/<pdir.name>/, alongside patch.json, and presets are
+        # written into <out_dir> itself (see main()'s `out_root`, which
+        # defaults to `library_dir` == <out_dir>) -- so the correct
+        # relative path from a preset to its samples is just the patch
+        # directory's own name. An earlier version of this used
+        # "Samples/<pdir.name>", which doesn't exist anywhere on disk and
+        # would have made every emitted <sample>/<region> unresolvable.
+        sample_prefix = pdir.name
 
         stem = f"{meta['bank']}{meta['index']:02d} {_sanitize_filename(meta['name'])}"
         (out_root / f"{stem}.dspreset").write_text(build_dspreset(meta, cal, sample_prefix))

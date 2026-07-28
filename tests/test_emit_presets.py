@@ -20,12 +20,25 @@ CALIB_PATH = Path(__file__).resolve().parents[1] / "calib" / "calibration.json"
 # Synthetic fixtures
 # ---------------------------------------------------------------------------
 
+_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+def note_name(midi):
+    """Mirror src/jv_sampler.cpp's note_name() exactly (NOTE_NAMES[midi%12]
+    + str(midi/12 - 1), e.g. 24 -> "C1", 27 -> "D#1", 96 -> "C7"), so
+    synthetic fixtures use the SAME filename shape the real renderer
+    produces -- including the '#' in sharp note names -- rather than a
+    simplified n<key> form that would never exercise whatever character
+    handling the real pipeline needs."""
+    return f"{_NOTE_NAMES[midi % 12]}{midi // 12 - 1}"
+
+
 def make_zone(key, velocity, layer, kind="sustaining", release=0.5,
               loop_enabled=True, crossfade=500, file=None):
     z = {
         "key": key, "velocity": velocity, "layer": layer,
         "frames": 200000,
-        "file": file or f"n{key}_v{layer}.flac",
+        "file": file or f"{note_name(key)}_v{layer}.flac",
         "kind": kind,
         "sustain_ratio": 0.4 if kind == "sustaining" else 0.0,
         "release": release,
@@ -99,8 +112,39 @@ CAL = {
 REAL_CAL = json.loads(CALIB_PATH.read_text()) if CALIB_PATH.exists() else None
 
 
-def parse(meta, cal=CAL, prefix="Samples/x"):
+def parse(meta, cal=CAL, prefix="x"):
     return ET.fromstring(ep.build_dspreset(meta, cal, prefix))
+
+
+def iattr(el, name):
+    """int() an XML attribute without tripping `str | None` type checks:
+    Element.get() is typed Optional[str], and these tests only ever call
+    this on an attribute they've already established is present, so a
+    plain "0" default is never actually exercised at runtime -- it only
+    exists to give int() a str, not None, to satisfy Pyright."""
+    return int(el.get(name, "0"))
+
+
+def fattr(el, name):
+    """float() counterpart to iattr -- see its docstring."""
+    return float(el.get(name, "0"))
+
+
+def sattr(el, name):
+    """str-typed .get() with a "" default, for callers that immediately
+    call a str method (.startswith/.endswith) or use `in` -- Element.get()
+    alone is typed Optional[str], which neither supports."""
+    return el.get(name, "")
+
+
+def find1(parent, path):
+    """ET's .find() is typed to return Optional[Element]; these tests only
+    ever call it where the element is known (by test construction) to
+    exist, so assert that instead of leaving a `| None` for every
+    subsequent .get()/.findall() call on the result to trip over."""
+    found = parent.find(path)
+    assert found is not None, f"expected to find {path!r}"
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +180,7 @@ def test_key_ranges_tile_0_to_127_no_gaps():
 
 def test_key_ranges_from_full_dspreset_tile_without_gaps():
     root = parse(make_meta())
-    spans = sorted({(int(s.get("loNote")), int(s.get("hiNote")))
+    spans = sorted({(iattr(s, "loNote"), iattr(s, "hiNote"))
                     for s in root.findall(".//sample")})
     assert spans[0][0] == 0
     assert spans[-1][1] == 127
@@ -175,7 +219,7 @@ def test_vel_ranges_tile_without_gaps_for_various_layer_counts(n):
 
 def test_velocity_ranges_from_full_dspreset_tile_1_to_127():
     root = parse(make_meta())
-    vr = sorted({(int(s.get("loVel")), int(s.get("hiVel")))
+    vr = sorted({(iattr(s, "loVel"), iattr(s, "hiVel"))
                  for s in root.findall(".//sample")})
     assert vr[0][0] == 1 and vr[-1][1] == 127
     for (_, hi), (lo, _) in zip(vr, vr[1:]):
@@ -204,13 +248,13 @@ def test_delay_type_emits_delay_never_reverb():
 def test_pan_dly_emits_delay_with_nonzero_stereo_offset():
     root = parse(make_meta(reverb_type="Pan-Dly"))
     delay_el = [e for e in root.findall(".//effect") if e.get("type") == "delay"][0]
-    assert float(delay_el.get("stereoOffset")) != 0.0
+    assert fattr(delay_el, "stereoOffset") != 0.0
 
 
 def test_plain_delay_type_has_zero_stereo_offset():
     root = parse(make_meta(reverb_type="Delay"))
     delay_el = [e for e in root.findall(".//effect") if e.get("type") == "delay"][0]
-    assert float(delay_el.get("stereoOffset")) == 0.0
+    assert fattr(delay_el, "stereoOffset") == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +266,7 @@ def test_chorus_effect_present_with_calibrated_mod_rate():
     ch = [e for e in root.findall(".//effect") if e.get("type") == "chorus"][0]
     # raw rate 50 sits between the 32 (0.9) and 96 (2.2734) calibration
     # points in CAL -- interpolated, so strictly between them.
-    assert 0.9 < float(ch.get("modRate")) < 2.2734
+    assert 0.9 < fattr(ch, "modRate") < 2.2734
 
 
 def test_interp_table_matches_hand_computed_value():
@@ -240,6 +284,7 @@ def test_chorus_rate_24_gap_does_not_yield_zero_hz():
     measurement was dominated by a non-chorus artifact. It is an
     INTERPOLATION GAP, not a zero -- table.get("24", 0) would silently
     produce a 0 Hz chorus, which this must not do."""
+    assert REAL_CAL is not None  # narrows for Pyright; guaranteed by skipif above
     assert "24" not in REAL_CAL["chorus_rate_hz"]
     rate = ep.interp_table(REAL_CAL["chorus_rate_hz"], 24)
     assert rate > 0.0
@@ -254,7 +299,7 @@ def test_chorus_rate_24_gap_end_to_end_through_dspreset():
     to it) in the generated XML."""
     root = parse(make_meta(chorus_rate=24), cal=CAL)
     ch = [e for e in root.findall(".//effect") if e.get("type") == "chorus"][0]
-    mod_rate = float(ch.get("modRate"))
+    mod_rate = fattr(ch, "modRate")
     assert mod_rate > 0.05, f"chorus rate=24 gap produced near-zero modRate: {mod_rate}"
 
 
@@ -263,6 +308,7 @@ def test_reverb_rt60_hall1_dip_is_preserved_not_smoothed():
     """reverb_rt60 type 4 (Hall1) has a genuine measured dip (~0.27s)
     between raw 16 (2.0773) and raw 32 (1.8122). Interpolation must
     reproduce that dip, not fit a monotonic curve that erases it."""
+    assert REAL_CAL is not None  # narrows for Pyright; guaranteed by skipif above
     table = REAL_CAL["reverb_rt60"]["4"]
     v16 = table["16"]
     v32 = table["32"]
@@ -293,22 +339,71 @@ def test_stripped_free_running_lfo_emits_global_scope():
 def test_stripped_lfo_binds_to_tva_target():
     # make_meta's lfo1 has tva=20, pitch=0, tvf=0
     root = parse(make_meta(lfo1_stripped=True))
-    lfo = root.find(".//lfo")
+    lfo = find1(root, ".//lfo")
     bindings = lfo.findall("binding")
     assert len(bindings) == 1
-    assert bindings[0].get("parameter") == "AMP_VOLUME"
+    b = bindings[0]
+    assert b.get("parameter") == "AMP_VOLUME"
+    # Verified against the official DecentSampler developer guide's
+    # Appendix B: Group Volume is type="amp" level="group", requires a
+    # groupIndex identifying which <group> (there's only ever one here,
+    # index 0). "voice" is never a valid `level` value at all.
+    assert b.get("type") == "amp"
+    assert b.get("level") == "group"
+    assert b.get("groupIndex") == "0"
+    assert b.get("modBehavior") == "modulate"
+    # translationOutputMin/Max carry the actual per-target depth (see
+    # _lfo_binding_range's docstring) -- <binding> itself has no modAmount
+    # attribute at all.
+    assert b.get("modAmount") is None
+    assert fattr(b, "translationOutputMin") < 0 < fattr(b, "translationOutputMax")
+
+
+def test_modulators_is_top_level_not_nested_in_group():
+    """The official developer guide states <modulators> "lives below the
+    top-level <DecentSampler> element" -- it is a SIBLING of <groups> and
+    <effects>, not something nested inside an individual <group>. Getting
+    this wrong means real DecentSampler doesn't recognize the block as a
+    modulator container at all and the LFO is silently dropped."""
+    root = parse(make_meta(lfo1_stripped=True))
+    modulators = root.find("modulators")
+    assert modulators is not None, "<modulators> must exist as a top-level element"
+    assert modulators in list(root), "<modulators> must be a direct child of <DecentSampler>"
+    group = find1(root, ".//group")
+    assert group.find("modulators") is None, "<modulators> must NOT be nested inside <group>"
+
+
+def test_tvf_only_depth_emits_no_lfo_no_valid_target():
+    """TVF has no valid DecentSampler binding target in this pipeline's
+    output: FX_FILTER_FREQUENCY is real but requires an actual filter
+    effect in the chain, and build_effects() never emits one (the JV's
+    TVF filter is already baked into the render). A patch whose ONLY
+    nonzero LFO depth is tvf must therefore emit no <lfo> at all, rather
+    than a binding that looks plausible but targets the wrong effect."""
+    meta = make_meta(lfo1_stripped=True)
+    meta["lfo1"]["tva"] = 0
+    meta["lfo1"]["pitch"] = 0
+    meta["lfo1"]["tvf"] = 40
+    root = parse(meta)
+    assert root.find(".//lfo") is None
+
+
+def test_build_lfo_modulator_tvf_alone_returns_none():
+    lfo = {"stripped": True, "form": "SIN", "rate": 60, "delay": 0, "sync": 1,
+           "pitch": 0, "tvf": 63, "tva": 0}
+    assert ep.build_lfo_modulator(lfo) is None
 
 
 def test_stripped_lfo_shape_tri_maps_to_sine():
     root = parse(make_meta(lfo1_stripped=True, lfo_form="TRI"))
-    assert root.find(".//lfo").get("shape") == "sine"
+    assert find1(root, ".//lfo").get("shape") == "sine"
 
 
 @pytest.mark.parametrize("form", ["SIN", "SAW", "SQU"])
 def test_stripped_lfo_shape_maps_correctly(form):
     root = parse(make_meta(lfo1_stripped=True, lfo_form=form))
     expected = {"SIN": "sine", "SAW": "saw", "SQU": "square"}[form]
-    assert root.find(".//lfo").get("shape") == expected
+    assert find1(root, ".//lfo").get("shape") == expected
 
 
 @pytest.mark.parametrize("form", ["RND1", "RND2"])
@@ -336,6 +431,13 @@ def test_build_lfo_modulator_directly_multiple_targets():
     assert m is not None
     params = {b["parameter"] for b in m["bindings"]}
     assert params == {"AMP_VOLUME", "GROUP_TUNING"}
+    # GROUP_TUNING is real (verified against Appendix B) but is type="amp"
+    # like AMP_VOLUME, NOT type="generic" -- an earlier version of this
+    # code got the parameter name right but the type wrong.
+    for b in m["bindings"]:
+        assert b["type"] == "amp"
+        assert b["level"] == "group"
+        assert b["groupIndex"] == ep.GROUP_INDEX
 
 
 # ---------------------------------------------------------------------------
@@ -351,17 +453,34 @@ def test_loop_crossfade_passed_through_unchanged():
             z["loop"]["crossfade"] = 137
     root = parse(meta)
     sample = [s for s in root.findall(".//sample") if s.get("rootNote") == "24"
-              and int(s.get("loVel")) == 1][0]
+              and iattr(s, "loVel") == 1][0]
     assert sample.get("loopCrossfade") == "137"
 
 
 def test_loop_attributes_present_for_looped_zone():
     root = parse(make_meta())
-    s = root.find(".//sample")
+    s = find1(root, ".//sample")
     assert s.get("loopEnabled") == "1"
-    assert int(s.get("loopStart")) == 48000
-    assert int(s.get("loopEnd")) == 158000
-    assert int(s.get("loopCrossfade")) <= 2000
+    assert iattr(s, "loopStart") == 48000
+    assert iattr(s, "loopEnd") == 158000
+    assert iattr(s, "loopCrossfade") <= 2000
+
+
+def test_sample_release_attribute_matches_measured_zone_release():
+    """DecentSampler's per-sample envelope release attribute is `release`
+    (alongside attack/decay/sustain), confirmed against the official
+    developer guide -- NOT `ampegRelease`, which isn't a real attribute at
+    all and would be silently ignored, discarding every measured release
+    time from postprocess.py's measure_release without any error."""
+    meta = make_meta()
+    for z in meta["zones"]:
+        if z["key"] == 24 and z["layer"] == 1:
+            z["release"] = 1.234
+    root = parse(meta)
+    sample = [s for s in root.findall(".//sample") if s.get("rootNote") == "24"
+              and iattr(s, "loVel") == 1][0]
+    assert sample.get("release") == "1.234"
+    assert sample.get("ampegRelease") is None
 
 
 def test_non_looped_zone_has_no_loop_attributes():
@@ -372,7 +491,7 @@ def test_non_looped_zone_has_no_loop_attributes():
             z["loop"] = {"enabled": False}
     root = parse(meta)
     sample = [s for s in root.findall(".//sample") if s.get("rootNote") == "24"
-              and int(s.get("loVel")) == 1][0]
+              and iattr(s, "loVel") == 1][0]
     assert sample.get("loopEnabled") is None
     assert sample.get("loopStart") is None
 
@@ -386,20 +505,20 @@ def test_missing_zone_produces_no_sample():
     root = parse(meta)
     samples = root.findall(".//sample")
     assert len(samples) == 25 * 3 - 1
-    paths = [s.get("path") for s in samples]
+    paths = [sattr(s, "path") for s in samples]
     assert not any("does_not_exist" in p for p in paths)
 
 
 def test_error_zone_produces_no_sample():
     meta = make_meta(zone_overrides={(60, 1): {"kind": "error", "file": "corrupt.wav"}})
     root = parse(meta)
-    paths = [s.get("path") for s in root.findall(".//sample")]
+    paths = [sattr(s, "path") for s in root.findall(".//sample")]
     assert not any("corrupt" in p for p in paths)
 
 
 def test_missing_zone_produces_no_sfz_region():
     meta = make_meta(zone_overrides={(24, 2): {"kind": "missing", "file": "does_not_exist.wav"}})
-    sfz = ep.build_sfz(meta, "Samples/x")
+    sfz = ep.build_sfz(meta, "x")
     assert "does_not_exist" not in sfz
     assert sfz.count("<region>") == 25 * 3 - 1
 
@@ -413,9 +532,9 @@ def test_key_with_all_layers_missing_leaves_no_gap_in_neighbours():
                  (24, 3): {"kind": "missing", "file": "x.wav"}}
     meta = make_meta(zone_overrides=overrides)
     root = parse(meta)
-    root_notes = {int(s.get("rootNote")) for s in root.findall(".//sample")}
+    root_notes = {iattr(s, "rootNote") for s in root.findall(".//sample")}
     assert 24 not in root_notes
-    spans = sorted({(int(s.get("loNote")), int(s.get("hiNote")))
+    spans = sorted({(iattr(s, "loNote"), iattr(s, "hiNote"))
                     for s in root.findall(".//sample")})
     assert spans[0][0] == 0
     assert spans[-1][1] == 127
@@ -430,7 +549,7 @@ def test_partial_key_failure_still_tiles_velocity():
     root = parse(meta)
     samples = [s for s in root.findall(".//sample") if s.get("rootNote") == "24"]
     assert len(samples) == 2
-    vr = sorted((int(s.get("loVel")), int(s.get("hiVel"))) for s in samples)
+    vr = sorted((iattr(s, "loVel"), iattr(s, "hiVel")) for s in samples)
     assert vr[0][0] == 1 and vr[-1][1] == 127
     assert vr[0][1] + 1 == vr[1][0]
 
@@ -464,7 +583,7 @@ def test_effective_send_ignores_inactive_tone_contribution():
 
 def test_chorus_feeds_reverb_when_output_is_reverb():
     root = parse(make_meta(chorus_output="Reverb"))
-    types = [e.get("type") for e in root.find("effects")]
+    types = [e.get("type") for e in find1(root, "effects")]
     assert types.index("chorus") < types.index("reverb")
 
 
@@ -474,7 +593,7 @@ def test_chorus_parallel_after_reverb_when_output_is_mix():
     # after" -- i.e. reverb is NOT fed by chorus here, so reverb comes
     # first and chorus is appended after it.
     root = parse(make_meta(chorus_output="Mix"))
-    types = [e.get("type") for e in root.find("effects")]
+    types = [e.get("type") for e in find1(root, "effects")]
     assert types.index("chorus") > types.index("reverb")
 
 
@@ -483,12 +602,12 @@ def test_chorus_parallel_after_reverb_when_output_is_mix():
 # ---------------------------------------------------------------------------
 
 def test_sfz_has_one_region_per_zone():
-    sfz = ep.build_sfz(make_meta(), "Samples/x")
+    sfz = ep.build_sfz(make_meta(), "x")
     assert sfz.count("<region>") == 25 * 3
 
 
 def test_sfz_region_has_matching_key_vel_ranges_and_release():
-    sfz = ep.build_sfz(make_meta(), "Samples/x")
+    sfz = ep.build_sfz(make_meta(), "x")
     assert "lokey=0" in sfz  # lowest key's span starts at 0
     assert "hikey=127" in sfz  # highest key's span ends at 127
     assert "lovel=1" in sfz
@@ -497,7 +616,7 @@ def test_sfz_region_has_matching_key_vel_ranges_and_release():
 
 
 def test_sfz_looped_zone_has_loop_opcodes():
-    sfz = ep.build_sfz(make_meta(), "Samples/x")
+    sfz = ep.build_sfz(make_meta(), "x")
     assert "loop_mode=loop_continuous" in sfz
     assert "loop_start=48000 loop_end=158000" in sfz
 
@@ -507,7 +626,7 @@ def test_sfz_non_looped_zone_has_no_loop_points_only_no_loop_mode():
     for z in meta["zones"]:
         z["kind"] = "decaying"
         z["loop"] = {"enabled": False}
-    sfz = ep.build_sfz(meta, "Samples/x")
+    sfz = ep.build_sfz(meta, "x")
     assert "loop_mode=no_loop" in sfz
     assert "loop_mode=loop_continuous" not in sfz
     assert "loop_start=" not in sfz
@@ -518,30 +637,61 @@ def test_sfz_non_looped_zone_has_no_loop_points_only_no_loop_mode():
 # ---------------------------------------------------------------------------
 
 def test_sample_paths_use_sample_prefix_and_zone_file():
-    root = parse(make_meta(), prefix="Samples/000_TestPatch")
-    sample = root.find(".//sample")
-    assert sample.get("path").startswith("Samples/000_TestPatch/")
-    assert sample.get("path").endswith(".flac")
+    # Real layout is flat: jv_sampler + postprocess.py write FLACs
+    # directly into <out_dir>/<patchdir>/, with no "Samples/" wrapper (see
+    # main()'s sample_prefix, which is just pdir.name).
+    root = parse(make_meta(), prefix="000_TestPatch")
+    sample = find1(root, ".//sample")
+    assert sattr(sample, "path").startswith("000_TestPatch/")
+    assert sattr(sample, "path").endswith(".flac")
+
+
+def test_realistic_note_names_including_sharp_survive_unmangled():
+    """Real rendered filenames are note-name based (A1_v1.flac,
+    D#4_v2.flac, C1_v3.flac -- see src/jv_sampler.cpp's note_name()), not
+    a simplified n<key> form. In particular, sharp keys produce a literal
+    '#' in the filename -- confirm it survives XML attribute
+    serialization/parsing and SFZ text output unmangled (not escaped,
+    not URL-encoded, not dropped)."""
+    meta = make_meta()
+    # key=27 -> D#1 (MIDI 27 % 12 == 3 -> "D#", 27 // 12 - 1 == 1)
+    sharp_zone = next(z for z in meta["zones"] if z["key"] == 27 and z["layer"] == 1)
+    assert sharp_zone["file"] == "D#1_v1.flac"  # fixture sanity check
+
+    root = parse(meta, prefix="000_TestPatch")
+    sample = [s for s in root.findall(".//sample") if s.get("rootNote") == "27"
+              and iattr(s, "loVel") == 1][0]
+    assert sample.get("path") == "000_TestPatch/D#1_v1.flac"
+
+    sfz = ep.build_sfz(meta, "000_TestPatch")
+    assert "sample=D#1_v1.flac" in sfz
 
 
 def test_end_to_end_emitted_sample_paths_exist_on_disk(tmp_path):
     """Integration-level check of AC 9: write real FLAC-named (empty)
-    files at the location `sample_prefix` implies (mirroring what main()
-    assembles: presets sit in `library_dir`, samples in
-    `library_dir/Samples/<patchdir>/`), run build_dspreset, and verify
-    every emitted <sample path> resolves relative to the preset's own
-    directory -- while a deliberately-missing zone must never appear."""
+    files at the location `sample_prefix` implies, mirroring what main()
+    ACTUALLY assembles -- a flat layout with no "Samples/" wrapper: the
+    .dspreset lives directly in `library_dir` and its samples live in
+    `library_dir/<patchdir>/` (patch.json's own directory), not under any
+    "Samples/" subfolder. An earlier version of this test (and of
+    main()'s sample_prefix) assumed a "Samples/<patchdir>/" wrapper that
+    doesn't exist anywhere on disk -- this fixture would have failed to
+    catch that regression because it built its OWN matching-but-wrong
+    "Samples/" directory instead of the real layout. Verify every emitted
+    <sample path> resolves relative to the preset's own directory, using
+    realistic note-name filenames (including a sharp), while a
+    deliberately-missing zone must never appear."""
     library_dir = tmp_path  # where the .dspreset itself would be written
     patch_name = "000_TestPatch"
-    samples_dir = library_dir / "Samples" / patch_name
-    samples_dir.mkdir(parents=True)
+    patch_dir = library_dir / patch_name  # NOT library_dir / "Samples" / patch_name
+    patch_dir.mkdir(parents=True)
 
     meta = make_meta(zone_overrides={(24, 2): {"kind": "missing", "file": "ghost.flac"}})
     for z in meta["zones"]:
         if z.get("kind") not in ep.FAILURE_KINDS:
-            (samples_dir / z["file"]).write_bytes(b"")  # placeholder, existence is what matters
+            (patch_dir / z["file"]).write_bytes(b"")  # placeholder, existence is what matters
 
-    sample_prefix = f"Samples/{patch_name}"
+    sample_prefix = patch_name  # matches main()'s pdir.name, no "Samples/" prefix
     xml_text = ep.build_dspreset(meta, CAL, sample_prefix)
     root = ET.fromstring(xml_text)
 
@@ -549,3 +699,38 @@ def test_end_to_end_emitted_sample_paths_exist_on_disk(tmp_path):
                if not (library_dir / s.get("path")).exists()]
     assert missing == []
     assert not any("ghost" in (s.get("path") or "") for s in root.findall(".//sample"))
+    # A sharp-named sample must resolve too, not just plain ones.
+    sharp_paths = [s.get("path") for s in root.findall(".//sample") if "#" in (s.get("path") or "")]
+    assert sharp_paths, "fixture sanity check: expected at least one sharp-named sample"
+    assert all((library_dir / p).exists() for p in sharp_paths)
+
+
+def test_main_uses_flat_sample_prefix_matching_real_layout(tmp_path, monkeypatch, capsys):
+    """End-to-end main(): build a patch directory in the REAL flat layout
+    jv_sampler/postprocess.py actually produce (FLACs alongside
+    patch.json, no "Samples/" wrapper), run main() against it, and verify
+    the emitted .dspreset's <sample path> attributes resolve relative to
+    the library directory main() wrote the preset into."""
+    library_dir = tmp_path / "JV-880 Internal"
+    patch_dir = library_dir / "000_Test Patch"
+    patch_dir.mkdir(parents=True)
+
+    meta = make_meta()
+    meta["name"] = "Test Patch"
+    for z in meta["zones"]:
+        (patch_dir / z["file"]).write_bytes(b"")
+    (patch_dir / "patch.json").write_text(json.dumps(meta))
+
+    cal_path = tmp_path / "calibration.json"
+    cal_path.write_text(json.dumps(CAL))
+
+    monkeypatch.setattr(sys, "argv", ["emit_presets.py", str(library_dir), str(cal_path)])
+    ep.main()
+
+    dspreset_files = list(library_dir.glob("*.dspreset"))
+    assert len(dspreset_files) == 1
+    root = ET.parse(dspreset_files[0]).getroot()
+    samples = root.findall(".//sample")
+    assert samples
+    missing = [s.get("path") for s in samples if not (library_dir / s.get("path")).exists()]
+    assert missing == []
