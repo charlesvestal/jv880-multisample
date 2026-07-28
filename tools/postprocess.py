@@ -5,6 +5,7 @@ Turns the raw 64 kHz WAV renders produced by the C++ renderer (Task 3) into
 48 kHz / 24-bit FLAC files, annotating each zone in ``patch.json`` with loop
 points (for sustaining zones only) and a measured release time.
 """
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -48,44 +49,38 @@ def classify(x, hold_frames):
     return ("sustaining" if ratio > 0.18 else "decaying"), ratio
 
 
-def estimate_period(mono, sr):
-    """Fundamental period in frames via autocorrelation, refined to
-    sub-sample precision by parabolic interpolation of the peak.
-
-    Sub-sample precision matters: multiplying a merely-integer period by up
-    to 60 periods (see find_loop) would amplify a fraction-of-a-sample
-    truncation error into many samples of accumulated phase drift.
-    """
-    seg = mono - mono.mean()
-    if len(seg) < 4096:
-        return 0.0
-    # fftconvolve is O(n log n) vs np.correlate's direct O(n^2); on the
-    # ~100-300k-frame steady-state regions this pipeline actually sees,
-    # np.correlate cost ~8s per sustaining zone (measured: 117,600 frames
-    # -> 7.4s) which would add hours to a multi-thousand-patch batch.
-    # fftconvolve(seg, seg[::-1], "full") is the standard identity for
-    # correlate(seg, seg, "full") and is ~1370x faster at that size
-    # (verified numerically identical, max diff ~1e-11 -- floating-point
-    # noise, not a behavior change). See test_estimate_period_performance.
-    ac = fftconvolve(seg, seg[::-1], mode="full")[len(seg) - 1:]
-    ac /= (ac[0] + 1e-12)
-    lo, hi = int(sr / 1200), int(sr / 40)     # 40 Hz .. 1200 Hz
-    hi = min(hi, len(ac) - 1)
-    if hi <= lo:
-        return 0.0
-    k = int(lo + np.argmax(ac[lo:hi]))
-    if k <= 0 or k >= len(ac) - 1:
-        return float(k)
-    y0, y1, y2 = ac[k - 1], ac[k], ac[k + 1]
-    denom = y0 - 2 * y1 + y2
-    if abs(denom) < 1e-12:
-        return float(k)
-    offset = float(np.clip(0.5 * (y0 - y2) / denom, -1.0, 1.0))
-    return float(k) + offset
+MIN_LOOP_SECONDS = 0.05
+REF_WIN = 2048  # reference window (frames) for the cross-correlation search
 
 
 def find_loop(x, sr, hold_frames):
-    """Correlation-matched loop points inside the steady-state region."""
+    """Correlation-matched loop points inside the steady-state region.
+
+    Searches loop LENGTH directly via FFT cross-correlation over the whole
+    steady-state region, rather than constraining candidates to multiples
+    of an estimated pitch period. The period-multiple approach (the
+    original design) put a hard ceiling on how far the search could reach:
+    at 60 periods, a ~1245 Hz note (period ~39 frames) only reaches ~48ms,
+    while its real repeat lived at 1.9s -- so nothing above the bass
+    register could ever find its actual loop point, and it silently looked
+    like "this material isn't loopable" (pilot render: 7,112 sustaining
+    zones, only 1,284 looped -- 3.8%). Low notes happened to work because
+    their long periods pushed 60 multiples into a useful range, which is
+    why this passed unnoticed on a 220 Hz synthetic test signal.
+
+    For every lag L from MIN_LOOP_SECONDS up to as long as the region
+    allows, this scores normalized cross-correlation between a REF_WIN-
+    frame window at loop_start and one at loop_start+L. Cross-correlation
+    at every lag is computed in one FFT call (`fftconvolve`, the same
+    O(n log n) trick used for the earlier autocorrelation fix) rather than
+    a Python loop over candidate lengths -- this runs per sustaining zone,
+    ~7,000+ times a batch, and needs to stay in the low-milliseconds.
+    Because every lag is scored at full sample resolution already (not a
+    coarse grid), there's no separate "fine" refinement pass afterward:
+    the endpoint discontinuity (dv) used for the final pick is exact for
+    every candidate, which is a tighter alignment than the old period-
+    based sub-sample interpolation ever produced.
+    """
     if len(x) == 0:
         return None
     mono = x.mean(axis=1) if x.ndim > 1 else x
@@ -94,56 +89,74 @@ def find_loop(x, sr, hold_frames):
     if region_hi - start_lo < int(0.3 * sr):
         return None
 
-    period = estimate_period(mono[start_lo:region_hi], sr)
-    if not np.isfinite(period) or period <= 0:
-        return None
-
-    win = max(int(round(period * 2)), 256)
     loop_start = start_lo
+    # float64 throughout: the cumulative-sum trick below for rolling
+    # window energy is numerically sensitive to precision loss over
+    # ~100k+ samples, and the source may already be float32 (see
+    # sf.read(..., dtype="float32") in process_patch).
+    region = mono[loop_start:region_hi].astype(np.float64)
+    n_region = len(region)
 
-    # Try loop lengths from 8 to 60 periods; longer loops sound less static.
-    # NOTE (not fixed here): this choice has no awareness of the patch's
-    # own LFO1/LFO2 rate. A slow vibrato/tremolo whose cycle is longer than
-    # the chosen loop length gets flattened once looped, since the loop
-    # only ever replays one phase of the LFO. Inherited from the original
-    # design; real LFO-modulated renders exist now (Task 3 is built), but
-    # this hasn't been evaluated against them yet -- needs auditioning
-    # real pad/string patches before deciding how to size loops relative
-    # to LFO period.
-    # `period` is a non-integer estimate, so `period * n_per` rounds to a
-    # slightly different sub-sample residual for each n_per. Rather than
-    # trust a single windowed-correlation "best" (which tolerates small
-    # phase error and can still leave a visible endpoint discontinuity),
-    # score every candidate that passes the periodicity gate by its actual
-    # sample-level endpoint match -- across ~50 candidates at least one
-    # lands very close to true phase alignment.
-    candidates = []  # (n_per, end, dv, score)
-    for n_per in range(8, 61):
-        end = int(round(loop_start + period * n_per))
-        if end + win >= region_hi:
-            break
-        a = mono[loop_start:loop_start + win]
-        b = mono[end:end + win]
-        denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
-        score = float(np.dot(a, b) / denom)
-        if score < 0.90:
-            continue
-        dv = abs(float(mono[loop_start]) - float(mono[end]))
-        candidates.append((n_per, end, dv, score))
-
-    if not candidates:
+    win = min(REF_WIN, n_region // 2)
+    if win < 64:
         return None
+
+    ref = region[:win]
+    ref_norm = float(np.linalg.norm(ref))
+    if ref_norm <= 1e-12:
+        return None
+
+    l_min = int(MIN_LOOP_SECONDS * sr)
+    l_max = n_region - win
+    if l_max < l_min:
+        return None
+
+    # numerator[L] = sum_j region[L+j] * ref[j] for every lag L at once --
+    # the standard correlation-as-convolution identity (mode="valid" here
+    # instead of "full", since we only want in-range lags).
+    numerator = fftconvolve(region, ref[::-1], mode="valid")
+    # Rolling window energy via cumulative sum of squares, so
+    # norm(region[L:L+win]) doesn't need recomputing from scratch per lag.
+    csq = np.cumsum(np.concatenate(([0.0], region ** 2)))
+    win_energy = csq[win:] - csq[:-win]
+    win_norm = np.sqrt(np.maximum(win_energy, 0.0))
+    denom = ref_norm * win_norm + 1e-12
+    score = numerator / denom
+
+    lags = np.arange(len(score))
+    # Correlation gate unchanged from the period-based version (0.90); the
+    # bug being fixed is the search's reach, not this threshold.
+    mask = (lags >= l_min) & (lags <= l_max) & np.isfinite(score) & (score >= 0.90)
+    if not np.any(mask):
+        return None
+
+    cand_lags = lags[mask]
+    cand_scores = score[mask]
+    dv_vals = np.abs(region[0] - region[cand_lags])
 
     # Among the candidates, prefer a LONGER loop (fewer perceptible
     # repeats -- a real quality concern on the pads/strings this pipeline
     # is full of), but not at the cost of a meaningfully worse endpoint
     # match. Take every candidate within a small tolerance of the best
     # achievable discontinuity, then pick the longest of those.
-    best_dv = min(c[2] for c in candidates)
+    #
+    # NOTE (not fixed here): this still has no explicit awareness of the
+    # patch's own LFO1/LFO2 rate. Loops now generally land much longer
+    # than the old ~60-period ceiling (often close to the full region),
+    # which incidentally makes it less likely a loop is shorter than one
+    # LFO cycle -- but nothing here specifically checks that. Needs
+    # auditioning real LFO-modulated pad/string renders to know whether
+    # this needs a dedicated fix.
+    best_dv = float(np.min(dv_vals))
     peak = float(np.max(np.abs(mono))) if len(mono) else 0.0
     tol = max(best_dv * 2.0, 0.0005 * peak, 1e-9)
-    near_best = [c for c in candidates if c[2] <= tol]
-    n_per, end, dv, score = max(near_best, key=lambda c: c[0])
+    near_mask = dv_vals <= tol
+    near_lags = cand_lags[near_mask]
+    near_scores = cand_scores[near_mask]
+
+    best_idx = int(np.argmax(near_lags))
+    end = loop_start + int(near_lags[best_idx])
+    chosen_score = float(near_scores[best_idx])
 
     length = end - loop_start
     if length <= 0:
@@ -153,7 +166,7 @@ def find_loop(x, sr, hold_frames):
     # loopStart or the loop length, so cap it hard on every path here.
     xfade = int(min(MAX_XFADE, loop_start // 4, length // 4))
     return {"enabled": True, "start": int(loop_start), "end": int(end),
-            "crossfade": int(max(0, xfade)), "score": round(score, 4)}
+            "crossfade": int(max(0, xfade)), "score": round(chosen_score, 4)}
 
 
 def measure_release(x, sr, hold_frames):
@@ -330,8 +343,94 @@ def process_patch(pdir: Path, hold_seconds=3.5):
     return meta
 
 
+def reloop_patch(pdir: Path, hold_seconds=3.5):
+    """Re-run classification and loop detection on the already-encoded
+    48 kHz FLACs in place, WITHOUT re-encoding audio or touching sample
+    files (zone["file"], zone["frames"], and the audio bytes are never
+    modified) -- only zone["kind"], zone["sustain_ratio"], zone["loop"],
+    and zone["release"] are refreshed.
+
+    process_patch deletes the source .wav after writing the .flac, so it
+    cannot be re-run to pick up a loop-detection improvement; that would
+    need a full re-render (37GB for the pilot library alone). This is the
+    path for iterating on loop quality against already-processed output --
+    which, per the find_loop rewrite above, we know we'll need to do again.
+    The FLACs are lossless 48kHz/24-bit, so reading them back for
+    classification loses nothing relative to the .wav they came from.
+    """
+    meta = json.loads((pdir / "patch.json").read_text())
+    hold_out = int(hold_seconds * SR_OUT)
+
+    for z in meta["zones"]:
+        fname = z.get("file")
+        # Only a zone that actually has encoded audio can be re-looped; a
+        # "missing"/"error" zone (see FAILURE_KINDS) has no .flac to read,
+        # and re-loop must never invent or touch sample files -- leave
+        # those zones exactly as process_patch (or a previous reloop) left
+        # them.
+        if not fname or Path(fname).suffix.lower() != ".flac":
+            continue
+        src = pdir / fname
+        if not src.exists():
+            continue
+
+        try:
+            y, sr = sf.read(str(src), always_2d=True, dtype="float32")
+            assert sr == SR_OUT, (
+                f"unexpected rate {sr} in {src} (expected {SR_OUT}; this "
+                "should already be an encoded 48kHz FLAC)"
+            )
+
+            kind, ratio = classify(y, hold_out)
+            loop = find_loop(y, SR_OUT, hold_out) if kind == "sustaining" else None
+            release_val = round(measure_release(y, SR_OUT, hold_out), 4)
+
+            z["kind"] = kind
+            z["sustain_ratio"] = round(ratio, 4)
+            z["loop"] = loop or {"enabled": False}
+            z["release"] = release_val
+        except Exception as exc:
+            # Unlike process_patch, we deliberately do NOT downgrade the
+            # zone to _mark_zone_unprocessable here: the .flac is valid
+            # audio that already had working (if possibly imperfect)
+            # metadata from a prior run, so a transient re-loop failure
+            # shouldn't discard that in favour of an "error" zone with no
+            # usable loop info at all. Leave the previous metadata as-is.
+            print(
+                f"  reloop zone {fname!r} (key={z.get('key')}, "
+                f"velocity={z.get('velocity')}): FAILED ({exc!r}) -- "
+                "leaving previous metadata, continuing with next zone",
+                file=sys.stderr,
+            )
+
+    meta["sample_rate"] = SR_OUT
+    (pdir / "patch.json").write_text(json.dumps(meta, indent=2))
+    return meta
+
+
+def _build_arg_parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "root",
+        help="Directory containing per-patch subdirectories, each with a patch.json.",
+    )
+    p.add_argument(
+        "--reloop",
+        action="store_true",
+        help=(
+            "Re-run classification and loop detection on the existing "
+            "48kHz FLACs in place, without re-encoding audio or touching "
+            "sample files. Use this to pick up a find_loop improvement "
+            "without a full re-render."
+        ),
+    )
+    return p
+
+
 def main():
-    root = Path(sys.argv[1])
+    args = _build_arg_parser().parse_args()
+    root = Path(args.root)
+    process_fn = reloop_patch if args.reloop else process_patch
     dirs = sorted(p for p in root.iterdir() if (p / "patch.json").exists())
 
     # A systemic bug that quietly errors out a chunk of zones must not
@@ -350,7 +449,7 @@ def main():
         # inside process_patch -- this is the outer safety net for
         # failures at the whole-patch level.
         try:
-            m = process_patch(d)
+            m = process_fn(d)
         except Exception as exc:
             patch_failures += 1
             failures.append({"scope": "patch", "patch": d.name, "reason": repr(exc)})

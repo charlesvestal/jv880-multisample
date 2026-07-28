@@ -49,16 +49,22 @@ def test_crossfade_bounded():
     # regression to e.g. `length // 3` would still satisfy a
     # self-referential "crossfade <= min(...)" check computed the same way
     # the implementation computes it.
+    #
+    # Values below are for the length-based FFT search (see find_loop):
+    # a pure 220 Hz tone is periodic at every lag, so the "prefer longer"
+    # tiebreak walks all the way out near the end of the reachable region
+    # (region_hi - REF_WIN), not just to a small multiple of the pitch
+    # period.
     t = np.arange(int(6.0 * SR)) / SR
     mono = 0.5 * np.sin(2 * np.pi * 220.0 * t)
     x = make_stereo(mono)
     loop = pp.find_loop(x, SR, HOLD)
     assert loop is not None
     assert loop["start"] == 48000
-    assert loop["end"] == 60000
+    assert loop["end"] == 163200
     assert loop["crossfade"] == 2000
     # This specific case exercises the MAX_XFADE branch of the min(): both
-    # start//4 (12000) and length//4 (3000) exceed MAX_XFADE (2000), so
+    # start//4 (12000) and length//4 (28800) exceed MAX_XFADE (2000), so
     # MAX_XFADE is the binding constraint here.
     assert loop["crossfade"] == pp.MAX_XFADE
     # Independent sanity check against the documented bound, using the
@@ -69,9 +75,9 @@ def test_crossfade_bounded():
 
 def test_find_loop_prefers_longer_loop_when_endpoints_are_comparable():
     """A clean periodic signal has a near-perfect endpoint match at nearly
-    every candidate n_per from 8 to 60 -- the tiebreak must pull toward the
-    longest such candidate (less perceptible repetition on pads/strings),
-    not just whichever n_per happens to have the single smallest dv.
+    every reachable lag -- the tiebreak must pull toward a long candidate
+    (less perceptible repetition on pads/strings), not just whichever lag
+    happens to have the single smallest endpoint discontinuity.
     """
     t = np.arange(int(6.0 * SR)) / SR
     mono = 0.5 * np.sin(2 * np.pi * 220.0 * t)
@@ -85,6 +91,88 @@ def test_find_loop_prefers_longer_loop_when_endpoints_are_comparable():
         f"loop length {length} is too close to the shortest 8-period "
         f"candidate ({shortest_candidate:.0f}); longer-loop tiebreak does "
         "not appear to be working"
+    )
+
+
+def test_high_frequency_loop_beyond_old_period_multiple_ceiling():
+    """Regression test for the exact pilot-render bug: the OLD find_loop
+    constrained candidates to end = loop_start + period * n for n in
+    8..60, so for a ~1200 Hz note (period ~40 frames) the search never
+    reached beyond ~60*40 = 2400 frames (50ms). Real material (e.g. the
+    pilot's "Wave Bells") has its actual repeat far beyond that -- e.g.
+    D#6 at 1.9s, corr 0.996 -- so those zones classified sustaining but
+    got no loop at all (pilot: 7,112 sustaining zones, only 1,284 looped,
+    3.8%), silently looking like "this material isn't loopable" when it
+    wasn't.
+
+    This builds a textured, high-frequency, NON-tonal signal (bandpass
+    noise -- no coherent short-period structure at all, standing in for
+    inharmonic bell-like material) with an exact copy spliced in at
+    L_target=1.9s. A single pure tone can't demonstrate this bug (every
+    period multiple of a pure tone is trivially a perfect match, which is
+    exactly why the bug passed unnoticed on this file's own 220 Hz test
+    signal) -- the point is that old-style short-lag candidates must
+    genuinely NOT correlate, only the engineered long lag should.
+    """
+    from scipy.signal import butter, sosfiltfilt
+
+    n_total = int(6.0 * SR)
+    rng = np.random.default_rng(42)
+    noise = rng.standard_normal(n_total)
+    sos = butter(4, [900, 6000], btype="bandpass", fs=SR, output="sos")
+    texture = sosfiltfilt(sos, noise)
+    texture /= np.max(np.abs(texture)) + 1e-9
+    mono = 0.5 * texture
+
+    start_lo = int(1.0 * SR)
+    l_target = int(1.9 * SR)
+    overlap = 4096  # > REF_WIN, so the engineered repeat is unambiguous
+    mono[start_lo + l_target: start_lo + l_target + overlap] = \
+        mono[start_lo: start_lo + overlap]
+    x = make_stereo(mono)
+
+    kind, ratio = pp.classify(x, HOLD)
+    assert kind == "sustaining", f"test signal must classify sustaining (ratio={ratio})"
+
+    loop = pp.find_loop(x, SR, HOLD)
+    assert loop is not None, "the fixed length-based search must find the spliced-in repeat"
+    assert loop["score"] >= 0.90
+    assert loop["end"] - loop["start"] == l_target, (
+        "expected the search to lock onto the exact engineered repeat point"
+    )
+
+    a = x[loop["start"], 0]
+    b = x[loop["end"], 0]
+    assert abs(a - b) < 0.01 * np.abs(x).max(), "loop endpoints discontinuous"
+
+    # Direct, self-contained proof that the OLD period-multiple-constrained
+    # search (n_per in 8..60, window = period*2) could never have found
+    # this: reconstruct its exact reachable-candidate scoring and confirm
+    # every one of the ~53 candidates falls short of the 0.90 gate --
+    # matching the pilot's own diagnosis ("best achievable correlation ...
+    # mostly 0.2-0.7").
+    approx_period = SR / 1200.0
+    old_ceiling = int(60 * approx_period)
+    assert loop["end"] - loop["start"] > old_ceiling * 5, (
+        "this test is supposed to exercise a repeat far beyond the old "
+        "60-period ceiling"
+    )
+
+    mono64 = mono.astype(np.float64)
+    period = round(approx_period)
+    win = period * 2
+    old_scores = []
+    for n_per in range(8, 61):
+        end = start_lo + period * n_per
+        a_win = mono64[start_lo:start_lo + win]
+        b_win = mono64[end:end + win]
+        denom = (np.linalg.norm(a_win) * np.linalg.norm(b_win)) + 1e-12
+        old_scores.append(float(np.dot(a_win, b_win) / denom))
+    assert max(old_scores) < 0.90, (
+        f"expected every old-algorithm candidate (n_per 8..60) to score "
+        f"below the 0.90 gate, got max {max(old_scores):.3f} -- if this "
+        "signal doesn't reproduce the old failure mode, the regression "
+        "test isn't testing what it claims to"
     )
 
 
@@ -512,28 +600,151 @@ def test_zone_failure_after_read_stays_retryable(tmp_path, monkeypatch):
     assert z2["file"] == "zone0.flac"
 
 
-def test_estimate_period_performance():
-    """Regression guard for the O(n^2) -> O(n log n) fix. The old
-    np.correlate(seg, seg, mode="full") path measured ~7.4s on a
-    117,600-frame region (the size find_loop actually passes in
-    production) and ~8.3s at 120,000 frames. fftconvolve does the same
-    computation in ~5ms. If this ever regresses back to the quadratic
-    path, a multi-thousand-patch batch full of sustaining pads/organs/
-    strings would take hours-to-days longer -- so fail the test well
-    before it'd get anywhere near the old timing.
+def test_find_loop_performance():
+    """Regression guard, now exercised through find_loop directly.
+
+    estimate_period (the target of the previous perf fix, O(n^2)
+    np.correlate -> O(n log n) fftconvolve) no longer exists: the
+    length-based rewrite made it genuinely dead weight -- gating candidate
+    lengths off a single estimated pitch period is exactly the bug this
+    rewrite fixes, so there was nothing left for it to usefully do, and
+    the new full-region FFT cross-correlation already produces sample-
+    exact endpoint alignment without it (see find_loop's docstring).
+
+    This asserts find_loop itself stays fast on a production-sized
+    ~117,600-frame steady-state region (the standard 3.5s-hold synthetic
+    test signal below). The old np.correlate-based estimate_period alone
+    took ~7.4s at this size; find_loop's FFT cross-correlation over the
+    *entire* region (a strictly bigger computation) should still complete
+    in well under a second -- measured around 5-10ms.
     """
-    rng = np.random.default_rng(0)
-    n = 120_000
-    t = np.arange(n) / SR
-    mono = 0.5 * np.sin(2 * np.pi * 220.0 * t) + 0.01 * rng.standard_normal(n)
+    t = np.arange(int(6.0 * SR)) / SR
+    mono = 0.5 * np.sin(2 * np.pi * 220.0 * t)
+    x = make_stereo(mono)
 
     start = time.perf_counter()
-    period = pp.estimate_period(mono, SR)
+    loop = pp.find_loop(x, SR, HOLD)
     elapsed = time.perf_counter() - start
 
+    assert loop is not None
     assert elapsed < 1.0, (
-        f"estimate_period took {elapsed:.2f}s on {n} frames -- the old "
-        "quadratic np.correlate path took ~8s at this size, so this "
-        "looks like a performance regression back to it"
+        f"find_loop took {elapsed:.2f}s on a {HOLD}-frame-hold region -- "
+        "the old np.correlate-based period estimate alone took ~8s at a "
+        "comparable size, so this looks like a performance regression"
     )
-    assert period > 0
+
+
+# ---------------------------------------------------------------------------
+# --reloop mode: re-run classification/loop detection on already-encoded
+# FLACs in place, without re-encoding audio or touching sample files.
+# process_patch deletes the source .wav after writing the .flac, so a
+# find_loop improvement (like this one) can only reach already-processed
+# output through this path -- otherwise it needs a full re-render.
+# ---------------------------------------------------------------------------
+
+
+def test_reloop_leaves_file_frames_and_audio_bytes_untouched(tmp_path):
+    zones_audio = [
+        (60, 100, 1, _sustaining_zone_audio(freq=220.0)),
+        (60, 64, 1, _decaying_zone_audio(freq=440.0)),
+    ]
+    _make_patch_dir(tmp_path, zones_audio)
+
+    first = pp.process_patch(tmp_path)
+    # Keyed by (key, velocity), not just key -- these two zones share the
+    # same MIDI key (60) at different velocities, same as real multisample
+    # layers do.
+    before = {
+        (z["key"], z["velocity"]): {
+            "file": z["file"],
+            "frames": z["frames"],
+            "bytes": (tmp_path / z["file"]).read_bytes(),
+        }
+        for z in first["zones"]
+    }
+
+    second = pp.reloop_patch(tmp_path)
+
+    assert len(second["zones"]) == len(first["zones"])
+    for z in second["zones"]:
+        b = before[(z["key"], z["velocity"])]
+        assert z["file"] == b["file"]
+        assert z["frames"] == b["frames"]
+        assert (tmp_path / z["file"]).read_bytes() == b["bytes"], (
+            "reloop must never rewrite the audio file"
+        )
+        # Schema contract still holds after a reloop pass.
+        assert "loop" in z and "kind" in z and "release" in z
+
+    on_disk = json.loads((tmp_path / "patch.json").read_text())
+    assert on_disk == second
+
+
+def test_reloop_can_improve_loop_detection_without_reencoding(tmp_path, monkeypatch):
+    """The actual reason --reloop exists: pick up a find_loop improvement
+    on already-processed output. Simulates having processed this patch
+    with a worse loop detector (the pilot render used the old, narrowly
+    period-constrained find_loop and now needs re-looping without a 37GB
+    re-render) by monkeypatching find_loop to find nothing on the first
+    pass, then showing reloop_patch (with the real, fixed find_loop)
+    updates the loop -- with the audio file never rewritten.
+    """
+    zones_audio = [(60, 100, 1, _sustaining_zone_audio(freq=1200.0))]
+    _make_patch_dir(tmp_path, zones_audio)
+
+    monkeypatch.setattr(pp, "find_loop", lambda *a, **k: None)
+    first = pp.process_patch(tmp_path)
+    z0 = first["zones"][0]
+    assert z0["kind"] == "sustaining"
+    assert z0["loop"]["enabled"] is False  # old/worse detector found nothing
+
+    flac_path = tmp_path / z0["file"]
+    original_bytes = flac_path.read_bytes()
+    original_file = z0["file"]
+    original_frames = z0["frames"]
+
+    monkeypatch.undo()  # restore the real (fixed) find_loop
+
+    second = pp.reloop_patch(tmp_path)
+    z1 = second["zones"][0]
+
+    assert z1["loop"]["enabled"] is True, "the fixed detector should find this loop"
+    assert z1["file"] == original_file
+    assert z1["frames"] == original_frames
+    assert flac_path.read_bytes() == original_bytes, "audio must never be rewritten by reloop"
+
+
+def test_reloop_skips_missing_and_error_zones(tmp_path):
+    """A zone with no usable audio (kind "missing"/"error") must be left
+    exactly as-is by reloop -- there's no .flac to read, and reloop must
+    never invent or touch sample files."""
+    patch = _minimal_patch_dict([
+        {"key": 60, "velocity": 100, "layer": 1, "frames": 0,
+         "file": "does_not_exist.wav"},
+    ])
+    (tmp_path / "patch.json").write_text(json.dumps(patch))
+
+    first = pp.process_patch(tmp_path)
+    assert first["zones"][0]["kind"] == "missing"
+
+    second = pp.reloop_patch(tmp_path)
+    assert second["zones"][0]["kind"] == "missing"
+    assert second["zones"][0]["loop"] == {"enabled": False}
+    assert second["zones"][0]["file"] == "does_not_exist.wav"
+
+
+def test_main_reloop_flag_invokes_reloop_not_process(tmp_path, monkeypatch):
+    zones_audio = [(60, 100, 1, _sustaining_zone_audio(freq=220.0))]
+    _make_patch_dir(tmp_path, zones_audio)
+    pp.process_patch(tmp_path)  # get to an already-encoded state first
+
+    flac_name = json.loads((tmp_path / "patch.json").read_text())["zones"][0]["file"]
+    original_bytes = (tmp_path / flac_name).read_bytes()
+
+    monkeypatch.setattr(sys, "argv", ["postprocess.py", "--reloop", str(tmp_path)])
+    pp.main()  # must not raise, must not try to re-encode from a .wav
+    # that no longer exists
+
+    assert (tmp_path / flac_name).read_bytes() == original_bytes
+    on_disk = json.loads((tmp_path / "patch.json").read_text())
+    assert on_disk["zones"][0]["file"] == flac_name
