@@ -83,6 +83,42 @@ Seven boards carry the maximum 255 patches (02 Orchestral, 04 Vintage Synth, 05 
 (Experience), also 2 MB, parses correctly at 64 patches. These two are excluded from the
 main pipeline and investigated separately — they must not block the other 20 boards.
 
+#### Boards 97 and 98: investigation (2026-07-28, Task 10)
+
+`tools/probe_expansion.py` investigated whether 97/98 can be parsed, using board 99 as
+a known-good control for the detection method. Findings:
+
+- **Control validated.** A full-image scan for candidate patch-name tables (Kadane
+  max-subarray search for runs of plausible 12-byte names, calibrated against the
+  3,941 real names read from boards 01-19: printable ASCII, ≥2 letters, longest
+  uppercase-letter run ≤4 for 99.9% of real names) correctly locates board 99's real
+  table at offset `0x1F9866`, a clean 65-entry run, patch 0 = `*Tr.Rhodes` — and is
+  not fooled by the printable-but-garbage run a naive scan finds at `0x402`.
+- **Nothing comparable exists on 97/98.** Run against the full 2 MB image, the same
+  detector's best candidate for board 97 scores 12 (18% of board 99's real-table
+  score of 65) as a 12-entry run; for board 98 it scores 10 (15%) as a 10-entry run.
+  Both "candidates" are visibly not text — monotonic ascending byte ramps (e.g.
+  `27<BIS[_bflo`) or runs of a single repeated byte (`wwwwwwwwwwww`) — the signature
+  of PCM waveform/envelope data coincidentally landing in the printable-ASCII range,
+  not patch names.
+- **The hinted alternate header fields are not patch counts.** `0x60-0x61` (187/198)
+  and `0x62-0x63` (34/27 for boards 97/98) looked like candidates since they're the
+  only nonzero values near where `patch_count` normally lives. Surveyed across all 20
+  boards with a real `patch_count`, `0x62-0x63 / patch_count` ranges 0.30-1.63 — not
+  a constant ratio — so this is some other per-board quantity (plausibly a wave/tone
+  count) that scales with board size, not a duplicate encoding of patch count. It's
+  small on 97/98 because they're small 2 MB boards, not because it's secretly the
+  real patch count.
+- **Geometry rules out the standard `patches_offset` field too.** It points to
+  within ~5.4 KB (board 97) / ~5.2 KB (board 98) of end-of-file — room for at most 14
+  patch records — far short of even the smallest genuine table seen anywhere (64, on
+  board 99 itself).
+
+**Conclusion: boards 97 and 98 contain no parseable patch table in the SR-JV80
+format.** `patch_count = 0` from the standard header is genuinely correct, not a
+parsing bug or an alignment/offset error. They remain excluded from the pipeline; the
+21-library output (Internal + 20 boards) stands as final.
+
 Revised cost: ~250-315 GB and ~5-6 hours on 8 cores. Fits within the 1.1 TB free on
 ExtFS.
 
