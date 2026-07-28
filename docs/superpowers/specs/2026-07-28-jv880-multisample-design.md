@@ -62,7 +62,29 @@ Patch banks in `rom2`, 0x16a bytes per patch, 12-byte ASCII name at offset 0:
   | 3 | 110 | 86-127 |
 
 - **Per patch:** 25 x 3 = **75 samples**.
-- **Total:** ~2,800 patches x 75 = ~210,000 samples.
+- **Total:** 4,197 patches x 75 = **~315,000 samples**.
+
+### Verified patch counts (measured 2026-07-28)
+
+Expansion headers were parsed directly (unscramble + `patch_count` at `0x66..0x67`,
+`patches_offset` at `0x8c..0x8f`). Actual totals are ~50% higher than first estimated:
+
+| Source | Patches |
+|---|---|
+| Internal (Preset A + Preset B + Internal) | 192 |
+| 20 working SR-JV80 boards | 4,005 |
+| **Total** | **4,197** |
+
+Seven boards carry the maximum 255 patches (02 Orchestral, 04 Vintage Synth, 05 World,
+06 Dance, 08 Keyboards 60s/70s, 11 Techno, 12 HipHop).
+
+**Boards 97 and 98 do not parse.** SR-JV80-97 (Experience III) and SR-JV80-98
+(Experience II) both report `patch_count = 0`. Both are 2 MB promo boards; SR-JV80-99
+(Experience), also 2 MB, parses correctly at 64 patches. These two are excluded from the
+main pipeline and investigated separately — they must not block the other 20 boards.
+
+Revised cost: ~250-315 GB and ~5-6 hours on 8 cores. Fits within the 1.1 TB free on
+ExtFS.
 
 ### Per-sample timing
 
@@ -239,7 +261,7 @@ phase to match at the loop point.
 
 ## Output structure
 
-One library folder per board, 23 total:
+One library folder per board, **21 total** (Internal + 20 working boards):
 
 ```
 JV-880 Multisamples/
@@ -307,10 +329,10 @@ re-rendering audio.
 
 ## Risks
 
-1. **Expansion ROM parsing** — highest risk. The 22 boards need unscrambling and
-   patch-table parsing ported from `jv880_plugin.cpp` (which handles it, including a
-   patch cache and on-demand loading) into the headless renderer. Well documented in that
-   source but unproven outside the plugin. Internal patches are already verified working.
+1. ~~**Expansion ROM parsing**~~ — **resolved 2026-07-28.** The unscramble algorithm from
+   `jv880_plugin.cpp:496` was reimplemented and validated against all 22 boards: 20 parse
+   cleanly with correct patch names and counts. Remaining sub-risk is limited to boards 97
+   and 98 (see above), which are excluded from the main pipeline.
 2. **Loop quality on evolving patches** — some pads modulate continuously and have no
    truly steady state. Mitigated by the accept-threshold: no loop is better than a bad one.
 3. **LFO compatibility heuristic** — the "tones agree within tolerance" rule needs a
