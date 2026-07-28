@@ -2,10 +2,24 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
+// mcu.h is third-party (schwung-jv880) and not ours to fix; pcm.h, which it
+// pulls in, trips -Wmissing-braces/-Wmissing-field-initializers under our
+// -Wall -Wextra. Suppress just those two, just for this include, so this
+// translation unit's build stays warning-free without weakening -Wall
+// -Wextra for our own code below.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-braces"
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
 #include "mcu.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 namespace jv {
 
@@ -54,6 +68,10 @@ void Renderer::load_patch_bytes(const std::vector<uint8_t> &bytes, const GridSpe
     m->nvram[NVRAM_MODE_OFFSET] = 1;
     uint8_t pc[2] = {0xC0, 0x00};
     m->postMidiSC55(pc, 2);
+
+    // Cheap to pull out of bytes we already have; used only to identify the
+    // patch in the flush-cap diagnostic below (design note B follow-up).
+    current_patch_name_ = trim_patch_name(bytes.data());
 
     // Settle ONCE here (design note A), not per note: 75 render_note calls
     // per patch would otherwise each pay this cost, wasting emulator time.
@@ -133,15 +151,29 @@ std::vector<int16_t> Renderer::render_note(int key, int velocity, const GridSpec
     double floor = (double)peak * std::pow(10.0, g.silence_db / 20.0);
     const int flush_cap = 5 * SAMPLE_RATE;   // 5 s safety bound
     int flush_quiet_run = 0;
+    bool flushed_quiet = false;
     for (int pos = 0; pos < flush_cap; pos += CHUNK) {
         int n = std::min(CHUNK, flush_cap - pos);
         m->updateSC55(n);
         if (chunk_is_quiet(m, n, floor)) {
             flush_quiet_run += n;
-            if (flush_quiet_run >= quiet_run_needed) break;
+            if (flush_quiet_run >= quiet_run_needed) { flushed_quiet = true; break; }
         } else {
             flush_quiet_run = 0;
         }
+    }
+
+    // The 5s cap is calibrated against measured pad/string patches, but the
+    // full library is ~4,197 patches across 20 expansion boards — if some
+    // patch's release genuinely outlasts the cap, the original bleed bug
+    // (design note B) silently returns for the next cell. Surface it on
+    // stderr rather than let that happen unnoticed; this should be rare
+    // enough to be a real signal, not routine noise.
+    if (!flushed_quiet) {
+        fprintf(stderr,
+                "warning: flush cap reached without quiet (patch=%s key=%d vel=%d)"
+                " — possible bleed into next note\n",
+                current_patch_name_.c_str(), key, velocity);
     }
 
     return out;

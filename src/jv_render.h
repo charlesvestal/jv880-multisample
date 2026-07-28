@@ -49,6 +49,10 @@ public:
 
 private:
     void *mcu_ = nullptr;   // opaque MCU*
+    // Trimmed 12-char ROM name of the currently-loaded patch (cheap to pull
+    // out of patch_bytes in load_patch_bytes), used only to identify which
+    // patch a render_note() flush-cap diagnostic came from.
+    std::string current_patch_name_;
 };
 
 } // namespace jv
