@@ -8,6 +8,14 @@
 namespace jv {
 
 static const int SAMPLE_RATE   = 64000;
+// 100,000 warmup updateSC55(1) calls, matching the schwung-jv880 reference
+// harness exactly. Do not "fix" this the way run_frames() fixes the render
+// loops: each updateSC55(1) call empirically produces exactly 2 real
+// frames (never drained, so the frame/sample-count bug never applied
+// here), so this already yields 200,000 frames = 3.125s -- matching the
+// reference harness's own comment ("~3 s worth of emulator ticks at
+// 64 kHz") almost exactly. See jv_render.cpp's WARMUP_STEPS call site and
+// run_frames() for the full measurement.
 static const int WARMUP_STEPS  = 100000;
 static const int NVRAM_PATCH_OFFSET = 0x0d70;
 static const int NVRAM_MODE_OFFSET  = 0x11;

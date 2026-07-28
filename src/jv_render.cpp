@@ -28,10 +28,43 @@ namespace {
 
 const int CHUNK = 64;   // matches the reference harness / audio_buffer_size headroom
 
+// CRITICAL: MCU::updateSC55(nSamples) does NOT produce nSamples stereo
+// frames — it is misleadingly named. mcu.h's MCU_PostSample() bumps
+// sample_write_ptr once for the L value and once for the R value (see
+// mcu.h ~line 396), so sample_write_ptr counts int16 VALUES posted, not
+// frames, and it resets to 0 at the top of every updateSC55() call. The
+// while-loop condition is `sample_write_ptr < nSamples`, so requesting
+// nSamples actually yields ceil(nSamples/2) frames in the naive model —
+// and empirically (verified via direct instrumentation: calling
+// updateSC55(n) for n in {1..128} and reading sample_write_ptr straight
+// after) the real emulator rounds UP to the next multiple of 4 int16
+// values (pcm.cpp's PCM_Update posts two frames per triggered oversampled
+// DAC batch), i.e. updateSC55(n) always yields exactly ceil(n/4)*4 int16
+// values — never fewer, occasionally up to 1 extra frame.
+//
+// This function is the ONE place that convention is applied: pass the
+// number of stereo FRAMES you want; it requests frames*2 from updateSC55
+// so the emulator writes at least `frames` real frames into sample_buffer
+// before returning, which is what drain()/chunk_is_quiet() below assume.
+//
+// Before this fix, every render-loop call site passed the frame count
+// directly as nSamples (i.e. requested n, not n*2), so updateSC55 only
+// produced n/2 real frames while drain() still copied n frames worth of
+// buffer — the trailing half was stale leftover content from the
+// PREVIOUS updateSC55 call. That silently doubled every rendered note's
+// duration and halved its pitch (measured: MIDI 60 rendering at 131 Hz
+// instead of 261.63 Hz, ratio 0.501 — exactly a time-stretch-by-2 /
+// octave-down error). See tests/test_pitch.py for the regression test.
+void run_frames(MCU *m, int frames) {
+    m->updateSC55(frames * 2);
+}
+
 // Appends n stereo frames (n*2 int16 values) drained from mcu->sample_buffer
-// to out. Must be called right after updateSC55(n): sample_write_ptr resets
-// to 0 at the start of every updateSC55 call, so the buffer holds exactly n
-// frames starting at index 0.
+// to out. Must be called right after run_frames(m, n): sample_write_ptr
+// resets to 0 at the start of every updateSC55() call, and run_frames(m, n)
+// guarantees at least n real frames are written starting at index 0 (see
+// run_frames's comment for why passing n directly to updateSC55 would be
+// wrong).
 void drain(MCU *m, std::vector<int16_t> &out, int n) {
     size_t at = out.size();
     out.resize(at + (size_t)n * 2);
@@ -64,6 +97,18 @@ bool Renderer::init(const RomSet &roms) {
         delete m;
         return false;
     }
+    // NOT run_frames(m, 1): this intentionally matches the reference
+    // harness's literal updateSC55(1) call, not the frames-requested
+    // convention used elsewhere. Warmup never reads sample_buffer (no
+    // drain), so the n->frames bug doesn't apply here — the only thing
+    // that matters is total warmup duration, and updateSC55(1) always
+    // yields exactly 2 real frames per call (see run_frames's comment on
+    // the ceil(n/4)*4 quantization: n=1 rounds up to 4 int16 values).
+    // Verified by direct instrumentation: 100,000 calls x 2 frames =
+    // 200,000 frames = 3.125s, matching this constant's origin (the
+    // schwung-jv880 reference harness's own comment: "Warmup: ~3 s worth
+    // of emulator ticks at 64 kHz"). So WARMUP_STEPS already produces the
+    // originally-intended ~3s warmup and needs no adjustment for this fix.
     for (int i = 0; i < WARMUP_STEPS; i++) m->updateSC55(1);
 
     // Guard against double-init() leaking the previous MCU (several MB):
@@ -91,7 +136,7 @@ void Renderer::load_patch_bytes(const std::vector<uint8_t> &bytes, const GridSpe
     int settle = (int)(g.settle_seconds * SAMPLE_RATE);
     for (int pos = 0; pos < settle; pos += CHUNK) {
         int n = std::min(CHUNK, settle - pos);
-        m->updateSC55(n);
+        run_frames(m, n);
     }
 }
 
@@ -117,7 +162,7 @@ std::vector<int16_t> Renderer::render_note(int key, int velocity, const GridSpec
     int peak = 0;
     for (int pos = 0; pos < hold_samples; pos += CHUNK) {
         int n = std::min(CHUNK, hold_samples - pos);
-        m->updateSC55(n);
+        run_frames(m, n);
         size_t before = out.size();
         drain(m, out, n);
         for (size_t i = before; i < out.size(); i++)
@@ -133,7 +178,7 @@ std::vector<int16_t> Renderer::render_note(int key, int velocity, const GridSpec
     int quiet_run = 0;
     for (int pos = 0; pos < tail_samples; pos += CHUNK) {
         int n = std::min(CHUNK, tail_samples - pos);
-        m->updateSC55(n);
+        run_frames(m, n);
         size_t before = out.size();
         drain(m, out, n);
 
@@ -174,7 +219,7 @@ std::vector<int16_t> Renderer::render_note(int key, int velocity, const GridSpec
     bool flushed_quiet = false;
     for (int pos = 0; pos < flush_cap; pos += CHUNK) {
         int n = std::min(CHUNK, flush_cap - pos);
-        m->updateSC55(n);
+        run_frames(m, n);
         if (chunk_is_quiet(m, n, floor)) {
             flush_quiet_run += n;
             if (flush_quiet_run >= quiet_run_needed) { flushed_quiet = true; break; }
