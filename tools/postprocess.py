@@ -26,6 +26,8 @@ def resample_to_48k(x):
 
 def classify(x, hold_frames):
     """Sustaining if energy just before note-off is still substantial."""
+    if len(x) == 0:
+        return "silent", 0.0
     peak = np.abs(x).max()
     if peak <= 0:
         return "silent", 0.0
@@ -68,6 +70,8 @@ def estimate_period(mono, sr):
 
 def find_loop(x, sr, hold_frames):
     """Correlation-matched loop points inside the steady-state region."""
+    if len(x) == 0:
+        return None
     mono = x.mean(axis=1) if x.ndim > 1 else x
     start_lo = int(1.0 * sr)
     region_hi = min(hold_frames, len(mono)) - int(0.05 * sr)
@@ -82,6 +86,12 @@ def find_loop(x, sr, hold_frames):
     loop_start = start_lo
 
     # Try loop lengths from 8 to 60 periods; longer loops sound less static.
+    # NOTE (not fixed here): this choice has no awareness of the patch's
+    # own LFO1/LFO2 rate. A slow vibrato/tremolo whose cycle is longer than
+    # the chosen loop length gets flattened once looped, since the loop
+    # only ever replays one phase of the LFO. Inherited from the original
+    # design; needs revisiting once we can audition real renders with
+    # LFO-modulated sustains (Task 3 isn't built yet).
     # `period` is a non-integer estimate, so `period * n_per` rounds to a
     # slightly different sub-sample residual for each n_per. Rather than
     # trust a single windowed-correlation "best" (which tolerates small
@@ -121,6 +131,8 @@ def find_loop(x, sr, hold_frames):
 
 def measure_release(x, sr, hold_frames):
     """Seconds for the post-note-off tail to fall 60 dB."""
+    if len(x) == 0:
+        return 0.1
     tail = x[hold_frames:]
     if len(tail) < sr // 20:
         return 0.1
@@ -140,6 +152,26 @@ def measure_release(x, sr, hold_frames):
     return float(len(mono) / sr)
 
 
+def _mark_zone_unprocessable(z, kind):
+    """Populate the schema-required per-zone fields with safe defaults.
+
+    Task 6 reads zone["loop"] / zone["release"] unconditionally on every
+    zone, so every zone must gain these keys regardless of whether it could
+    actually be converted -- a missing render or a per-zone processing
+    failure must never leave a zone short of the schema contract (that
+    would surface as a KeyError deep into an hours-long batch render,
+    rather than here where it's cheap to handle).
+
+    kind: "missing" (the renderer never produced this file) or "error"
+    (the file exists but couldn't be processed, e.g. zero-length audio or
+    an unexpected channel count).
+    """
+    z["kind"] = kind
+    z["sustain_ratio"] = 0.0
+    z["loop"] = {"enabled": False}
+    z["release"] = 0.0
+
+
 def process_patch(pdir: Path, hold_seconds=3.5):
     meta = json.loads((pdir / "patch.json").read_text())
     hold_out = int(hold_seconds * SR_OUT)
@@ -150,27 +182,64 @@ def process_patch(pdir: Path, hold_seconds=3.5):
         # rewritten to point at the .flac (see below), so re-running on the
         # same directory must recognise that name -- not just "file
         # missing" -- and skip it instead of trying to re-read a 48 kHz
-        # FLAC as a 64 kHz WAV. Also guards the case of a genuinely missing
-        # source render.
-        if src.suffix.lower() != ".wav" or not src.exists():
+        # FLAC as a 64 kHz WAV.
+        if src.suffix.lower() != ".wav":
             continue
-        x, sr = sf.read(str(src), always_2d=True)
-        assert sr == SR_IN, f"unexpected rate {sr} in {src}"
-        y = resample_to_48k(x)
 
-        kind, ratio = classify(y, hold_out)
-        loop = find_loop(y, SR_OUT, hold_out) if kind == "sustaining" else None
+        if not src.exists():
+            # Renderer never produced this file. Still fill in the schema
+            # so a downstream KeyError doesn't surface hours into a batch.
+            _mark_zone_unprocessable(z, "missing")
+            continue
 
-        dst = src.with_suffix(".flac")
-        sf.write(str(dst), y, SR_OUT, subtype="PCM_24")
-        src.unlink()
+        try:
+            x, sr = sf.read(str(src), always_2d=True)
+            assert sr == SR_IN, f"unexpected rate {sr} in {src}"
+            if x.shape[1] != 2:
+                # Fail loudly rather than silently emitting a mono FLAC:
+                # Task 3 is expected to always render stereo, so this is a
+                # signal something upstream is wrong, not something to
+                # quietly paper over by upmixing.
+                raise ValueError(
+                    f"expected stereo (2ch) audio, got {x.shape[1]}ch in {src}"
+                )
+            if len(x) == 0:
+                # A zero-frame WAV resamples to a zero-frame array, and
+                # soundfile happily "writes" a zero-frame FLAC that it then
+                # can't reopen (verified: libsndfile reports "Format not
+                # recognised"). Writing that file and deleting the source
+                # would silently corrupt this zone, so refuse explicitly
+                # before ever getting to sf.write/src.unlink below.
+                raise ValueError(f"zero-length audio in {src}")
 
-        z["file"] = dst.name
-        z["frames"] = int(len(y))
-        z["kind"] = kind
-        z["sustain_ratio"] = round(ratio, 4)
-        z["loop"] = loop or {"enabled": False}
-        z["release"] = round(measure_release(y, SR_OUT, hold_out), 4)
+            y = resample_to_48k(x)
+
+            kind, ratio = classify(y, hold_out)
+            loop = find_loop(y, SR_OUT, hold_out) if kind == "sustaining" else None
+
+            dst = src.with_suffix(".flac")
+            sf.write(str(dst), y, SR_OUT, subtype="PCM_24")
+            src.unlink()
+
+            z["file"] = dst.name
+            z["frames"] = int(len(y))
+            z["kind"] = kind
+            z["sustain_ratio"] = round(ratio, 4)
+            z["loop"] = loop or {"enabled": False}
+            z["release"] = round(measure_release(y, SR_OUT, hold_out), 4)
+        except Exception as exc:
+            # One degenerate zone (zero-length render, wrong channel count,
+            # corrupt audio, ...) must not lose the work already done on
+            # this patch's other zones, and must not abort the batch. The
+            # source file (if any) is left untouched -- we only unlink it
+            # on the success path above -- so nothing is lost on retry.
+            print(
+                f"  zone {z.get('file')!r} (key={z.get('key')}, "
+                f"velocity={z.get('velocity')}): FAILED ({exc!r}) -- "
+                "marking as error, continuing with next zone",
+                file=sys.stderr,
+            )
+            _mark_zone_unprocessable(z, "error")
 
     meta["sample_rate"] = SR_OUT
     (pdir / "patch.json").write_text(json.dumps(meta, indent=2))
@@ -181,7 +250,20 @@ def main():
     root = Path(sys.argv[1])
     dirs = sorted(p for p in root.iterdir() if (p / "patch.json").exists())
     for i, d in enumerate(dirs, 1):
-        m = process_patch(d)
+        # A batch runs over thousands of patches; one bad patch (malformed
+        # patch.json, unexpected schema, disk error, ...) must not abort
+        # the rest of the run. Per-zone failures are already isolated
+        # inside process_patch -- this is the outer safety net for
+        # failures at the whole-patch level.
+        try:
+            m = process_patch(d)
+        except Exception as exc:
+            print(
+                f"[{i}/{len(dirs)}] {d.name}: PATCH FAILED ({exc!r}) -- "
+                "skipping, continuing batch",
+                file=sys.stderr,
+            )
+            continue
         looped = sum(1 for z in m["zones"] if z["loop"]["enabled"])
         print(f"[{i}/{len(dirs)}] {m['name']}: {looped}/{len(m['zones'])} looped")
 

@@ -217,3 +217,131 @@ def test_silent_zone_end_to_end_no_loop(tmp_path):
     z = meta["zones"][0]
     assert z["kind"] == "silent"
     assert z["loop"]["enabled"] is False
+
+
+# ---------------------------------------------------------------------------
+# Batch-safety tests (spec-review follow-up): a missing render, a
+# zero-length WAV, or a mono WAV must never crash the whole 4,197-patch
+# batch, and every zone must end up with the full schema regardless.
+# ---------------------------------------------------------------------------
+
+
+def _minimal_patch_dict(zones):
+    return {
+        "name": "Batch Safety Patch", "bank": "A", "index": 0,
+        "sample_rate": pp.SR_IN,
+        "effects": {}, "lfo1": {}, "lfo2": {},
+        "zones": zones,
+    }
+
+
+def test_missing_zone_file_gets_safe_defaults(tmp_path):
+    # No .wav is ever written for this zone -- simulates a render that the
+    # C++ renderer (Task 3) never produced.
+    patch = _minimal_patch_dict([
+        {"key": 60, "velocity": 100, "layer": 1, "frames": 0,
+         "file": "does_not_exist.wav"},
+    ])
+    (tmp_path / "patch.json").write_text(json.dumps(patch))
+
+    meta = pp.process_patch(tmp_path)  # must not raise
+    z = meta["zones"][0]
+
+    assert z["kind"] == "missing"
+    assert z["loop"] == {"enabled": False}
+    assert "release" in z and isinstance(z["release"], (int, float))
+    assert z["sustain_ratio"] == 0.0
+    # Nothing was produced to point the file reference at; left as-is
+    # rather than invented.
+    assert z["file"] == "does_not_exist.wav"
+
+
+def test_empty_array_does_not_crash_classify_find_loop_or_release():
+    empty = np.zeros((0, 2))
+
+    kind, ratio = pp.classify(empty, HOLD)
+    assert kind == "silent"
+    assert ratio == 0.0
+
+    assert pp.find_loop(empty, SR, HOLD) is None
+
+    r = pp.measure_release(empty, SR, HOLD)
+    assert np.isfinite(r)
+
+
+def test_process_patch_survives_zero_length_zone(tmp_path):
+    good_audio = _sustaining_zone_audio(freq=220.0)
+    good_stereo = np.stack([good_audio, good_audio], axis=1).astype(np.float32)
+    sf.write(str(tmp_path / "good.wav"), good_stereo, pp.SR_IN, subtype="PCM_16")
+
+    empty_stereo = np.zeros((0, 2), dtype=np.float32)
+    sf.write(str(tmp_path / "empty.wav"), empty_stereo, pp.SR_IN, subtype="PCM_16")
+
+    patch = _minimal_patch_dict([
+        {"key": 60, "velocity": 100, "layer": 1, "frames": len(good_audio),
+         "file": "good.wav"},
+        {"key": 61, "velocity": 100, "layer": 1, "frames": 0,
+         "file": "empty.wav"},
+    ])
+    (tmp_path / "patch.json").write_text(json.dumps(patch))
+
+    meta = pp.process_patch(tmp_path)  # must not raise -- one bad zone
+    # must not take down the other zones in this patch.
+
+    good_zone = next(z for z in meta["zones"] if z["key"] == 60)
+    bad_zone = next(z for z in meta["zones"] if z["key"] == 61)
+
+    assert good_zone["kind"] == "sustaining"
+    assert good_zone["file"].endswith(".flac")
+    assert (tmp_path / good_zone["file"]).exists()
+
+    assert bad_zone["kind"] == "error"
+    assert bad_zone["loop"] == {"enabled": False}
+    # The zero-length source is left in place untouched, rather than
+    # deleted in favour of a FLAC that soundfile can't reopen (verified
+    # separately: writing a zero-frame FLAC produces a file libsndfile
+    # reports as "Format not recognised").
+    assert (tmp_path / "empty.wav").exists()
+    assert bad_zone["file"] == "empty.wav"
+
+
+def test_mono_zone_fails_explicitly_not_silently(tmp_path):
+    mono_audio = _sustaining_zone_audio(freq=220.0).astype(np.float32)
+    sf.write(str(tmp_path / "mono.wav"), mono_audio, pp.SR_IN, subtype="PCM_16")
+
+    patch = _minimal_patch_dict([
+        {"key": 60, "velocity": 100, "layer": 1, "frames": len(mono_audio),
+         "file": "mono.wav"},
+    ])
+    (tmp_path / "patch.json").write_text(json.dumps(patch))
+
+    meta = pp.process_patch(tmp_path)  # must not raise
+    z = meta["zones"][0]
+
+    assert z["kind"] == "error"
+    assert z["loop"] == {"enabled": False}
+    # No mono FLAC was silently written in place of the stereo requirement.
+    assert not (tmp_path / "mono.flac").exists()
+    assert (tmp_path / "mono.wav").exists()
+    assert z["file"] == "mono.wav"
+
+
+def test_main_survives_bad_patch_and_continues(tmp_path, monkeypatch, capsys):
+    bad_dir = tmp_path / "01_bad"
+    bad_dir.mkdir()
+    (bad_dir / "patch.json").write_text("{not valid json")
+
+    good_dir = tmp_path / "02_good"
+    good_dir.mkdir()
+    _make_patch_dir(good_dir, [(60, 100, 1, _sustaining_zone_audio(freq=220.0))])
+
+    monkeypatch.setattr(sys, "argv", ["postprocess.py", str(tmp_path)])
+    pp.main()  # must not raise even though one patch is malformed
+
+    captured = capsys.readouterr()
+    assert "FAILED" in captured.err
+    assert "01_bad" in captured.err
+
+    on_disk = json.loads((good_dir / "patch.json").read_text())
+    assert on_disk["sample_rate"] == pp.SR_OUT
+    assert on_disk["zones"][0]["loop"]["enabled"] is True
