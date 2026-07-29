@@ -28,7 +28,17 @@ bool tone_active(const uint8_t *patch, int tone) {
 
 Effects read_effects(const uint8_t *p) {
     Effects e;
-    e.reverb_type     = bits(p, 12, 0, 4);
+    // reverbtype is THREE bits, not four.  The plugin's parameter table lists
+    // width 4 but max 7, which is self-contradictory -- 0-7 needs only 3 bits.
+    // Reading 4 bits picks up an adjacent unrelated flag (set on 40 of the 192
+    // internal patches) and yields invalid types 8-15: A.Piano 1 decoded as 12
+    // rather than Hall1, Clav 1 as 8 rather than Room1.
+    //
+    // Ground truth is the reference JUCE implementation, which reads
+    //   reverbTypeComboBox.setSelectedItemIndex(patch->revChorConfig & 0x7)
+    // (jv880_juce Source/ui/EditCommonTab.cpp:174).  Masking 3 bits yields an
+    // all-valid, sensibly distributed set across every patch.
+    e.reverb_type     = bits(p, 12, 0, 3);
     e.chorus_type     = bits(p, 12, 4, 2);
     e.reverb_level    = bits(p, 13, 0, 7);
     e.reverb_time     = bits(p, 14, 0, 7);
