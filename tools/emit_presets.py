@@ -756,6 +756,69 @@ def zone_vel_range(zones):
     return vel_ranges(len(zones))
 
 
+def _bus_effects(meta, cal):
+    """Effects that belong on the parallel reverb SEND bus.
+
+    Only the convolution reverb. A delay's `wetLevel` is ADDITIVE -- it passes
+    its input through alongside the echoes -- so on a send bus it would return
+    an undelayed copy of the dry to the main output and comb-filter against
+    the original. It stays an insert, where additive wetLevel is exactly right.
+    Convolution's `mix` is a blend, so at mix=1.0 it returns pure wet, which is
+    what a send bus wants.
+    """
+    return [(kind, dict(attrs, mix=1.0)) for kind, attrs in build_effects(meta, cal)
+            if kind == "convolution" and float(attrs.get("mix", 0.0)) > 0.0]
+
+
+def _insert_effects(meta, cal):
+    """Effects that stay in the instrument's own chain: chorus and delay."""
+    return [(kind, attrs) for kind, attrs in build_effects(meta, cal)
+            if kind != "convolution"]
+
+
+def _reverb_target_ratio(meta, cal):
+    """The JV's own wet/dry ratio for this patch, from the measured fit.
+
+    Same predictor and per-type coefficients the blend used (see
+    REVERB_RATIO_SLOPE), but now it is the send level directly rather than
+    something to be converted into a crossfade position.
+    """
+    rv = meta["effects"]["reverb"]
+    if rv["type"] not in REVERB_NAMES:
+        return 0.0
+    rtype = REVERB_NAMES.index(rv["type"])
+    if rtype in DELAY_TYPE_INDICES:
+        return 0.0
+    wet = _clamp01(amount(rv["level"]) * (effective_send(meta, "reverb") / 127.0))
+    slope, intercept = REVERB_RATIO_SLOPE, REVERB_RATIO_INTERCEPT
+    if cal:
+        f = (cal.get("reverb_ratio_fit") or {}).get(str(rtype)) \
+            or cal.get("reverb_ratio_fit_global")
+        if f:
+            slope, intercept = float(f["slope"]), float(f["intercept"])
+    return max(0.0, min(REVERB_RATIO_MAX, slope * wet + intercept))
+
+
+def _reverb_send_level(meta, cal):
+    """(group send level, bus volume) reproducing the JV's wet/dry ratio.
+
+    With a parallel send the arithmetic is finally direct: the IRs are
+    gain-neutral, so wet/dry is just send * busVolume. No blend efficiency
+    factor, no cap to stop `mix` erasing the dry, and no makeup gain -- all
+    three existed only to fight the crossfade, and all three are gone.
+
+    Sends above unity are carried by busVolume, since a send level is a
+    fraction of the signal being sent.
+    """
+    convolutions = [attrs for kind, attrs in build_effects(meta, cal)
+                    if kind == "convolution"]
+    if not convolutions or float(convolutions[0].get("mix", 0.0)) <= 0.0:
+        return 0.0, 1.0
+    ratio = _reverb_target_ratio(meta, cal)
+    send = min(1.0, ratio)
+    return send, (ratio / send if send > 0 else 1.0)
+
+
 def build_effects(meta, cal):
     """Return [(type, {attr: value}), ...] in signal-chain order.
 
@@ -954,10 +1017,18 @@ def build_dspreset(meta, cal, sample_prefix):
         # per-zone release (see postprocess.py's measure_release) is the
         # only envelope stage that varies and is set per-<sample> below.
         "attack": "0.001", "decay": "0.001", "sustain": "1.0",
-        # Restores the dry level DecentSampler's blend controls take away, so
-        # the direct sound matches the plugin instead of arriving several dB
-        # down. See blend_makeup_gain.
-        "volume": f"{blend_makeup_gain(build_effects(meta, cal)):.4f}",
+        # Restores the dry level DecentSampler's blend controls take away.
+        # Only the chorus insert blends now -- the reverb moved to a parallel
+        # SEND bus, which does not touch the dry path at all. See
+        # blend_makeup_gain and build_dspreset's bus block.
+        "volume": f"{blend_makeup_gain(_insert_effects(meta, cal)):.4f}",
+        # A true send, matching the JV: the dry goes to the main output at
+        # full level and a COPY goes to the reverb bus. DecentSampler
+        # duplicates rather than steals the signal, so unlike `mix` this
+        # cannot thin out the direct sound.
+        "output1Target": "MAIN_OUTPUT",
+        "output2Target": "BUS_1",
+        "output2Volume": f"{_reverb_send_level(meta, cal)[0]:.4f}",
     })
 
     by_key = _group_zones_by_key(zones)
@@ -992,8 +1063,37 @@ def build_dspreset(meta, cal, sample_prefix):
             ET.SubElement(group_el, "sample", attrs)
 
     effects_el = ET.SubElement(root, "effects")
-    for etype, eattrs in build_effects(meta, cal):
+    for etype, eattrs in _insert_effects(meta, cal):
         ET.SubElement(effects_el, "effect",
+                      {"type": etype, **{k: str(v) for k, v in eattrs.items()}})
+
+    # The reverb bus. The JV routes a per-tone SEND to a global reverb block
+    # whose output is added back -- it does not crossfade the dry away, and
+    # its stereo image is the reverb's own rather than the note's. Modelling
+    # that with DecentSampler's `mix` got both wrong: the dry arrived several
+    # dB down, and the wet inherited each note's pan. Measured on A.Piano 2,
+    # whose dry pans 25.5 dB across the keyboard by key position, the JV's
+    # reverb moves only 5.1 dB -- it is effectively a fixed, centred bus --
+    # while a per-channel blend dragged the reverb the full 25.5 dB with it.
+    # That affects 36% of the library (>6 dB pan span) and 20% severely
+    # (>20 dB).
+    for etype, eattrs in _bus_effects(meta, cal):
+        buses_el = root.find("buses") or ET.SubElement(root, "buses")
+        bus_el = buses_el.find("bus")
+        if bus_el is None:
+            _, bus_volume = _reverb_send_level(meta, cal)
+            bus_el = ET.SubElement(buses_el, "bus", {
+                "busVolume": f"{bus_volume:.4f}",
+                "output1Target": "MAIN_OUTPUT",
+            })
+            bus_fx = ET.SubElement(bus_el, "effects")
+            # Collapse the send to mono BEFORE convolving, so the reverb sits
+            # where the JV's does instead of following the note across the
+            # stereo field.
+            ET.SubElement(bus_fx, "effect",
+                          {"type": "stereo_simulator", "width": "0"})
+        bus_fx = bus_el.find("effects")
+        ET.SubElement(bus_fx, "effect",
                       {"type": etype, **{k: str(v) for k, v in eattrs.items()}})
 
     # <modulators> is a TOP-LEVEL element, a sibling of <groups> and

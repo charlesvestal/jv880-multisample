@@ -924,11 +924,11 @@ def test_ir_snaps_to_nearest_captured_time_step():
     assert all(ok for ok in (ep._nearest_ir(cal, 4, r)[1] for r in (0, 50, 90)))
 
 
-def test_silent_ir_step_zeroes_wet_instead_of_eating_the_dry_signal():
-    """convolution `mix` is a BLEND, so mix>0 against an all-zero IR quietly
-    attenuates the dry signal while adding nothing. The JV really does emit no
-    wet signal at reverbtime 0, so the correct emission is mix=0 -- and the
-    irFile should point at an AUDIBLE step so the knob still works."""
+def test_silent_ir_step_sends_nothing_to_the_reverb_bus():
+    """The JV really does emit no wet signal at reverbtime 0 that an impulse
+    can capture (it underflows). Under the send-bus architecture the right
+    emission is simply no send -- and, unlike the old blend, a zero send
+    cannot touch the dry path at all."""
     cal = _cal_with_ir()
     cal["reverb_ir_silent"] = {"4": [0]}
 
@@ -938,10 +938,10 @@ def test_silent_ir_step_zeroes_wet_instead_of_eating_the_dry_signal():
 
     meta = make_meta(reverb_type="Hall1")
     meta["effects"]["reverb"].update(time=0, level=127)
-    conv = [e for e in parse(meta, cal).findall(".//effect")
-            if e.get("type") == "convolution"][0]
-    assert float(conv.get("mix") or 0) == 0.0
-    assert not (conv.get("irFile") or "").endswith("_000.wav")
+    root = parse(meta, cal)
+    group = find1(root, ".//group")
+    assert float(group.get("output2Volume") or 0) == 0.0
+    assert not root.findall("./buses/bus/effects/effect[@type='convolution']")
 
 
 def test_audible_step_is_unaffected_by_the_silent_manifest():
@@ -949,9 +949,9 @@ def test_audible_step_is_unaffected_by_the_silent_manifest():
     cal["reverb_ir_silent"] = {"4": [0]}
     meta = make_meta(reverb_type="Hall1")
     meta["effects"]["reverb"].update(time=96, level=127)
-    conv = [e for e in parse(meta, cal).findall(".//effect")
-            if e.get("type") == "convolution"][0]
-    assert float(conv.get("mix") or 0) > 0.0
+    root = parse(meta, cal)
+    conv = find1(root, "./buses/bus/effects/effect[@type='convolution']")
+    assert float(find1(root, ".//group").get("output2Volume") or 0) > 0.0
     assert (conv.get("irFile") or "").endswith("_096.wav")
 
 
@@ -1038,3 +1038,60 @@ def test_makeup_gain_is_unity_without_effects_and_is_bounded():
     assert ep.blend_makeup_gain([]) == 1.0
     huge = [("convolution", {"mix": 0.99}), ("chorus", {"mix": 0.99})]
     assert ep.blend_makeup_gain(huge) <= ep.MAX_MAKEUP_GAIN
+
+
+# --- reverb send bus -------------------------------------------------------
+# The JV routes a per-tone SEND to a global reverb whose output is ADDED back.
+# DecentSampler's `mix` is a crossfade, which got two things wrong at once:
+# the dry arrived attenuated, and the wet inherited each note's pan. These
+# pin the send-bus emission that replaced it.
+
+def test_reverb_is_a_parallel_send_not_a_blend():
+    root = parse(make_meta(reverb_type="Hall1"), _cal_with_ir())
+    group = find1(root, ".//group")
+    assert group.get("output1Target") == "MAIN_OUTPUT", "dry must reach the main output"
+    assert group.get("output2Target") == "BUS_1"
+    assert float(group.get("output2Volume") or 0) > 0.0
+    # The convolution belongs on the bus, never in the instrument chain --
+    # both would double the reverb.
+    assert not root.findall("./effects/effect[@type='convolution']")
+    assert root.findall("./buses/bus/effects/effect[@type='convolution']")
+
+
+def test_bus_convolution_is_fully_wet():
+    """On a parallel send the bus must return wet only; any dry it passes
+    back would comb-filter against the dry already at the main output."""
+    root = parse(make_meta(reverb_type="Hall1"), _cal_with_ir())
+    conv = find1(root, "./buses/bus/effects/effect[@type='convolution']")
+    assert float(conv.get("mix") or 0) == 1.0
+
+
+def test_bus_collapses_the_send_to_mono_before_convolving():
+    """A.Piano 2's dry pans 25.5 dB across the keyboard by key position while
+    the JV's reverb moves only 5.1 dB -- its reverb bus is effectively fixed
+    and centred. Per-channel convolution dragged the reverb the full 25.5 dB
+    with the note. The stereo simulator must come FIRST to prevent that."""
+    root = parse(make_meta(reverb_type="Hall1"), _cal_with_ir())
+    effects = root.findall("./buses/bus/effects/effect")
+    assert effects[0].get("type") == "stereo_simulator"
+    assert float(effects[0].get("width") or 1) == 0.0
+    assert [e.get("type") for e in effects].index("convolution") > 0
+
+
+def test_delay_stays_an_insert_not_a_send():
+    """A delay's wetLevel is ADDITIVE -- it passes its input through. On a
+    send bus that returns an undelayed copy of the dry to the main output."""
+    root = parse(make_meta(reverb_type="Pan-Dly"), _cal_with_ir())
+    assert root.findall("./effects/effect[@type='delay']")
+    assert not root.findall("./buses/bus/effects/effect[@type='delay']")
+
+
+def test_makeup_gain_no_longer_compensates_the_reverb():
+    """The send does not touch the dry path, so only the chorus insert still
+    needs making up. Compensating for the reverb too would now overshoot."""
+    meta = make_meta(reverb_type="Hall1")
+    root = parse(meta, _cal_with_ir())
+    vol = float(find1(root, ".//group").get("volume") or 1.0)
+    chorus = find1(root, "./effects/effect[@type='chorus']")
+    expected = ep.blend_makeup_gain([("chorus", chorus.attrib)])
+    assert vol == pytest.approx(expected, abs=1e-3)
