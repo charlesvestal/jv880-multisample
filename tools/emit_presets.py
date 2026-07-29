@@ -615,7 +615,17 @@ def main():
         # would have made every emitted <sample>/<region> unresolvable.
         sample_prefix = pdir.name
 
-        stem = f"{meta['bank']}{meta['index']:02d} {_sanitize_filename(meta['name'])}"
+        # Preset filenames are what a player's browser shows, so keep them
+        # short and scannable. Internal banks ("A"/"B"/"Internal") are useful
+        # prefixes and stay. An expansion's bank IS the board name, which is
+        # already the enclosing library folder -- repeating it gives
+        # "SR-JV80-04 Vintage Synth00 Prologue" for all 255 presets, where the
+        # index also runs straight into the board name. Drop the redundant
+        # prefix in that case and lead with the index.
+        bank = str(meta["bank"])
+        prefix = "" if bank == out_root.name else bank
+        sep = "" if prefix else ""
+        stem = f"{prefix}{sep}{meta['index']:02d} {_sanitize_filename(meta['name'])}"
         (out_root / f"{stem}.dspreset").write_text(build_dspreset(meta, cal, sample_prefix))
         (out_root / f"{stem}.sfz").write_text(build_sfz(meta, sample_prefix))
         n += 1
