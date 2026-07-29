@@ -1049,8 +1049,15 @@ def _stage_referenced_irs(out_root, calib_root):
         if not src.exists():
             raise SystemExit(f"emitted preset references missing IR: {src}")
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if not dst.exists() or dst.stat().st_size != src.stat().st_size:
-            shutil.copy2(src, dst)
+        # Copy unconditionally. This used to skip when the sizes matched, which
+        # is silently wrong for exactly the change most likely to happen to an
+        # IR: re-processing one in place -- a different filter, a different
+        # normalisation -- leaves the length and format identical, so the size
+        # is identical, so the stale file survived in every library. That cost
+        # a full spectral-correction validation run, which reported the
+        # corrected bank as byte-for-byte no improvement. There are only tens
+        # of these files; there is nothing to optimise here.
+        shutil.copy2(src, dst)
         staged += 1
     return staged
 
