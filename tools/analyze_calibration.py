@@ -251,17 +251,34 @@ def measure_chorus_rate_hz(path, oct_frac=0.6, reliability_frac=0.90):
         return None
     top_surviving = max(surviving, key=lambda c: c[1])
 
-    # Octave-ambiguity fix: prefer a genuine local max near HALF the top
-    # surviving candidate's lag (i.e. ~2x its frequency) if one is
-    # comparably tall -- the top pick is often a subharmonic (period-double)
-    # of the true, faster fundamental.
-    target_lag = top_surviving[0] / 2.0
-    best_half = None
-    for lag, h, f in surviving:
-        if abs(lag - target_lag) <= max(2, 0.06 * target_lag) and h >= oct_frac * top_surviving[1]:
-            if best_half is None or h > best_half[1]:
-                best_half = (lag, h, f)
-    chosen = best_half if best_half is not None else top_surviving
+    # Subharmonic-family fix.  Autocorrelation of a periodic envelope peaks at
+    # the true period T *and* at every integer multiple 2T, 3T, ...  Those
+    # multiples are frequently TALLER than the fundamental (longer windows
+    # accumulate more correlation), so simply taking the tallest peak reports
+    # f/2, f/3, f/5 ... instead of f.
+    #
+    # An earlier version only probed HALF the top lag (one octave up), which
+    # cannot reach a 3rd- or 5th-order subharmonic.  Measured failures were
+    # exactly that: raw 48 reported 0.43 Hz where ~2.2 Hz was expected (~1/5),
+    # raw 16 reported 0.52 Hz where ~1.5 Hz was expected (~1/3).
+    #
+    # Generalise: walk the family T/k for k = 2..MAX_SUBHARMONIC and choose the
+    # SHORTEST lag (highest frequency) that still carries a comparably tall
+    # genuine peak.  That is the fundamental; the rest are its aliases.
+    MAX_SUBHARMONIC = 8
+    chosen = top_surviving
+    for k in range(2, MAX_SUBHARMONIC + 1):
+        target_lag = top_surviving[0] / k
+        if target_lag < lo_lag:
+            break
+        tol = max(2.0, 0.06 * target_lag)
+        best_k = None
+        for lag, h, f in surviving:
+            if abs(lag - target_lag) <= tol and h >= oct_frac * top_surviving[1]:
+                if best_k is None or h > best_k[1]:
+                    best_k = (lag, h, f)
+        if best_k is not None:
+            chosen = best_k   # keep going; a higher k may be the true fundamental
 
     # Reliability check: if the UNCONSTRAINED tallest peak anywhere in the
     # search band falls inside a known artifact band and is measurably
