@@ -288,9 +288,18 @@ def test_chorus_rate_24_gap_does_not_yield_zero_hz():
     assert "24" not in REAL_CAL["chorus_rate_hz"]
     rate = ep.interp_table(REAL_CAL["chorus_rate_hz"], 24)
     assert rate > 0.0
-    # Sanity: should land between the real neighbouring measured points
-    # (16 -> 0.7782, 32 -> 0.9009).
-    assert 0.7782 < rate < 0.9009
+    # Should land between the real neighbouring measured points. Read those
+    # from the table rather than hardcoding them: the calibration is a
+    # regenerated measurement (it changed materially when the octave/time-
+    # stretch renderer bug was fixed), so pinning literals here would make
+    # this test fail on a legitimate recalibration rather than on a real
+    # regression in the gap-interpolation behaviour it exists to guard.
+    lo = REAL_CAL["chorus_rate_hz"]["16"]
+    hi = REAL_CAL["chorus_rate_hz"]["32"]
+    assert min(lo, hi) <= rate <= max(lo, hi), (
+        f"interpolated {rate} Hz at the raw=24 gap is outside its measured "
+        f"neighbours ({lo}, {hi})"
+    )
 
 
 def test_chorus_rate_24_gap_end_to_end_through_dspreset():
@@ -305,17 +314,38 @@ def test_chorus_rate_24_gap_end_to_end_through_dspreset():
 
 @pytest.mark.skipif(REAL_CAL is None, reason="calib/calibration.json not present")
 def test_reverb_rt60_hall1_dip_is_preserved_not_smoothed():
-    """reverb_rt60 type 4 (Hall1) has a genuine measured dip (~0.27s)
-    between raw 16 (2.0773) and raw 32 (1.8122). Interpolation must
-    reproduce that dip, not fit a monotonic curve that erases it."""
+    """A genuine measured RT60 dip must survive interpolation, not be
+    smoothed into a monotonic curve.
+
+    Which reverb type exhibits a dip is a property of the measurement, not a
+    fixed fact: the original table had one in Hall1 at raw 16->32, but that
+    dip vanished when the calibration was regenerated after the octave/time-
+    stretch renderer fix. So locate a real dip in the current data rather
+    than assuming a specific one, and skip if the corrected measurements are
+    genuinely monotonic everywhere (a legitimate outcome, not a failure)."""
     assert REAL_CAL is not None  # narrows for Pyright; guaranteed by skipif above
-    table = REAL_CAL["reverb_rt60"]["4"]
-    v16 = table["16"]
-    v32 = table["32"]
-    assert v32 < v16, "fixture assumption: the measured dip must exist in the data"
-    mid = ep.interp_table(table, 24)
-    assert v32 <= mid <= v16, "interpolation should sit between the two real points"
-    assert mid < v16, "the dip must show up in interpolated values, not be smoothed away"
+
+    found = None
+    for rtype, table in sorted(REAL_CAL["reverb_rt60"].items()):
+        pts = sorted((int(k), v) for k, v in table.items() if v is not None)
+        for (k0, v0), (k1, v1) in zip(pts, pts[1:]):
+            if v1 < v0:
+                found = (rtype, k0, v0, k1, v1)
+                break
+        if found:
+            break
+
+    if found is None:
+        pytest.skip("no measured RT60 dip in the current calibration -- "
+                    "nothing for interpolation to smooth away")
+
+    rtype, k0, v0, k1, v1 = found
+    mid = ep.interp_table(REAL_CAL["reverb_rt60"][rtype], (k0 + k1) // 2)
+    assert v1 <= mid <= v0, (
+        f"type {rtype}: interpolation at the midpoint of the measured dip "
+        f"({k0}->{k1}, {v0}->{v1}s) gave {mid}s, outside the two real points"
+    )
+    assert mid < v0, "the dip must survive interpolation, not be smoothed away"
 
 
 # ---------------------------------------------------------------------------

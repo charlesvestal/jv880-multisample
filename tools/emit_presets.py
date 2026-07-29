@@ -167,7 +167,14 @@ def interp_table(table, raw):
     """
     if not table:
         raise ValueError("empty calibration table")
-    pts = sorted((int(k), float(v)) for k, v in table.items())
+    # A key may be PRESENT with a null value: analyze_calibration.py records an
+    # unmeasurable point as null rather than omitting it or inventing a number
+    # (e.g. reverb_rt60 type 1 raw 0, whose tail never crossed -35 dB). Treat
+    # null exactly like an absent key -- interpolate across it from the nearest
+    # real measurements. Coercing null to 0.0 would fabricate an instant decay.
+    pts = sorted((int(k), float(v)) for k, v in table.items() if v is not None)
+    if not pts:
+        raise ValueError("calibration table has no measured values")
     keys = [k for k, _ in pts]
     vals = [v for _, v in pts]
 
