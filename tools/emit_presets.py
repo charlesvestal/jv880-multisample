@@ -403,7 +403,30 @@ def _clamp01(x):
 # tools/ir_capture.py's cmd_chorus_depth for the full method. The resulting
 # calibration.json "chorus_depth_norm" table is what CHORUS_MAX_MOD_DEPTH now
 # scales (see build_effects below) instead of a flat proportional guess.
-CHORUS_MAX_MOD_DEPTH = 0.35
+# Lowered 0.35 -> 0.10 after measuring what the JV's chorus actually does to
+# PITCH. At the chorus LFO rate -- the only component the chorus can be
+# responsible for, since the patch's own multi-tone detuning is broadband --
+# MIDI EPiano (chorus depth 116/127, about as deep as the bank goes) measures
+# 6.14 cents on the dry render and 4.07 cents with the JV's chorus engaged.
+# The JV's chorus does not add pitch modulation there at all; it slightly
+# reduces it. What it produces is doubling and stereo width, which `mix`
+# already carries.
+#
+# DecentSampler's chorus is a genuinely pitch-modulating one, so mapping the
+# JV's depth byte onto modDepth manufactures a vibrato the JV never had --
+# reported as the electric piano sounding cartoonish. An earlier measurement
+# appeared to clear this at 0.31 by comparing total pitch deviation, plugin
+# 27.5 cents vs ours 26.7; that number is meaningless, because the DRY render
+# measures 35.2 cents on its own. The metric was reading the patch's beating,
+# not the chorus.
+#
+# 0.10 is a judgement call, not a measurement, and is flagged as such:
+# modDepth is dimensionless and undocumented, there is no DecentSampler CLI to
+# render through, and our own chorus model adds only +0.14 cents at 0.31 --
+# so the model cannot be used to calibrate DS's response either. This keeps
+# audible movement while staying far away from vibrato; only listening in
+# DecentSampler can confirm the value.
+CHORUS_MAX_MOD_DEPTH = 0.10
 
 
 def amount(raw, ceiling=1.0):
@@ -521,7 +544,23 @@ EFFECT_MAX_MIX = 0.5
 # one. The cap keeps some direct sound on the wettest patches.
 REVERB_RATIO_SLOPE = 1.428
 REVERB_RATIO_INTERCEPT = -0.048
-REVERB_RATIO_MAX = 1.5          # highest ratio measured; mix caps at 0.6
+REVERB_RATIO_MAX = 1.7          # highest ratio measured across 88 patches
+
+# A `mix` of m nominally yields a wet/dry ratio of m/(1-m). Measured against
+# the emitted presets it yields only about 0.72x that -- convolution reflects
+# some of the dry signal back correlated with itself, so part of what the
+# blend adds does not read as "wet" at all. Setting mix = R/(1+R) as if the
+# blend were ideal therefore lands systematically dry, by 4-7 dB on the
+# wettest patches, which is why Pop Piano 1 (plugin ratio 1.53) was reported
+# as sounding like it had no reverb.
+#
+# Solving mix against the measured efficiency instead: mix = R/(R + EFF).
+REVERB_MIX_EFFICIENCY = 0.72
+# Cap high enough that a genuinely wet patch is not clipped by the cap
+# instead of by its own measurement -- at the old 0.6 the wettest patches
+# could not reach their measured ratio at all. Dry is restored afterwards by
+# blend_makeup_gain, so a high mix costs level, not presence.
+REVERB_MIX_MAX = 0.78
 
 # Ceiling on the dry-restoring makeup gain (see blend_makeup_gain). At the
 # emitted maxima -- reverb mix 0.6 with chorus mix 0.5 -- exact compensation
@@ -600,7 +639,9 @@ def _convolution_mix(wet, cal=None, rtype=None):
             slope, intercept = float(f["slope"]), float(f["intercept"])
     ratio = slope * _clamp01(wet) + intercept
     ratio = max(0.0, min(REVERB_RATIO_MAX, ratio))
-    return round(_clamp01(ratio / (1.0 + ratio)), 4)
+    if ratio <= 0.0:
+        return 0.0
+    return round(min(REVERB_MIX_MAX, ratio / (ratio + REVERB_MIX_EFFICIENCY)), 4)
 
 
 def _nearest_ir(cal, rtype, raw_time):

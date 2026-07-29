@@ -943,7 +943,11 @@ def test_convolution_mix_is_monotonic_and_leaves_dry_intact():
     prev = -1.0
     for raw in range(0, 128, 8):
         mix = ep._convolution_mix(raw / 127.0)
-        assert 0.0 <= mix <= 0.62, f"mix {mix} would erase the direct sound"
+        # Ceiling is REVERB_MIX_MAX: mix is solved against the measured blend
+        # efficiency (a mix of m delivers only ~0.72x the ratio it nominally
+        # asks for), so a genuinely wet patch needs a higher mix than the
+        # naive R/(1+R) would give. Dry level is restored by the group volume.
+        assert 0.0 <= mix <= ep.REVERB_MIX_MAX, f"mix {mix} would erase the direct sound"
         assert mix >= prev, "more reverb send must not yield less reverb"
         prev = mix
     assert ep._convolution_mix(0.0) == 0.0, "no send must mean no wet signal"
