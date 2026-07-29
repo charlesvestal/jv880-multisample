@@ -64,3 +64,11 @@ target_compile_options(jv_sampler PRIVATE ${JV_WARN_FLAGS})
 add_executable(calibrate tools/calibrate.cpp)
 target_link_libraries(calibrate jv_render)
 target_compile_options(calibrate PRIVATE ${JV_WARN_FLAGS})
+
+# Wave-ROM injection harness (tools/wave_inject.cpp): renders effect IRs by
+# substituting a synthetic impulse into an in-memory copy of the wave ROM, and
+# renders the two sides of a listening A/B. Previously compiled ad hoc, which
+# left no reproducible way to rebuild it after a source change.
+add_executable(wave_inject tools/wave_inject.cpp)
+target_link_libraries(wave_inject jv_render)
+target_compile_options(wave_inject PRIVATE ${JV_WARN_FLAGS})

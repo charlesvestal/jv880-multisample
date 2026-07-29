@@ -507,15 +507,31 @@ def _nearest_ir(cal, rtype, raw_time):
     if no IR was captured for this reverb type, so the caller can fall back
     rather than emit a preset referencing a file that does not exist.
 
-    `wet_ok` is False when the nearest step is a genuinely SILENT capture. At
-    reverbtime 0 the JV emits no wet signal at all and the capture faithfully
-    records digital silence -- but "convolve against silence" is not the same
-    as "no reverb". DecentSampler's convolution `mix` is a BLEND, so any mix
-    above 0 against a silent IR attenuates the dry signal while adding
-    nothing (House Hunter: reverb level 127 at time 0 -> mix 0.32 -> -3.4 dB
-    of dry for zero benefit). So a silent step reports wet_ok=False and
-    irFile points at the nearest AUDIBLE step instead, leaving the effect
-    usable if a player raises the reverb knob.
+    `wet_ok` is False when the nearest step captured as digital silence, which
+    happens at reverbtime 0 for every type. Note what that does and does NOT
+    mean. The JV genuinely DOES produce a wet signal at reverbtime 0 -- an
+    A/B of House Hunter (type 4, level 127, time 0) against its own dry render
+    measures the reverb-only contribution at 0.9x the dry RMS, correlated 0.41
+    with the dry at lag 0: a short, dense, filtered ambience rather than a
+    tail. What it means is that this response UNDERFLOWS to zero under impulse
+    excitation: the emulator's fixed-point reverb, given a single-sample
+    impulse and a near-zero decay time, produces output below its own
+    resolution. So no IR can be captured for these steps -- not with a louder
+    impulse, since the excitation is already full-scale.
+
+    Given that, mix must be 0. DecentSampler's convolution `mix` is a BLEND,
+    so any mix above 0 against an all-zero IR attenuates the dry signal while
+    adding nothing (House Hunter: mix 0.32 -> -3.4 dB of dry for zero
+    benefit). Pointing these patches at the nearest AUDIBLE step instead would
+    be worse than silence: at type 4 that step carries an 849 ms tail where
+    the truth is a brief ambience. So irFile references the nearest audible
+    step purely so the knob does something if a player raises it, while the
+    shipped mix stays 0.
+
+    KNOWN LIMITATION: the 6 of 309 pilot patches with reverbtime < 8 therefore
+    ship without their ambience. Capturing it needs a sustained excitation and
+    deconvolution, which this pipeline deliberately abandoned -- deconvolved
+    IRs carried audible source resonance.
     """
     bank = cal.get("reverb_ir", {}).get(str(rtype))
     if not bank:

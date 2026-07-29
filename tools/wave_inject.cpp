@@ -1174,6 +1174,69 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (cmd == "abcompare") {
+        // Renders the two sides of a listening A/B for one patch at one key:
+        //   full.wav -- the patch with its COMPLETE native effect chain
+        //               (reverb AND chorus), i.e. what the JV actually sounds
+        //               like. `groundtruth` deliberately restores reverb only,
+        //               because isolating one effect is right for MEASURING
+        //               it; for a listening test the whole chain is the point.
+        //   dry.wav  -- exactly what this pipeline samples: effects zeroed.
+        // LFO is stripped on BOTH sides. Our shipped samples are LFO-stripped
+        // and re-add modulation via DecentSampler <modulators>, so leaving LFO
+        // in would compare our effect chain against effects PLUS a modulation
+        // path the reconstruction never claimed to cover, and the resulting
+        // mismatch would be unattributable.
+        auto internal = enumerate_internal(roms);
+        if ((size_t)a.patch_index >= internal.size()) {
+            fprintf(stderr, "patch index out of range\n");
+            return 1;
+        }
+        const PatchRef &pr = internal[a.patch_index];
+        std::vector<uint8_t> raw(pr.data, pr.data + PATCH_SIZE);
+
+        LfoDecision d1 = decide_lfo_strip(pr.data, 1);
+        LfoDecision d2 = decide_lfo_strip(pr.data, 2);
+        std::vector<uint8_t> dry = preprocess(pr.data, d1, d2);
+
+        std::vector<uint8_t> full = dry;
+        full[12] = raw[12];   // reverbtype / chorustype nibble
+        full[13] = raw[13];   // reverblevel  (preprocess zeroed)
+        full[14] = raw[14];   // reverbtime
+        full[15] = raw[15];   // reverbfeedback
+        full[16] = raw[16];   // choruslevel + chorusoutput (preprocess zeroed)
+        // chorus depth/rate/feedback (17-19) are never zeroed by preprocess.
+
+        Effects e = read_effects(pr.data);
+        printf("{\"index\":%d,\"name\":\"%s\",\"key\":%d,\"reverb_type\":%d,"
+               "\"reverb_level\":%d,\"reverb_time\":%d,\"reverb_feedback\":%d,"
+               "\"chorus_level\":%d,\"chorus_depth\":%d,\"chorus_rate\":%d,"
+               "\"tone_level\":[%d,%d,%d,%d],\"reverb_send\":[%d,%d,%d,%d],"
+               "\"chorus_send\":[%d,%d,%d,%d]}\n",
+               a.patch_index, pr.name.c_str(), a.key, e.reverb_type,
+               e.reverb_level, e.reverb_time, e.reverb_feedback,
+               e.chorus_level, e.chorus_depth, e.chorus_rate,
+               e.tone_level[0], e.tone_level[1], e.tone_level[2], e.tone_level[3],
+               e.reverb_send[0], e.reverb_send[1], e.reverb_send[2], e.reverb_send[3],
+               e.chorus_send[0], e.chorus_send[1], e.chorus_send[2], e.chorus_send[3]);
+
+        Renderer r;
+        if (!r.init(roms)) { fprintf(stderr, "emulator init failed\n"); return 1; }
+        mkdirs(a.out_dir);
+
+        GridSpec g;
+        g.hold_seconds = 3.5;
+        g.tail_seconds = 6.0;
+        g.silence_db = -80.0;
+
+        char buf[512];
+        snprintf(buf, sizeof(buf), "%s/full_k%d.wav", a.out_dir.c_str(), a.key);
+        write_render(r, full, g, a.key, 100, buf);
+        snprintf(buf, sizeof(buf), "%s/dry_k%d.wav", a.out_dir.c_str(), a.key);
+        write_render(r, dry, g, a.key, 100, buf);
+        return 0;
+    }
+
     fprintf(stderr, "unknown subcommand: %s\n", cmd.c_str());
     return 1;
 }

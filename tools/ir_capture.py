@@ -404,11 +404,14 @@ def cmd_capture(wave_inject, roms, tmp, out_dir, args, excitation_latency):
             sf.write(str(dst), out16, IR_TARGET_SR, subtype="PCM_16")
             dur_raw = len(x) / SR
             dur_trim = len(trimmed) / SR
-            # A captured IR can be legitimately all-zero: at reverbtime 0 the
-            # JV produces no wet output whatsoever. Record that explicitly so
-            # the emitter can distinguish "no reverb here" from "reverb we
-            # failed to capture" -- convolving against silence at mix>0
-            # attenuates the dry signal instead of leaving it alone.
+            # A captured IR can come back all-zero. This happens at reverbtime
+            # 0 for every type, and it is an UNDERFLOW, not an absence: the JV
+            # does produce wet signal there (measured against a real patch's
+            # own dry render at 0.9x dry RMS), but a single-sample impulse into
+            # a near-zero decay time lands below the fixed-point reverb's own
+            # resolution. Record it so the emitter can ship mix=0 rather than
+            # convolving against silence, which at mix>0 attenuates the dry
+            # signal instead of leaving it alone.
             bank[t][raw] = {"file": str(dst.relative_to(out_dir.parent)),
                             "raw_duration_s": dur_raw, "trimmed_duration_s": dur_trim,
                             "rt60_s": rt60, "silent": not bool(out16.any())}
