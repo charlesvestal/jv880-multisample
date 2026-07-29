@@ -62,6 +62,29 @@ MIN_CROSSFADE_SCORE = 0.35
 # achievable crossfade-region score, pick the longest rather than the
 # single highest-scoring one.
 SCORE_TOL = 0.05
+# Bound on how many candidates the verify-actual-crossfade fallback (see
+# find_loop) will check before declining. Each check is a cheap O(xfade)
+# per-channel correlation (at most a few thousand samples), and only the
+# rare zone whose top pick doesn't saturate ever reaches this loop at all,
+# so this is generous headroom, not a tight budget.
+MAX_VERIFY_TRIES = 2000
+
+
+def _crossfade_window_score(ext_region, ref_start, cand_start, length, n_channels):
+    """Per-channel worst-case normalized correlation between
+    ext_region[ref_start:ref_start+length] and
+    ext_region[cand_start:cand_start+length] -- used to verify a single
+    candidate's ACTUAL emitted crossfade window, as opposed to the fixed
+    xf_score window the bulk FFT search scores every lag with."""
+    worst = None
+    for c in range(n_channels):
+        chan = ext_region[:, c]
+        ref = chan[ref_start:ref_start + length]
+        cand = chan[cand_start:cand_start + length]
+        denom = (np.linalg.norm(ref) * np.linalg.norm(cand)) + 1e-12
+        s = float(np.dot(ref, cand) / denom)
+        worst = s if worst is None else min(worst, s)
+    return worst if worst is not None else 0.0
 
 
 def find_loop(x, sr, hold_frames):
@@ -107,6 +130,24 @@ def find_loop(x, sr, hold_frames):
     are considered, both to keep this window size representative and to
     avoid the reference and candidate windows overlapping each other
     (which would inflate the score with self-correlation).
+
+    VERIFICATION (found in full-pilot validation): xf_score is only the
+    ACTUAL emitted crossfade for candidates long enough that the
+    `length // 4` term in the crossfade formula below doesn't bind. For
+    shorter candidates, DecentSampler will blend a shorter window than
+    the one just scored -- so a candidate can look good over the wider
+    scoring window while its real, shorter emitted window is a genuinely
+    bad seam (observed on real pilot zones: correlations of 0.20, 0.09,
+    even negative, despite clearing the wide-window floor). Per-candidate
+    window sizing inside the vectorized FFT search isn't practical (the
+    short-candidate range alone spans thousands of distinct window
+    sizes), so instead: once a candidate is selected, if its own actual
+    emitted crossfade is shorter than xf_score, its score is re-verified
+    against that real window; if it fails, the next-best candidate is
+    tried instead (bounded by MAX_VERIFY_TRIES), until one genuinely
+    passes or the search declines. Candidates whose emitted crossfade
+    already saturates at xf_score need no re-verification -- their score
+    is already exact.
 
     DECISION (also rewritten): the old code rejected outright whenever the
     single best available candidate still exceeded an endpoint-delta
@@ -247,12 +288,54 @@ def find_loop(x, sr, hold_frames):
     # found in the previous (dv-based) version of this function. Every
     # candidate this can return must itself clear the floor.
     near_mask = cand_scores >= max(best_score - SCORE_TOL, MIN_CROSSFADE_SCORE)
-    near_lags = cand_lags[near_mask]
-    near_scores = cand_scores[near_mask]
+    # Every trial candidate (near-best or fallback) must clear the floor
+    # on its WIDE (scored) window at minimum -- a saturated candidate is
+    # trusted without re-verification below (see the L // 4 check), so if
+    # this didn't exclude sub-floor candidates from the fallback pool, a
+    # saturated-but-genuinely-bad-wide-score candidate could be accepted
+    # via that trusted path without ever being checked against the floor
+    # at all. Found while testing this fix, not in pilot validation.
+    other_mask = (~near_mask) & (cand_scores >= MIN_CROSSFADE_SCORE)
 
-    best_idx = int(np.argmax(near_lags))
-    end = loop_start + int(near_lags[best_idx])
-    chosen_score = float(near_scores[best_idx])
+    # Trial order: the preferred pool (near-best score, longest first --
+    # matches the "prefer longer" tiebreak) is tried before everything
+    # else that still cleared the floor (sorted by scored-window score,
+    # best first). Most zones resolve on the very first trial without
+    # ever reaching the verification step below.
+    near_lags, near_scores = cand_lags[near_mask], cand_scores[near_mask]
+    near_order = np.argsort(-near_lags)  # longest first
+    other_lags, other_scores = cand_lags[other_mask], cand_scores[other_mask]
+    other_order = np.argsort(-other_scores)  # best scored-window score first
+    trial_lags = np.concatenate([near_lags[near_order], other_lags[other_order]])
+    trial_scores = np.concatenate([near_scores[near_order], other_scores[other_order]])
+
+    end = None
+    chosen_score = None
+    for i in range(min(len(trial_lags), MAX_VERIFY_TRIES)):
+        cand_l = int(trial_lags[i])
+        scored_window_score = float(trial_scores[i])
+        if cand_l // 4 >= xf_score:
+            # Saturated: this candidate's actual emitted crossfade equals
+            # xf_score, the exact window it was already scored with --
+            # nothing to re-verify.
+            end = loop_start + cand_l
+            chosen_score = scored_window_score
+            break
+        xfade_actual = min(MAX_XFADE, loop_start // 4, cand_l // 4)
+        ref_start = xf_score - xfade_actual
+        cand_start = xf_score + cand_l - xfade_actual
+        verified = _crossfade_window_score(ext_region, ref_start, cand_start, xfade_actual, n_channels)
+        if verified >= MIN_CROSSFADE_SCORE:
+            end = loop_start + cand_l
+            chosen_score = verified
+            break
+
+    if end is None:
+        # Every candidate we were willing to try either failed
+        # verification against its real emitted window or we hit
+        # MAX_VERIFY_TRIES -- nothing here would actually blend
+        # acceptably at the crossfade length it would really get.
+        return None
 
     length = end - loop_start
     if length <= 0:
@@ -262,7 +345,7 @@ def find_loop(x, sr, hold_frames):
     # relative to loopStart or the loop length, so cap it hard on every
     # path here. For any loop >= 4x xf_score (the common case given the
     # "prefer longer" bias above), this saturates at xf_score -- the same
-    # window this candidate was actually scored with.
+    # window this candidate was actually scored (or re-verified) with.
     xfade = int(min(MAX_XFADE, loop_start // 4, length // 4))
     return {"enabled": True, "start": int(loop_start), "end": int(end),
             "crossfade": int(max(0, xfade)), "score": round(chosen_score, 4)}

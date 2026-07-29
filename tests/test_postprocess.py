@@ -125,6 +125,169 @@ def test_crossfade_bounded_by_length_for_short_loop():
     assert loop["crossfade"] <= min(pp.MAX_XFADE, loop["start"] // 4, length // 4)
 
 
+def _split_score_candidate(mono, start_lo, xf_score, l_target, good_seed, bad_seed):
+    """Build a candidate at lag l_target whose WIDE (xf_score) crossfade-
+    region window scores well overall, but whose ACTUAL emitted window
+    (xfade = l_target // 4, the short-loop case) is corrupted with
+    unrelated content -- reproducing the full-pilot finding: the scored
+    window is not the emitted window, so a candidate can look fine over
+    xf_score while its real, shorter crossfade is a genuine bad seam
+    (real correlations observed: 0.20, 0.15, 0.09, and negative values).
+    Mutates `mono` in place and returns the actual emitted xfade length.
+    """
+    from scipy.signal import butter, sosfiltfilt
+    sos = butter(4, [900, 6000], btype="bandpass", fs=pp.SR_OUT, output="sos")
+
+    idx = start_lo + l_target
+    xfade_actual = l_target // 4
+    ref_win = mono[start_lo - xf_score:start_lo].copy()
+    # Copy the reference across the whole wide window (makes the
+    # aggregate/wide score look near-perfect)...
+    mono[idx - xf_score:idx] = ref_win
+    # ...then corrupt only the LAST xfade_actual samples -- the part
+    # DecentSampler will actually blend -- with unrelated content.
+    unrelated = sosfiltfilt(sos, np.random.default_rng(bad_seed).standard_normal(xfade_actual))
+    unrelated /= np.max(np.abs(unrelated)) + 1e-9
+    mono[idx - xfade_actual:idx] = unrelated * float(np.max(np.abs(mono)))
+    return xfade_actual
+
+
+def test_short_loop_declines_when_actual_emitted_window_is_bad():
+    """Regression test for the exact full-pilot-validation bug: the
+    scoring window (xf_score) is only the ACTUAL emitted crossfade for
+    loops long enough that length // 4 doesn't bind. For a short loop,
+    the wide window can score well while the real, shorter emitted window
+    -- the last length // 4 samples of it -- is a genuine bad seam.
+
+    Builds ONE candidate at the shortest reachable lag (l_min == xf_score,
+    so its actual emitted crossfade is xf_score // 4) whose wide window is
+    an near-exact copy of the reference (so a scored-window-only decision
+    would accept it) but whose actual emitted window is corrupted with
+    unrelated content. With nothing else in the signal that clears the
+    floor, the OLD (scored-window-only) logic picks this candidate; the
+    real (fixed) find_loop must verify against the real window and
+    decline instead of returning a loop that would fail the validator.
+    """
+    n_total = int(6.0 * SR)
+    rng = np.random.default_rng(31)
+    from scipy.signal import butter, sosfiltfilt
+    sos = butter(4, [900, 6000], btype="bandpass", fs=SR, output="sos")
+    mono = sosfiltfilt(sos, rng.standard_normal(n_total))
+    mono /= np.max(np.abs(mono)) + 1e-9
+    mono *= 0.5
+
+    start_lo = int(1.0 * SR)
+    xf_score = min(pp.MAX_XFADE, start_lo // 4)
+    l_bad = xf_score  # shortest reachable loop length
+    xfade_actual = _split_score_candidate(mono, start_lo, xf_score, l_bad, good_seed=None, bad_seed=77)
+
+    x = make_stereo(mono)
+    kind, _ = pp.classify(x, HOLD)
+    assert kind == "sustaining"
+
+    # Self-contained proof of the bug: reconstruct the OLD, scored-
+    # window-only decision (no verification against the actual emitted
+    # window) and confirm it picks the bad candidate.
+    def old_style_pick(stereo, sr, hold_frames):
+        chans = stereo
+        start = int(1.0 * sr)
+        region_hi = min(hold_frames, len(chans)) - int(0.05 * sr)
+        xf = min(pp.MAX_XFADE, start // 4)
+        ext = chans[start - xf:region_hi].astype(np.float64)
+        combined = None
+        for c in range(chans.shape[1]):
+            chan = ext[:, c]
+            ref = chan[:xf]
+            ref_norm = float(np.linalg.norm(ref))
+            numerator = pp.fftconvolve(chan, ref[::-1], mode="valid")
+            csq = np.cumsum(np.concatenate(([0.0], chan ** 2)))
+            we = csq[xf:] - csq[:-xf]
+            wn = np.sqrt(np.maximum(we, 0.0))
+            score = numerator / (ref_norm * wn + 1e-12)
+            combined = score if combined is None else np.minimum(combined, score)
+        l_min = max(int(pp.MIN_LOOP_SECONDS * sr), xf)
+        l_max = len(ext) - xf
+        lags = np.arange(len(combined))
+        mask = (lags >= l_min) & (lags <= l_max) & np.isfinite(combined)
+        cand_lags, cand_scores = lags[mask], combined[mask]
+        best = float(np.max(cand_scores))
+        if best < pp.MIN_CROSSFADE_SCORE:
+            return None
+        near = cand_scores >= max(best - pp.SCORE_TOL, pp.MIN_CROSSFADE_SCORE)
+        near_lags = cand_lags[near]
+        idx = int(np.argmax(near_lags))
+        return start, start + int(near_lags[idx])
+
+    old_pick = old_style_pick(x, SR, HOLD)
+    assert old_pick is not None and old_pick[1] - old_pick[0] == l_bad, (
+        "setup check: expected the old, scored-window-only logic to pick "
+        "the bad candidate -- if it picked something else (or declined), "
+        "this test isn't exercising the bug"
+    )
+
+    # Directly confirm the actual emitted window really is bad.
+    peak = float(np.abs(x).max())
+    idx_bad = start_lo + l_bad
+    actual_ref = mono[start_lo - xfade_actual:start_lo]
+    actual_cand = mono[idx_bad - xfade_actual:idx_bad]
+    denom = (np.linalg.norm(actual_ref) * np.linalg.norm(actual_cand)) + 1e-12
+    actual_score = float(np.dot(actual_ref, actual_cand) / denom)
+    assert actual_score < pp.MIN_CROSSFADE_SCORE, (
+        f"setup check: actual emitted window score ({actual_score}) should "
+        "be genuinely bad, below the floor"
+    )
+
+    # The real (fixed) find_loop must not return this bad candidate.
+    loop = pp.find_loop(x, SR, HOLD)
+    assert loop is None, (
+        "find_loop returned a loop whose actual emitted crossfade window "
+        "is genuinely uncorrelated -- it should have verified against the "
+        "real window and declined (nothing else in this signal passes)"
+    )
+
+
+def test_short_loop_falls_back_to_next_candidate_when_first_pick_fails_verification():
+    """Companion to the decline test above: when a genuinely good
+    alternative DOES exist elsewhere, the verification failure on the
+    first (bad, short) pick must fall through to that alternative rather
+    than declining unnecessarily.
+    """
+    n_total = int(6.0 * SR)
+    rng = np.random.default_rng(31)
+    from scipy.signal import butter, sosfiltfilt
+    sos = butter(4, [900, 6000], btype="bandpass", fs=SR, output="sos")
+    mono = sosfiltfilt(sos, rng.standard_normal(n_total))
+    mono /= np.max(np.abs(mono)) + 1e-9
+    mono *= 0.5
+
+    start_lo = int(1.0 * SR)
+    xf_score = min(pp.MAX_XFADE, start_lo // 4)
+    l_bad = xf_score
+    _split_score_candidate(mono, start_lo, xf_score, l_bad, good_seed=None, bad_seed=77)
+
+    # A genuinely good, saturated (long) alternative elsewhere in the
+    # region -- an exact copy of the reference, well within the valid
+    # search range.
+    l_good = int(2.0 * SR)
+    idx_good = start_lo + l_good
+    ref_win = mono[start_lo - xf_score:start_lo]
+    mono[idx_good - xf_score:idx_good] = ref_win
+
+    x = make_stereo(mono)
+    kind, _ = pp.classify(x, HOLD)
+    assert kind == "sustaining"
+
+    loop = pp.find_loop(x, SR, HOLD)
+    assert loop is not None, "a genuinely good alternative exists -- find_loop should use it"
+    chosen_length = loop["end"] - loop["start"]
+    assert chosen_length != l_bad, "find_loop should have rejected the bad candidate"
+    assert chosen_length == l_good, (
+        f"expected find_loop to fall back to the good candidate ({l_good}), "
+        f"got length {chosen_length}"
+    )
+    assert loop["score"] >= pp.MIN_CROSSFADE_SCORE
+
+
 def test_find_loop_prefers_longer_loop_when_endpoints_are_comparable():
     """A clean periodic signal has a near-perfect endpoint match at nearly
     every reachable lag -- the tiebreak must pull toward a long candidate
