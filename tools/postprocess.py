@@ -16,7 +16,11 @@ from scipy.signal import fftconvolve, resample_poly
 
 SR_IN = 64000
 SR_OUT = 48000
-MAX_XFADE = 2000
+# "A few hundred ms" per listening-test follow-up (was 2000 = ~42ms, found
+# too conservative). In practice loop_start // 4 (~250ms for the standard
+# 1.0s loop_start) is usually the binding relative bound, not this
+# absolute ceiling -- see find_loop's docstring.
+MAX_XFADE = 24000
 # A zone whose kind is one of these has no usable audio; see
 # _mark_zone_unprocessable's docstring for the Task 6 contract this implies.
 FAILURE_KINDS = frozenset({"missing", "error"})
@@ -50,11 +54,14 @@ def classify(x, hold_frames):
 
 
 MIN_LOOP_SECONDS = 0.05
-REF_WIN = 2048  # reference window (frames) for the cross-correlation search
-# Matches the validator's own threshold: a candidate whose best achievable
-# per-channel endpoint discontinuity still exceeds this fraction of peak
-# is not looped at all, rather than looped at the least-bad candidate.
-MAX_ENDPOINT_DV_FRACTION = 0.05
+# Below this crossfade-region correlation, decline to loop at all -- the
+# candidates are genuinely bad, not just imperfect. Calibrated against real
+# pilot material; see find_loop's docstring for the listening-test context.
+MIN_CROSSFADE_SCORE = 0.35
+# "Prefer longer" tolerance: among candidates within this much of the best
+# achievable crossfade-region score, pick the longest rather than the
+# single highest-scoring one.
+SCORE_TOL = 0.05
 
 
 def find_loop(x, sr, hold_frames):
@@ -72,31 +79,52 @@ def find_loop(x, sr, hold_frames):
     their long periods pushed 60 multiples into a useful range, which is
     why this passed unnoticed on a 220 Hz synthetic test signal.
 
-    Everything below operates PER CHANNEL, not on the mono mix. Scoring
-    and minimizing discontinuity on x.mean(axis=1) was a separate, clean
-    bug: a real per-channel endpoint mismatch can be near-exactly opposite
-    in sign between L and R (common on stereo-detuned/panned JV patches),
-    which cancels in the mono average to a "perfect" 0.0% match while the
-    actual per-channel discontinuity a sampler plays back is 5-50%+ of
-    peak -- an audible click that the mono-based search couldn't see by
-    construction, on 2,400+ zones in the pilot. Endpoint discontinuity is
-    now `max(|L diff|, |R diff|)`, matching how the validator (and a real
-    player) judges it; correlation score is the worse of the two
-    per-channel scores at each lag, so a candidate only qualifies if BOTH
-    channels genuinely match, not just their sum.
+    Everything below operates PER CHANNEL, not on the mono mix -- a real
+    per-channel endpoint mismatch can be near-exactly opposite in sign
+    between L and R (common on stereo-detuned/panned JV patches), which
+    cancels in a mono average to a falsely "perfect" match. Correlation
+    score at each lag is the WORSE of the two per-channel scores, so a
+    candidate only qualifies if BOTH channels genuinely agree.
 
-    For every lag L from MIN_LOOP_SECONDS up to as long as the region
-    allows, this scores normalized cross-correlation between a REF_WIN-
-    frame window at loop_start and one at loop_start+L, per channel.
-    Cross-correlation at every lag is computed in one FFT call per channel
-    (`fftconvolve`, the same O(n log n) trick used for the earlier
-    autocorrelation fix) rather than a Python loop over candidate
-    lengths -- this runs per sustaining zone, ~7,000+ times a batch, and
-    needs to stay in the low tens of milliseconds even doubled for stereo.
-    Because every lag is scored at full sample resolution already (not a
-    coarse grid), there's no separate "fine" refinement pass afterward:
-    the endpoint discontinuity (dv) used for the final pick is exact for
-    every candidate, on every channel.
+    SCORING METRIC (rewritten after listening tests): this used to pick
+    candidates by minimizing a SINGLE-SAMPLE endpoint difference
+    |x[start] - x[end]|. That's the right objective for a hard loop with
+    no crossfade, but DecentSampler crossfades: it blends x[end-xf:end]
+    against x[start-xf:start], the `xf`-frame region ending at each loop
+    boundary, not the boundary sample alone. Two real pilot examples with
+    nearly identical raw endpoint deltas got opposite listening verdicts
+    -- JP-8 Strings at 40.9% sounded fine (dense detuned content masks a
+    seam), Whistle at 64.4% pulsed audibly (an exposed tone does not) --
+    proving the single-sample delta doesn't predict what's actually
+    audible through a crossfade. This now scores candidates by normalized
+    cross-correlation of the CROSSFADE REGION itself: the `xf`-frame
+    window ending at the candidate loop end vs. the `xf`-frame window
+    ending at loop_start (the material DecentSampler actually blends).
+    `xf` here is the saturated crossfade length (see MAX_XFADE below) --
+    the same value nearly every accepted (long) loop will actually get,
+    since the crossfade-length term in that formula only binds for loops
+    shorter than 4x this length. Only candidates with loop length >= xf
+    are considered, both to keep this window size representative and to
+    avoid the reference and candidate windows overlapping each other
+    (which would inflate the score with self-correlation).
+
+    DECISION (also rewritten): the old code rejected outright whenever the
+    single best available candidate still exceeded an endpoint-delta
+    ceiling -- optimizing for "no defects" over "usable instrument." A
+    user listening test overruled that: for a sustained instrument, a note
+    that just stops at ~6s is a worse failure than a subtle seam, so this
+    now prefers to loop. There's still a floor (MIN_CROSSFADE_SCORE) below
+    which the crossfade region is genuinely uncorrelated and a loop would
+    be actively bad, but it's far more permissive than before, and instead
+    of "reject if the best is imperfect," it's "take the best available
+    unless it's genuinely bad."
+
+    For every lag L, cross-correlation of the crossfade-region window is
+    computed in one FFT call per channel (`fftconvolve`, the same
+    O(n log n) trick used for the earlier autocorrelation fix) rather than
+    a Python loop over candidate lengths -- this runs per sustaining zone,
+    thousands of times a batch, and needs to stay in the low tens of
+    milliseconds even doubled for stereo.
     """
     if len(x) == 0:
         return None
@@ -111,38 +139,59 @@ def find_loop(x, sr, hold_frames):
         return None
 
     loop_start = start_lo
+
+    # NOTE (not fixed here): no explicit awareness of the patch's own
+    # LFO1/LFO2 rate. Loops generally land much longer than the old
+    # ~60-period ceiling (often close to the full region), which
+    # incidentally makes it less likely a loop is shorter than one LFO
+    # cycle -- but nothing here specifically checks that. Needs
+    # auditioning real LFO-modulated pad/string renders to know whether
+    # this needs a dedicated fix.
+
+    # The crossfade length used both for SCORING candidates and, for any
+    # loop long enough not to be clamped by the length//4 term below, as
+    # the actual crossfade DecentSampler will use.
+    xf_score = min(MAX_XFADE, loop_start // 4)
+    if xf_score < 64:
+        return None
+
+    pre_start = loop_start - xf_score
+    if pre_start < 0:
+        return None
     # float64 throughout: the cumulative-sum trick below for rolling
     # window energy is numerically sensitive to precision loss over
     # ~100k+ samples, and the source may already be float32 (see
-    # sf.read(..., dtype="float32") in process_patch).
-    region = chans[loop_start:region_hi].astype(np.float64)  # (n_region, C)
-    n_region = len(region)
+    # sf.read(..., dtype="float32") in process_patch). Extends back to
+    # pre_start (not loop_start) so the reference window can be the
+    # crossfade-in material x[loop_start-xf:loop_start].
+    ext_region = chans[pre_start:region_hi].astype(np.float64)  # (n_ext, C)
+    n_ext = len(ext_region)
 
-    win = min(REF_WIN, n_region // 2)
-    if win < 64:
-        return None
-
-    l_min = int(MIN_LOOP_SECONDS * sr)
-    l_max = n_region - win
+    # Candidate lengths must be >= xf_score: shorter than that, the
+    # candidate's own crossfade-region window would overlap the reference
+    # window (both start within xf_score samples of loop_start), which
+    # would inflate the score with shared, self-correlated samples rather
+    # than measuring a genuine match.
+    l_min = max(int(MIN_LOOP_SECONDS * sr), xf_score)
+    l_max = n_ext - xf_score  # == region_hi - loop_start
     if l_max < l_min:
         return None
 
     # If EVERY channel's reference window is near-silent, there's no real
     # audio to loop at all (a fully silent zone shouldn't get a "perfect"
-    # loop just because 0-0=0 everywhere) -- match the old mono
-    # behaviour's `ref_norm <= 1e-12: return None` for that case exactly.
-    ref_norms = [float(np.linalg.norm(region[:win, c])) for c in range(n_channels)]
+    # loop just because 0-0=0 everywhere).
+    ref_norms = [float(np.linalg.norm(ext_region[:xf_score, c])) for c in range(n_channels)]
     if max(ref_norms) <= 1e-12:
         return None
 
-    # Per-channel normalized cross-correlation at every lag, combined by
-    # taking the WORSE (minimum) of the per-channel scores -- a candidate
-    # only counts as a good match if every channel independently clears
-    # the bar, not just their average.
+    # Per-channel normalized cross-correlation of the crossfade region at
+    # every lag, combined by taking the WORSE (minimum) of the per-channel
+    # scores -- a candidate only counts as a good match if every channel
+    # independently clears the bar, not just their average.
     combined_score = None
     for c in range(n_channels):
-        chan = region[:, c]
-        ref = chan[:win]
+        chan = ext_region[:, c]
+        ref = chan[:xf_score]
         ref_norm = ref_norms[c]
         if ref_norm <= 1e-12:
             # A near-silent reference on THIS channel while at least one
@@ -150,17 +199,18 @@ def find_loop(x, sr, hold_frames):
             # can't meaningfully judge any lag itself -- numerator/denom
             # would be near 0/0 noise, not a real signal of mismatch.
             # Treat it as neutral (score 1.0 everywhere) rather than
-            # letting numerical noise veto every candidate; the endpoint
-            # discontinuity check below still applies to this channel
-            # with correct arithmetic regardless (0 - 0 stays 0).
-            chan_score = np.ones(n_region - win + 1)
+            # letting numerical noise veto every candidate.
+            chan_score = np.ones(n_ext - xf_score + 1)
         else:
             # numerator[L] = sum_j chan[L+j] * ref[j] for every lag L at
             # once -- the standard correlation-as-convolution identity
-            # (mode="valid" since we only want in-range lags).
+            # (mode="valid" since we only want in-range lags). chan[L:L+xf]
+            # is x[loop_start+L-xf : loop_start+L] == x[end-xf:end] for
+            # candidate end = loop_start + L, i.e. exactly the crossfade
+            # material DecentSampler would blend in at that loop point.
             numerator = fftconvolve(chan, ref[::-1], mode="valid")
             csq = np.cumsum(np.concatenate(([0.0], chan ** 2)))
-            win_energy = csq[win:] - csq[:-win]
+            win_energy = csq[xf_score:] - csq[:-xf_score]
             win_norm = np.sqrt(np.maximum(win_energy, 0.0))
             denom = ref_norm * win_norm + 1e-12
             chan_score = numerator / denom
@@ -170,67 +220,33 @@ def find_loop(x, sr, hold_frames):
         )
 
     lags = np.arange(len(combined_score))
-    # Correlation gate unchanged from the mono version (0.90); the bug
-    # being fixed is what the score/discontinuity are computed ON, not
-    # this threshold.
-    mask = (lags >= l_min) & (lags <= l_max) & np.isfinite(combined_score) & (combined_score >= 0.90)
+    mask = (lags >= l_min) & (lags <= l_max) & np.isfinite(combined_score)
     if not np.any(mask):
         return None
 
     cand_lags = lags[mask]
     cand_scores = combined_score[mask]
 
-    # Endpoint discontinuity: worst case across channels -- max(|L diff|,
-    # |R diff|) -- matching exactly what the validator checks
-    # (np.abs(x[s] - x[e]).max()) and what a sampler actually plays back.
-    # A mono-mixed difference can be near zero even when both channels are
-    # individually well outside tolerance, if their errors are opposite in
-    # sign; that cancellation was the entire bug.
-    start_vals = region[0]              # (C,)
-    end_vals = region[cand_lags]        # (len(cand_lags), C)
-    dv_vals = np.max(np.abs(start_vals - end_vals), axis=1)
-
-    # Among the candidates, prefer a LONGER loop (fewer perceptible
-    # repeats -- a real quality concern on the pads/strings this pipeline
-    # is full of), but not at the cost of a meaningfully worse endpoint
-    # match. Take every candidate within a small tolerance of the best
-    # achievable discontinuity, then pick the longest of those.
-    #
-    # NOTE (not fixed here): this still has no explicit awareness of the
-    # patch's own LFO1/LFO2 rate. Loops now generally land much longer
-    # than the old ~60-period ceiling (often close to the full region),
-    # which incidentally makes it less likely a loop is shorter than one
-    # LFO cycle -- but nothing here specifically checks that. Needs
-    # auditioning real LFO-modulated pad/string renders to know whether
-    # this needs a dedicated fix.
-    best_dv = float(np.min(dv_vals))
-    peak = float(np.max(np.abs(chans))) if chans.size else 0.0
-
-    # The 0.90 correlation gate is a WINDOWED, aggregate similarity check
-    # (2048 samples) -- it does not guarantee the single boundary sample
-    # actually lines up. On some material (seen in pilot validation on
-    # patches like Mighty Pad/Pipe Organ) literally every candidate that
-    # clears 0.90 still has a large per-channel endpoint jump (60-70% of
-    # peak), and without this check the "best of a bad lot" would still
-    # be returned as a loop. Match the design's own stated principle (see
-    # design doc, "no loop is better than a bad one") and the validator's
-    # own 5%-of-peak threshold: if even the closest achievable per-channel
-    # match is still clearly bad, decline to loop at all rather than hand
-    # back a candidate the validator would reject anyway.
-    if peak > 0 and best_dv > MAX_ENDPOINT_DV_FRACTION * peak:
+    # "Prefer to loop": take the best available candidate unless it's
+    # genuinely bad. This replaces the old reject-outright-if-imperfect
+    # ceiling -- a user listening test found that a sustained instrument
+    # cutting off after ~6s is a worse failure than a subtle crossfade
+    # seam, so only decline when the crossfade region is truly
+    # uncorrelated (nothing here would blend acceptably at all).
+    best_score = float(np.max(cand_scores))
+    if best_score < MIN_CROSSFADE_SCORE:
         return None
 
-    # The "prefer longer" tolerance window is relative to best_dv (up to
-    # 2x it), which can itself approach the ceiling above without
-    # exceeding it -- e.g. best_dv at 3% of peak passes the check above,
-    # but a tol of best_dv*2 = 6% would then let the tiebreak pick a
-    # LONGER candidate at up to 6%, over the ceiling it was just checked
-    # against. Clamp the tolerance to the same ceiling so the tiebreak can
-    # never hand back a candidate the check above was meant to rule out.
-    tol = max(best_dv * 2.0, 0.0005 * peak, 1e-9)
-    if peak > 0:
-        tol = min(tol, MAX_ENDPOINT_DV_FRACTION * peak)
-    near_mask = dv_vals <= tol
+    # Among candidates within SCORE_TOL of the best, prefer the LONGEST
+    # (fewer perceptible repeats -- a real quality concern on the
+    # pads/strings this pipeline is full of). Clamp the tolerance floor to
+    # MIN_CROSSFADE_SCORE: best_score alone clearing the "genuinely bad"
+    # check above doesn't stop best_score - SCORE_TOL from dipping below
+    # it (e.g. best_score=0.36 gives a tolerance floor of 0.31, under a
+    # 0.35 MIN_CROSSFADE_SCORE) -- the same tolerance-window-vs-ceiling gap
+    # found in the previous (dv-based) version of this function. Every
+    # candidate this can return must itself clear the floor.
+    near_mask = cand_scores >= max(best_score - SCORE_TOL, MIN_CROSSFADE_SCORE)
     near_lags = cand_lags[near_mask]
     near_scores = cand_scores[near_mask]
 
@@ -241,9 +257,12 @@ def find_loop(x, sr, hold_frames):
     length = end - loop_start
     if length <= 0:
         return None
-    # Enforce the DecentSampler crossfade bound in code (not just documented):
-    # loopCrossfade silently breaks looping when it's large relative to
-    # loopStart or the loop length, so cap it hard on every path here.
+    # Enforce the DecentSampler crossfade bound in code (not just
+    # documented): loopCrossfade silently breaks looping when it's large
+    # relative to loopStart or the loop length, so cap it hard on every
+    # path here. For any loop >= 4x xf_score (the common case given the
+    # "prefer longer" bias above), this saturates at xf_score -- the same
+    # window this candidate was actually scored with.
     xfade = int(min(MAX_XFADE, loop_start // 4, length // 4))
     return {"enabled": True, "start": int(loop_start), "end": int(end),
             "crossfade": int(max(0, xfade)), "score": round(chosen_score, 4)}

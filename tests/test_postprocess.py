@@ -50,26 +50,78 @@ def test_crossfade_bounded():
     # self-referential "crossfade <= min(...)" check computed the same way
     # the implementation computes it.
     #
-    # Values below are for the length-based FFT search (see find_loop):
-    # a pure 220 Hz tone is periodic at every lag, so the "prefer longer"
-    # tiebreak walks all the way out near the end of the reachable region
-    # (region_hi - REF_WIN), not just to a small multiple of the pitch
-    # period.
+    # Values below are for the crossfade-region-correlation search (see
+    # find_loop): a pure 220 Hz tone is periodic at every lag, so the
+    # "prefer longer" tiebreak walks all the way out near the end of the
+    # reachable region, not just to a small multiple of the pitch period.
     t = np.arange(int(6.0 * SR)) / SR
     mono = 0.5 * np.sin(2 * np.pi * 220.0 * t)
     x = make_stereo(mono)
     loop = pp.find_loop(x, SR, HOLD)
     assert loop is not None
     assert loop["start"] == 48000
-    assert loop["end"] == 163200
-    assert loop["crossfade"] == 2000
-    # This specific case exercises the MAX_XFADE branch of the min(): both
-    # start//4 (12000) and length//4 (28800) exceed MAX_XFADE (2000), so
-    # MAX_XFADE is the binding constraint here.
-    assert loop["crossfade"] == pp.MAX_XFADE
+    assert loop["end"] == 165600
+    assert loop["crossfade"] == 12000
+    # This specific case exercises the loop_start//4 branch of the min():
+    # loop_start//4 (12000) is smaller than MAX_XFADE (24000) and length//4
+    # (29400), so loop_start//4 is the binding constraint here -- matching
+    # the listening-test follow-up's own example (loop_start at 1s, a
+    # crossfade landing around 250ms = 25% of loop_start).
+    assert loop["crossfade"] == 48000 // 4
     # Independent sanity check against the documented bound, using the
     # loop's own reported values (not a copy of the implementation).
     length = loop["end"] - loop["start"]
+    assert loop["crossfade"] <= min(pp.MAX_XFADE, loop["start"] // 4, length // 4)
+
+
+def test_crossfade_bounded_by_length_for_short_loop():
+    """test_crossfade_bounded above only exercises the loop_start//4
+    branch of the crossfade formula (the common case, given the "prefer
+    longer" bias). This exercises length//4 -- the bound that matters for
+    a short loop, and specifically what protects against the DecentSampler
+    silent-failure mode the raised MAX_XFADE ceiling could otherwise risk
+    for short loops.
+
+    Splices an exact repeat at the SHORTEST reachable lag (l_min ==
+    xf_score, the minimum loop length find_loop's crossfade-region search
+    will consider), forcing the search to accept a short loop. For that
+    length, length//4 is far smaller than both MAX_XFADE and
+    loop_start//4, so it must be the binding constraint.
+    """
+    from scipy.signal import butter, sosfiltfilt
+
+    n_total = int(6.0 * SR)
+    rng = np.random.default_rng(55)
+    sos = butter(4, [900, 6000], btype="bandpass", fs=SR, output="sos")
+    mono = sosfiltfilt(sos, rng.standard_normal(n_total))
+    mono /= np.max(np.abs(mono)) + 1e-9
+    mono *= 0.5
+
+    start_lo = int(1.0 * SR)
+    xf_score = min(pp.MAX_XFADE, start_lo // 4)
+    l_target = xf_score  # the shortest loop length find_loop will consider
+    idx = start_lo + l_target
+    mono[idx - xf_score:idx] = mono[start_lo - xf_score:start_lo]
+
+    x = make_stereo(mono)
+    kind, _ = pp.classify(x, HOLD)
+    assert kind == "sustaining"
+
+    loop = pp.find_loop(x, SR, HOLD)
+    assert loop is not None
+    length = loop["end"] - loop["start"]
+    assert length == l_target, (
+        "expected the search to accept the shortest reachable loop -- if "
+        "it found something longer instead, this test isn't exercising "
+        "the length//4 branch"
+    )
+    assert loop["crossfade"] == length // 4, (
+        f"expected length//4 ({length // 4}) to be the binding constraint "
+        f"for this short loop, got crossfade={loop['crossfade']}"
+    )
+    assert loop["crossfade"] < start_lo // 4
+    assert loop["crossfade"] < pp.MAX_XFADE
+    # Independent sanity check against the documented bound.
     assert loop["crossfade"] <= min(pp.MAX_XFADE, loop["start"] // 4, length // 4)
 
 
@@ -107,12 +159,20 @@ def test_high_frequency_loop_beyond_old_period_multiple_ceiling():
 
     This builds a textured, high-frequency, NON-tonal signal (bandpass
     noise -- no coherent short-period structure at all, standing in for
-    inharmonic bell-like material) with an exact copy spliced in at
+    inharmonic bell-like material) with an exact copy spliced in around
     L_target=1.9s. A single pure tone can't demonstrate this bug (every
     period multiple of a pure tone is trivially a perfect match, which is
     exactly why the bug passed unnoticed on this file's own 220 Hz test
     signal) -- the point is that old-style short-lag candidates must
     genuinely NOT correlate, only the engineered long lag should.
+
+    The splice spans a wide radius straddling both loop_start and the
+    target end point (not just forward from them), so the copied region
+    covers BOTH what the current find_loop scores (the xf_score-frame
+    window ENDING at each point -- the crossfade region it actually
+    blends) and what the old-algorithm reconstruction below scores (a
+    small window STARTING at each point, as the pre-length-search
+    original code did).
     """
     from scipy.signal import butter, sosfiltfilt
 
@@ -126,9 +186,11 @@ def test_high_frequency_loop_beyond_old_period_multiple_ceiling():
 
     start_lo = int(1.0 * SR)
     l_target = int(1.9 * SR)
-    overlap = 4096  # > REF_WIN, so the engineered repeat is unambiguous
-    mono[start_lo + l_target: start_lo + l_target + overlap] = \
-        mono[start_lo: start_lo + overlap]
+    idx = start_lo + l_target
+    xf_score = min(pp.MAX_XFADE, start_lo // 4)
+    copy_radius = xf_score + 4096  # comfortably covers both window shapes
+    mono[idx - copy_radius: idx + copy_radius] = \
+        mono[start_lo - copy_radius: start_lo + copy_radius]
     x = make_stereo(mono)
 
     kind, ratio = pp.classify(x, HOLD)
@@ -176,86 +238,87 @@ def test_high_frequency_loop_beyond_old_period_multiple_ceiling():
     )
 
 
-def test_stereo_divergent_endpoint_rejected_even_when_mono_cancels():
-    """Regression test for a second, separate bug found in pilot
-    validation: find_loop used to score correlation and minimize endpoint
-    discontinuity on x.mean(axis=1) -- the MONO mix. On stereo-divergent
-    material (stereo-detuned/panned tone pairs, common in JV patches) the
-    L and R endpoint errors can be near-exact opposites that CANCEL in the
-    mono sum, producing a "perfect" 0.0% mono match at a lag whose real
-    per-channel discontinuity is far above the validator's 5%-of-peak
-    threshold -- an audible click the mono-based search couldn't see by
-    construction. Real pilot examples: F#2_v3 (mono 0.0%, per-channel
-    8.0%), C1_v2 (mono 0.1%, per-channel 6.9%). 2,400+ looped zones in the
-    447-patch pilot failed this way.
+def test_stereo_divergent_crossfade_region_rejected_even_when_mono_cancels():
+    """Regression test for a bug found in pilot validation: scoring on
+    x.mean(axis=1) -- the MONO mix -- can hide a real per-channel problem,
+    because L and R divergence can be near-exact opposites that CANCEL in
+    the average. This was originally found (and fixed) for the old
+    single-sample endpoint metric; the coordinator's later listening-test
+    follow-up replaced that metric with crossfade-REGION correlation, so
+    this proves the per-channel principle -- explicitly kept across that
+    rewrite -- still holds for the new metric too: cancellation across an
+    entire crossfade window, not just one sample, must still not fool the
+    real per-channel-aware search.
 
-    This builds a clean stereo-identical sine (lots of genuinely good,
-    per-channel-identical candidates exist naturally), finds where the
-    (already-fixed) length search would otherwise land, then poisons
-    exactly that one endpoint sample with opposite-sign L/R deltas (+8%,
-    -8% of peak) so the mono average at that point is untouched (the
-    errors cancel) while the per-channel discontinuity there is a clear
-    8%. A reconstruction of the mono-based scoring (the actual pre-fix
-    code) is shown to pick exactly that poisoned lag; the real, per-
-    channel-aware find_loop must not.
+    Builds a clean, stereo-identical sine (per-channel-identical
+    candidates exist naturally almost everywhere), finds where the
+    unperturbed search naturally lands, then overwrites the ENTIRE
+    crossfade-region window ending at that exact point with a strong,
+    opposite-signed perturbation on L vs R (so the mono average across
+    that whole window is untouched -- the errors cancel -- while each
+    channel individually diverges sharply from the reference). A
+    reconstruction of mono-mix scoring (same crossfade-region metric,
+    computed on the mono signal instead of per channel) is shown to still
+    pick that exact poisoned lag; the real, per-channel-aware find_loop
+    must not, and whatever it does pick must have a genuinely good
+    per-channel score.
     """
     t = np.arange(int(6.0 * SR)) / SR
     base = 0.5 * np.sin(2 * np.pi * 300.0 * t)
     peak = 0.5
     start_lo = int(1.0 * SR)
+    xf_score = min(pp.MAX_XFADE, start_lo // 4)
 
     # Establish where the (correct) search naturally lands on the clean,
-    # stereo-identical signal, so we know exactly which sample to poison.
+    # stereo-identical signal, so we know exactly which crossfade window
+    # to poison.
     baseline = pp.find_loop(make_stereo(base), SR, HOLD)
     assert baseline is not None
     l_bad = baseline["end"] - baseline["start"]
     idx = start_lo + l_bad
 
-    delta = 0.08 * peak  # 8% of peak -- comfortably above a 5% threshold
+    # A strong (2x peak), opposite-signed perturbation across the WHOLE
+    # crossfade-region window ending at idx: L gets +divergence, R gets
+    # -divergence, so (L+R)/2 over that window is untouched (still
+    # exactly `base`), while each channel individually is dominated by
+    # the divergence rather than the reference tone.
+    rng = np.random.default_rng(3)
+    divergence = rng.standard_normal(xf_score)
+    divergence /= np.max(np.abs(divergence)) + 1e-9
+    divergence *= 2.0 * peak
+
     left = base.copy()
     right = base.copy()
-    left[idx] += delta
-    right[idx] -= delta
+    left[idx - xf_score:idx] += divergence
+    right[idx - xf_score:idx] -= divergence
     x = np.stack([left, right], axis=1)
 
-    # Confirm the engineered signal actually reproduces the cancellation:
-    # mono difference at (start_lo, idx) is ~0, per-channel is ~8%.
-    mono = x.mean(axis=1)
-    mono_dv = abs(mono[start_lo] - mono[idx])
-    per_channel_dv = np.abs(x[start_lo] - x[idx]).max()
-    assert mono_dv < 0.0005 * peak, (
-        f"engineered mono discontinuity {mono_dv} should be ~0 (cancelled)"
-    )
-    assert per_channel_dv > 0.05 * peak, (
-        f"engineered per-channel discontinuity {per_channel_dv} should "
-        "clearly exceed the 5%-of-peak validator threshold"
-    )
+    kind, ratio = pp.classify(x, HOLD)
+    assert kind == "sustaining", f"test signal must classify sustaining (ratio={ratio})"
 
-    # Self-contained proof the OLD mono-based scoring would pick this
-    # exact bad lag: reconstruct it (mono mix, single-channel dv) and
-    # confirm it selects l_bad.
+    # Self-contained proof mono-mix scoring would still pick this exact
+    # bad lag: reconstruct find_loop's crossfade-region metric on the mono
+    # mix instead of per-channel.
     def find_loop_mono_reconstruction(stereo, sr, hold_frames):
         m = stereo.mean(axis=1)
         s_lo = int(1.0 * sr)
         r_hi = min(hold_frames, len(m)) - int(0.05 * sr)
-        region = m[s_lo:r_hi].astype(np.float64)
-        win = min(pp.REF_WIN, len(region) // 2)
-        ref = region[:win]
+        xf = min(pp.MAX_XFADE, s_lo // 4)
+        ext = m[s_lo - xf:r_hi].astype(np.float64)
+        ref = ext[:xf]
         ref_norm = float(np.linalg.norm(ref))
-        numerator = pp.fftconvolve(region, ref[::-1], mode="valid")
-        csq = np.cumsum(np.concatenate(([0.0], region ** 2)))
-        win_energy = csq[win:] - csq[:-win]
+        numerator = pp.fftconvolve(ext, ref[::-1], mode="valid")
+        csq = np.cumsum(np.concatenate(([0.0], ext ** 2)))
+        win_energy = csq[xf:] - csq[:-xf]
         win_norm = np.sqrt(np.maximum(win_energy, 0.0))
         score = numerator / (ref_norm * win_norm + 1e-12)
-        l_min = int(pp.MIN_LOOP_SECONDS * sr)
-        l_max = len(region) - win
+        l_min = max(int(pp.MIN_LOOP_SECONDS * sr), xf)
+        l_max = len(ext) - xf
         lags = np.arange(len(score))
-        mask = (lags >= l_min) & (lags <= l_max) & np.isfinite(score) & (score >= 0.90)
+        mask = (lags >= l_min) & (lags <= l_max) & np.isfinite(score)
         cand_lags, cand_scores = lags[mask], score[mask]
-        dv = np.abs(region[0] - region[cand_lags])
-        best_dv = float(np.min(dv))
-        tol = max(best_dv * 2.0, 0.0005 * float(np.max(np.abs(m))), 1e-9)
-        near = cand_lags[dv <= tol]
+        best = float(np.max(cand_scores))
+        near = cand_lags[cand_scores >= max(best - pp.SCORE_TOL, pp.MIN_CROSSFADE_SCORE)]
         chosen = int(near[np.argmax(near)])
         return s_lo, s_lo + chosen
 
@@ -266,40 +329,36 @@ def test_stereo_divergent_endpoint_rejected_even_when_mono_cancels():
         "else, this test isn't exercising the cancellation case"
     )
 
-    # The actual fix: per-channel scoring/discontinuity must NOT pick
-    # l_bad, and whatever it does pick must have a genuinely small
-    # per-channel discontinuity.
+    # The actual behavior under test: per-channel scoring must NOT pick
+    # l_bad, and whatever it picks must have a genuinely good per-channel
+    # crossfade-region score.
     loop = pp.find_loop(x, SR, HOLD)
     assert loop is not None
     chosen_length = loop["end"] - loop["start"]
     assert chosen_length != l_bad, (
-        "find_loop picked the same poisoned lag the mono-based scoring "
+        "find_loop picked the same poisoned lag the mono-mix scoring "
         "did -- per-channel matching isn't actually being applied"
     )
-    chosen_dv = np.abs(x[loop["start"]] - x[loop["end"]]).max()
-    assert chosen_dv < 0.01 * peak, (
-        f"find_loop's chosen endpoint has a {100*chosen_dv/peak:.2f}%-of-"
-        "peak per-channel discontinuity -- should have found one of the "
-        "many genuinely clean candidates on this otherwise-clean signal"
+    assert loop["score"] > 0.9, (
+        f"find_loop's chosen candidate scored only {loop['score']} -- "
+        "should have found one of the many genuinely clean candidates "
+        "on this otherwise-clean signal"
     )
 
 
 def test_find_loop_declines_when_best_candidate_is_still_bad():
-    """Found in pilot validation while measuring the stereo-divergence fix
-    above: the 0.90 correlation gate is a WINDOWED, aggregate similarity
-    check -- it does not guarantee the boundary sample itself lines up.
-    On some real material (seen on patches like Mighty Pad and Pipe
-    Organ 1), literally every candidate that cleared 0.90 still had a
-    60-70%-of-peak per-channel endpoint jump, because the material is
-    never truly periodic and some lag just happens to clear the
-    aggregate-shape bar anyway. Without an explicit ceiling, find_loop
-    returned that "best of a bad lot" candidate as a loop -- looping
-    fraction went up, but 75/550 looped zones in one measurement still
-    failed the validator's own 5%-of-peak threshold.
+    """The metric changed (crossfade-region correlation instead of a
+    single-sample endpoint delta), and the decision changed too ("prefer
+    to loop" -- see find_loop's docstring), but there's still a floor:
+    when the crossfade region is genuinely uncorrelated everywhere in the
+    reachable range, find_loop must still decline rather than fabricate a
+    loop from nothing.
 
-    A linear chirp (steadily rising frequency) is periodic nowhere, so no
-    lag is ever a genuinely clean repeat, but a nearby-in-time window can
-    still look structurally similar enough to just clear 0.90.
+    A linear chirp (steadily rising frequency) is periodic nowhere. Over
+    the wide (xf_score, ~250ms) window this now scores with, a chirp's
+    instantaneous frequency has drifted enough that even the best
+    achievable crossfade-region correlation is close to zero -- nothing
+    here would blend acceptably at any candidate length.
     """
     t = np.arange(int(6.0 * SR)) / SR
     f0, f1 = 2000.0, 2600.0
@@ -311,109 +370,231 @@ def test_find_loop_declines_when_best_candidate_is_still_bad():
     kind, _ = pp.classify(x, HOLD)
     assert kind == "sustaining"
 
-    # Confirm this signal actually exercises the ceiling and not just the
-    # 0.90 correlation gate: with the ceiling effectively disabled, some
-    # candidate DOES clear 0.90 but with a large endpoint discontinuity.
-    original_ceiling = pp.MAX_ENDPOINT_DV_FRACTION
+    # Confirm this signal actually exercises the floor: with it disabled,
+    # find_loop still returns SOME candidate, but its score is close to
+    # zero -- genuinely uncorrelated, not just "imperfect".
+    original_floor = pp.MIN_CROSSFADE_SCORE
     try:
-        pp.MAX_ENDPOINT_DV_FRACTION = 1.0
+        pp.MIN_CROSSFADE_SCORE = -1.0
         uncapped = pp.find_loop(x, SR, HOLD)
     finally:
-        pp.MAX_ENDPOINT_DV_FRACTION = original_ceiling
+        pp.MIN_CROSSFADE_SCORE = original_floor
 
     assert uncapped is not None, (
-        "expected some candidate to clear the 0.90 correlation gate even "
-        "though none of them are a genuinely clean repeat -- if nothing "
-        "clears the gate at all, this test isn't exercising the ceiling"
+        "expected find_loop to still find *a* best-available candidate "
+        "with the floor disabled -- if nothing is found at all, this "
+        "test isn't exercising the floor specifically"
     )
-    peak = float(np.abs(x).max())
-    uncapped_dv = np.abs(x[uncapped["start"]] - x[uncapped["end"]]).max()
-    assert uncapped_dv > pp.MAX_ENDPOINT_DV_FRACTION * peak, (
-        "the uncapped candidate's discontinuity should clearly exceed "
-        "the ceiling -- otherwise this isn't the 'best of a bad lot' case"
+    assert uncapped["score"] < original_floor, (
+        f"the uncapped candidate's score ({uncapped['score']}) should be "
+        f"clearly below MIN_CROSSFADE_SCORE ({original_floor}) -- "
+        "otherwise this isn't the 'genuinely uncorrelated' case"
     )
 
-    # With the real ceiling active, find_loop must decline rather than
-    # hand back that bad candidate.
+    # With the real floor active, find_loop must decline entirely.
     loop = pp.find_loop(x, SR, HOLD)
     assert loop is None, (
-        "find_loop returned a loop whose only available candidates all "
-        "have a bad endpoint match -- it should decline instead, per the "
-        "design principle that no loop is better than a bad one"
+        "find_loop returned a loop whose only available candidates are "
+        "genuinely uncorrelated -- it should decline instead"
     )
 
 
-def test_prefer_longer_tolerance_never_exceeds_endpoint_ceiling():
-    """Found while measuring the endpoint-ceiling fix above on real pilot
-    data: the "prefer longer among comparable candidates" tiebreak uses a
-    tolerance of `best_dv * 2.0` -- so a best_dv of, say, 3% of peak
-    (which clears MAX_ENDPOINT_DV_FRACTION on its own) gives a tolerance
-    of 6%, letting the tiebreak pick a LONGER candidate at up to 6%,
-    silently exceeding the very ceiling it was just checked against. This
-    is what let 28/503 looped zones in one real-data measurement still
-    exceed the validator's 5% threshold even after the ceiling was added.
+def test_prefer_longer_tolerance_never_drops_below_crossfade_floor():
+    """Analogous to a bug found (and fixed) in the previous, dv-based
+    version of this function: the "prefer longer among comparable
+    candidates" tolerance window (SCORE_TOL below the best score) can
+    itself dip below MIN_CROSSFADE_SCORE even when best_score clears it --
+    e.g. best_score at 0.38 (comfortably above a 0.35 floor) gives an
+    unclamped tolerance floor of 0.38-0.05=0.33, which would let a LONGER
+    candidate at 0.34 (itself below MIN_CROSSFADE_SCORE) through. Found
+    while writing this test, not pilot validation, but it's the exact
+    same shape of bug and needed the exact same fix: clamp the tolerance
+    window to never go below the floor.
 
-    Uses broadband bandpass-noise (near-zero autocorrelation almost
-    everywhere, like the high-frequency regression test above) so only
-    two deliberately spliced-in candidates pass the 0.90 gate at all,
-    giving full control: a SHORTER one at 3% endpoint discontinuity (just
-    under the ceiling) and a LONGER one at 6% (just over it). Without
-    clamping the tolerance window to the ceiling, "prefer longer" picks
-    the 6% one; with the clamp, it must pick the 3% one instead.
+    Two candidates are built by blending a fixed reference texture with
+    independent noise at precisely calibrated ratios (found via binary
+    search) to hit exact target crossfade-region correlations: a SHORT
+    one at ~0.38 (the best score) and a LONGER one at ~0.34 (below the
+    0.35 floor, but within the unclamped 0.05 tolerance of 0.38). Without
+    clamping, "prefer longer" picks the far, sub-floor candidate; with
+    the clamp, it must pick the short, floor-clearing one instead.
     """
     from scipy.signal import butter, sosfiltfilt
 
     n_total = int(6.0 * SR)
-    rng = np.random.default_rng(7)
+    rng = np.random.default_rng(11)
+    sos = butter(4, [900, 6000], btype="bandpass", fs=SR, output="sos")
+    ref_texture = sosfiltfilt(sos, rng.standard_normal(n_total))
+    ref_texture /= np.max(np.abs(ref_texture)) + 1e-9
+    peak = 0.5
+    mono = ref_texture * peak
+
+    start_lo = int(1.0 * SR)
+    xf_score = min(pp.MAX_XFADE, start_lo // 4)
+    ref_win = mono[start_lo - xf_score:start_lo]
+
+    def make_candidate(alpha, seed):
+        r = np.random.default_rng(int(seed))
+        noise = sosfiltfilt(sos, r.standard_normal(xf_score))
+        noise /= np.max(np.abs(noise)) + 1e-9
+        return alpha * ref_win + np.sqrt(max(0.0, 1 - alpha ** 2)) * noise * peak
+
+    def measured_corr(cand):
+        denom = (np.linalg.norm(ref_win) * np.linalg.norm(cand)) + 1e-12
+        return float(np.dot(ref_win, cand) / denom)
+
+    def find_alpha(target, seed, lo=0.0, hi=1.0, iters=40):
+        for _ in range(iters):
+            mid = (lo + hi) / 2
+            if measured_corr(make_candidate(mid, seed)) < target:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2
+
+    # best_score - SCORE_TOL = 0.38 - 0.05 = 0.33, which sits BELOW
+    # MIN_CROSSFADE_SCORE (0.35) -- so unclamped, a candidate scoring
+    # 0.34 (itself below the floor) would still fall inside the
+    # tolerance window.
+    a_short = find_alpha(0.38, seed=101)
+    a_long = find_alpha(0.34, seed=202)
+    l_short = int(1.0 * SR)
+    l_long = int(2.0 * SR)
+    idx_short = start_lo + l_short
+    idx_long = start_lo + l_long
+    mono[idx_short - xf_score:idx_short] = make_candidate(a_short, 101)
+    mono[idx_long - xf_score:idx_long] = make_candidate(a_long, 202)
+
+    x = make_stereo(mono)
+    kind, _ = pp.classify(x, HOLD)
+    assert kind == "sustaining"
+
+    # Self-contained proof of the setup: reconstruct find_loop's
+    # crossfade-region score array (identical computation, exposed here
+    # for direct inspection) and confirm the UNCLAMPED tolerance window
+    # would pick the far, sub-floor candidate.
+    def find_loop_scores(stereo, sr, hold_frames):
+        start = int(1.0 * sr)
+        region_hi = min(hold_frames, len(stereo)) - int(0.05 * sr)
+        xf = min(pp.MAX_XFADE, start // 4)
+        ext = stereo[start - xf:region_hi].astype(np.float64)
+        combined = None
+        for c in range(ext.shape[1]):
+            chan = ext[:, c]
+            ref = chan[:xf]
+            ref_norm = float(np.linalg.norm(ref))
+            numerator = pp.fftconvolve(chan, ref[::-1], mode="valid")
+            csq = np.cumsum(np.concatenate(([0.0], chan ** 2)))
+            we = csq[xf:] - csq[:-xf]
+            wn = np.sqrt(np.maximum(we, 0.0))
+            score = numerator / (ref_norm * wn + 1e-12)
+            combined = score if combined is None else np.minimum(combined, score)
+        l_min = max(int(pp.MIN_LOOP_SECONDS * sr), xf)
+        l_max = len(ext) - xf
+        lags = np.arange(len(combined))
+        mask = (lags >= l_min) & (lags <= l_max) & np.isfinite(combined)
+        return lags[mask], combined[mask]
+
+    cand_lags, cand_scores = find_loop_scores(x, SR, HOLD)
+    best_score = float(np.max(cand_scores))
+    assert best_score - pp.SCORE_TOL < pp.MIN_CROSSFADE_SCORE <= best_score, (
+        "setup check: expected the unclamped tolerance floor to fall "
+        "below MIN_CROSSFADE_SCORE while best_score itself clears it -- "
+        "otherwise this isn't exercising the gap this test targets"
+    )
+    unclamped_near = cand_lags[cand_scores >= (best_score - pp.SCORE_TOL)]
+    unclamped_pick = int(unclamped_near[np.argmax(unclamped_near)])
+    assert unclamped_pick == l_long, (
+        "expected the unclamped tiebreak to pick the far, sub-floor "
+        "candidate -- if it picked something else, this test isn't "
+        "exercising the tolerance-window gap"
+    )
+
+    # With the real (clamped) logic, it must pick the short, genuinely
+    # acceptable candidate instead.
+    loop = pp.find_loop(x, SR, HOLD)
+    assert loop is not None
+    assert loop["end"] - loop["start"] == l_short, (
+        "expected the clamped tiebreak to pick the short candidate "
+        "within the floor, not the longer one that falls below it"
+    )
+    assert loop["score"] >= pp.MIN_CROSSFADE_SCORE
+
+
+def test_metric_prefers_good_crossfade_region_over_good_endpoint_sample():
+    """The whole point of the metric rewrite: a listening test on the real
+    pilot found two candidates with nearly identical raw single-sample
+    endpoint deltas (JP-8 Strings 40.9%, ChuChu Vox 42.0%) that got
+    OPPOSITE verdicts -- JP-8 Strings sounded fine (dense detuned content
+    masks a seam), ChuChu Vox/Whistle pulsed audibly (an exposed tone does
+    not). The single-sample metric can't tell those apart; the crossfade-
+    region metric must.
+
+    Builds two candidates with the SAME large single-sample endpoint
+    delta (~112% of peak -- deliberately much worse than either real
+    example, to make the point starkly): candidate A's crossfade REGION
+    (the xf-frame window before it) is an exact copy of the reference,
+    so DecentSampler's actual blend would sound seamless despite the
+    wild single-sample jump right at the boundary; candidate B's
+    crossfade region is unrelated noise, so the blend would sound
+    obviously wrong, even though its single boundary sample was tuned to
+    match A's delta exactly. find_loop must pick A over B.
+    """
+    n_total = int(6.0 * SR)
+    from scipy.signal import butter, sosfiltfilt
+
+    rng = np.random.default_rng(21)
     sos = butter(4, [900, 6000], btype="bandpass", fs=SR, output="sos")
     base = sosfiltfilt(sos, rng.standard_normal(n_total))
     base /= np.max(np.abs(base)) + 1e-9
     peak = 0.5
-    left = base.copy() * peak
-    right = base.copy() * peak
+    mono = base * peak
 
     start_lo = int(1.0 * SR)
-    overlap = 4096  # > REF_WIN
-    l_near, l_far = int(1.0 * SR), int(1.8 * SR)
-    for l_target, delta_frac in [(l_near, 0.03), (l_far, 0.06)]:
-        idx = start_lo + l_target
-        left[idx:idx + overlap] = base[start_lo:start_lo + overlap] * peak
-        right[idx:idx + overlap] = base[start_lo:start_lo + overlap] * peak
-        delta = delta_frac * peak
-        left[idx] += delta
-        right[idx] -= delta
+    xf_score = min(pp.MAX_XFADE, start_lo // 4)
+    ref_win = mono[start_lo - xf_score:start_lo].copy()
 
-    x = np.stack([left, right], axis=1)
+    # Candidate A ("JP-8 Strings"): crossfade region is an exact copy of
+    # the reference (perfect blend), but the single SAMPLE right at the
+    # loop-end point is a wild outlier -- a single-sample metric would
+    # flag this as terrible.
+    l_good_region = int(1.0 * SR)
+    idx_good = start_lo + l_good_region
+    mono[idx_good - xf_score:idx_good] = ref_win
+    mono[idx_good] = -mono[start_lo] * 5.0
 
-    kind, _ = pp.classify(x, HOLD)
-    assert kind == "sustaining"
+    # Candidate B ("Whistle"/"ChuChu Vox"): crossfade region is unrelated
+    # noise (a bad blend), with its single endpoint SAMPLE tuned to match
+    # candidate A's delta exactly -- so a single-sample metric can't tell
+    # these apart, but a crossfade-region metric clearly can.
+    l_bad_region = int(2.0 * SR)
+    idx_bad = start_lo + l_bad_region
+    unrelated = sosfiltfilt(sos, np.random.default_rng(99).standard_normal(xf_score))
+    unrelated /= np.max(np.abs(unrelated)) + 1e-9
+    mono[idx_bad - xf_score:idx_bad] = unrelated * peak
+    mono[idx_bad] = mono[idx_good]  # same single-sample delta as A
 
-    # Confirm the setup: without the ceiling (and therefore without the
-    # tolerance clamp derived from it), the old "prefer longer" logic
-    # picks the farther, worse (6%) candidate.
-    original_ceiling = pp.MAX_ENDPOINT_DV_FRACTION
-    try:
-        pp.MAX_ENDPOINT_DV_FRACTION = 1.0
-        unclamped = pp.find_loop(x, SR, HOLD)
-    finally:
-        pp.MAX_ENDPOINT_DV_FRACTION = original_ceiling
-    assert unclamped is not None
-    assert unclamped["end"] - unclamped["start"] == l_far, (
-        "expected the unclamped tiebreak to pick the longer, worse "
-        "candidate -- if it picked something else, this test isn't "
-        "exercising the tolerance-window bug"
+    x = make_stereo(mono)
+    kind, ratio = pp.classify(x, HOLD)
+    assert kind == "sustaining", f"test signal must classify sustaining (ratio={ratio})"
+
+    dv_good = abs(mono[start_lo] - mono[idx_good])
+    dv_bad = abs(mono[start_lo] - mono[idx_bad])
+    assert dv_good == dv_bad, "both candidates must share the same single-sample delta"
+    assert dv_good > 0.5 * peak, (
+        "the shared single-sample delta should be dramatically bad -- a "
+        "single-sample metric would have rejected BOTH of these"
     )
 
-    # With the real (clamped) logic, it must pick the shorter, genuinely
-    # acceptable candidate instead.
     loop = pp.find_loop(x, SR, HOLD)
-    assert loop is not None
-    assert loop["end"] - loop["start"] == l_near, (
-        "expected the clamped tiebreak to pick the shorter candidate "
-        "within the ceiling, not the longer one that exceeds it"
+    assert loop is not None, "the good-crossfade-region candidate should still be accepted"
+    chosen_length = loop["end"] - loop["start"]
+    assert chosen_length == l_good_region, (
+        f"expected find_loop to pick the good-crossfade-region candidate "
+        f"({l_good_region}) over the bad one ({l_bad_region}) despite "
+        f"identical single-sample deltas; got length {chosen_length}"
     )
-    chosen_dv = np.abs(x[loop["start"]] - x[loop["end"]]).max()
-    assert chosen_dv <= pp.MAX_ENDPOINT_DV_FRACTION * peak
+    assert loop["score"] > 0.9, "the accepted candidate's crossfade region should score very well"
 
 
 def test_resample_ratio():
