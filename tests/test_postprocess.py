@@ -902,6 +902,47 @@ def test_process_patch_is_idempotent(tmp_path):
         assert (tmp_path / z["file"]).exists()
 
 
+def _decayed_before_noteoff(decay_end_s=2.2, total_s=3.6):
+    """Percussive zone: decays to digital silence well before note-off."""
+    n = int(total_s * SR)
+    x = np.zeros(n)
+    k = int(decay_end_s * SR)
+    t = np.arange(k) / SR
+    x[:k] = np.sin(2 * np.pi * 220 * t) * np.exp(-t * (60 / 20) * np.log(10) / decay_end_s)
+    return make_stereo(x)
+
+
+def test_release_lets_a_sound_that_ended_before_noteoff_play_out():
+    """The old code returned a 0.1 s default here and emit_presets shipped it
+    as a measurement, so DecentSampler faded a 2.2 s decay out in 100 ms on
+    any short note -- percussion sounded cut off."""
+    x = _decayed_before_noteoff()
+    r = pp.measure_release(x, SR, HOLD)
+    assert r > 2.0, f"a decay that ended before note-off must not be truncated (got {r})"
+    assert r <= len(x) / SR + 1e-6, "release should not exceed the sample itself"
+
+
+def test_near_silent_tail_also_counts_as_unmeasurable():
+    """A tail 60 dB under the sample's own peak is a finished decay; measuring
+    its -60 dB crossing just measures the noise floor."""
+    x = _decayed_before_noteoff()
+    rng = np.random.default_rng(0)
+    x[HOLD:] += rng.normal(0, 10 ** (-80 / 20), size=x[HOLD:].shape)
+    assert pp.measure_release(x, SR, HOLD) > 2.0
+
+
+def test_release_is_still_measured_when_there_is_a_real_tail():
+    """A sound still ringing at note-off must get a genuine measurement, not
+    the play-out fallback."""
+    n = int(6.0 * SR)
+    t = np.arange(n) / SR
+    x = np.sin(2 * np.pi * 220 * t)
+    tail = np.arange(n - HOLD) / SR
+    x[HOLD:] *= np.exp(-tail * (60 / 20) * np.log(10) / 0.5)   # ~0.5 s to -60 dB
+    r = pp.measure_release(make_stereo(x), SR, HOLD)
+    assert 0.3 < r < 0.9, f"expected a measured ~0.5 s release, got {r}"
+
+
 def test_silent_zone_is_safe():
     silent = np.zeros(int(6.0 * SR))
     x = make_stereo(silent)

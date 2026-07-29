@@ -352,21 +352,47 @@ def find_loop(x, sr, hold_frames):
 
 
 def measure_release(x, sr, hold_frames):
-    """Seconds for the post-note-off tail to fall 60 dB."""
+    """Seconds for the post-note-off tail to fall 60 dB.
+
+    When there is no measurable tail -- the sound decayed to silence BEFORE
+    note-off, which is the norm for percussive patches held for 3.5 s -- this
+    returns the sample's full duration rather than a short default.
+
+    That distinction matters a lot. The old code returned 0.1 here, and
+    emit_presets shipped it as if it were a measurement, so DecentSampler
+    applied a real 100 ms release: play a short note and a 2.2 s decay is
+    faded out in a tenth of a second. It affected 51% of decaying zones
+    (11507/22469 in the pilot) and was audible as percussion sounding cut
+    off. Returning the full duration is safe precisely BECAUSE the sound
+    self-terminates: an envelope longer than the audio cannot make anything
+    ring on past its own decay, it can only stop truncating it.
+
+    A zone that DOES have audible signal at note-off still gets a genuine
+    measurement below, so sounds with a real release are unaffected.
+    """
     if len(x) == 0:
         return 0.1
+    full_duration = float(len(x) / sr)
     tail = x[hold_frames:]
     if len(tail) < sr // 20:
-        return 0.1
+        return full_duration
     mono = np.abs(tail.mean(axis=1) if tail.ndim > 1 else tail)
     hop = 64
     n = (len(mono) // hop) * hop
     if n == 0:
-        return 0.1
+        return full_duration
     env = mono[:n].reshape(-1, hop).max(axis=1) + 1e-12
     peak = env.max()
     if peak <= 1e-12:
-        return 0.1
+        return full_duration
+    # Not-quite-zero counts as nothing to measure too. A tail sitting 60 dB
+    # under the sample's own peak is a decay that already finished, and
+    # measuring its -60 dB crossing just measures the noise floor -- which
+    # lands on an arbitrarily short release and truncates the sound exactly
+    # as the old 0.1 fallback did.
+    whole = np.abs(x.mean(axis=1) if x.ndim > 1 else x).max()
+    if whole > 0 and peak < whole * 10 ** (-60 / 20):
+        return full_duration
     db = 20 * np.log10(env / peak)
     below = np.where(db < -60)[0]
     if len(below):
