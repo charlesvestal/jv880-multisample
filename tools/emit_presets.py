@@ -420,13 +420,20 @@ def _clamp01(x):
 # measures 35.2 cents on its own. The metric was reading the patch's beating,
 # not the chorus.
 #
-# 0.10 is a judgement call, not a measurement, and is flagged as such:
+# 0.10 was still audibly too much in DecentSampler on MIDI EPiano (which
+# emitted 0.089), so this is now 0.03. The measurement supports going
+# essentially to zero -- the JV adds NO pitch modulation on that patch -- and
+# `mix` still carries the doubling and stereo width that its chorus really
+# does produce. A trace is kept rather than a hard zero only because DS's
+# chorus at modDepth 0 is an untested corner.
+#
+# This remains a judgement call, not a measurement, and is flagged as such:
 # modDepth is dimensionless and undocumented, there is no DecentSampler CLI to
 # render through, and our own chorus model adds only +0.14 cents at 0.31 --
 # so the model cannot be used to calibrate DS's response either. This keeps
 # audible movement while staying far away from vibrato; only listening in
 # DecentSampler can confirm the value.
-CHORUS_MAX_MOD_DEPTH = 0.10
+CHORUS_MAX_MOD_DEPTH = 0.03
 
 
 def amount(raw, ceiling=1.0):
