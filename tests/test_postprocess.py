@@ -176,6 +176,246 @@ def test_high_frequency_loop_beyond_old_period_multiple_ceiling():
     )
 
 
+def test_stereo_divergent_endpoint_rejected_even_when_mono_cancels():
+    """Regression test for a second, separate bug found in pilot
+    validation: find_loop used to score correlation and minimize endpoint
+    discontinuity on x.mean(axis=1) -- the MONO mix. On stereo-divergent
+    material (stereo-detuned/panned tone pairs, common in JV patches) the
+    L and R endpoint errors can be near-exact opposites that CANCEL in the
+    mono sum, producing a "perfect" 0.0% mono match at a lag whose real
+    per-channel discontinuity is far above the validator's 5%-of-peak
+    threshold -- an audible click the mono-based search couldn't see by
+    construction. Real pilot examples: F#2_v3 (mono 0.0%, per-channel
+    8.0%), C1_v2 (mono 0.1%, per-channel 6.9%). 2,400+ looped zones in the
+    447-patch pilot failed this way.
+
+    This builds a clean stereo-identical sine (lots of genuinely good,
+    per-channel-identical candidates exist naturally), finds where the
+    (already-fixed) length search would otherwise land, then poisons
+    exactly that one endpoint sample with opposite-sign L/R deltas (+8%,
+    -8% of peak) so the mono average at that point is untouched (the
+    errors cancel) while the per-channel discontinuity there is a clear
+    8%. A reconstruction of the mono-based scoring (the actual pre-fix
+    code) is shown to pick exactly that poisoned lag; the real, per-
+    channel-aware find_loop must not.
+    """
+    t = np.arange(int(6.0 * SR)) / SR
+    base = 0.5 * np.sin(2 * np.pi * 300.0 * t)
+    peak = 0.5
+    start_lo = int(1.0 * SR)
+
+    # Establish where the (correct) search naturally lands on the clean,
+    # stereo-identical signal, so we know exactly which sample to poison.
+    baseline = pp.find_loop(make_stereo(base), SR, HOLD)
+    assert baseline is not None
+    l_bad = baseline["end"] - baseline["start"]
+    idx = start_lo + l_bad
+
+    delta = 0.08 * peak  # 8% of peak -- comfortably above a 5% threshold
+    left = base.copy()
+    right = base.copy()
+    left[idx] += delta
+    right[idx] -= delta
+    x = np.stack([left, right], axis=1)
+
+    # Confirm the engineered signal actually reproduces the cancellation:
+    # mono difference at (start_lo, idx) is ~0, per-channel is ~8%.
+    mono = x.mean(axis=1)
+    mono_dv = abs(mono[start_lo] - mono[idx])
+    per_channel_dv = np.abs(x[start_lo] - x[idx]).max()
+    assert mono_dv < 0.0005 * peak, (
+        f"engineered mono discontinuity {mono_dv} should be ~0 (cancelled)"
+    )
+    assert per_channel_dv > 0.05 * peak, (
+        f"engineered per-channel discontinuity {per_channel_dv} should "
+        "clearly exceed the 5%-of-peak validator threshold"
+    )
+
+    # Self-contained proof the OLD mono-based scoring would pick this
+    # exact bad lag: reconstruct it (mono mix, single-channel dv) and
+    # confirm it selects l_bad.
+    def find_loop_mono_reconstruction(stereo, sr, hold_frames):
+        m = stereo.mean(axis=1)
+        s_lo = int(1.0 * sr)
+        r_hi = min(hold_frames, len(m)) - int(0.05 * sr)
+        region = m[s_lo:r_hi].astype(np.float64)
+        win = min(pp.REF_WIN, len(region) // 2)
+        ref = region[:win]
+        ref_norm = float(np.linalg.norm(ref))
+        numerator = pp.fftconvolve(region, ref[::-1], mode="valid")
+        csq = np.cumsum(np.concatenate(([0.0], region ** 2)))
+        win_energy = csq[win:] - csq[:-win]
+        win_norm = np.sqrt(np.maximum(win_energy, 0.0))
+        score = numerator / (ref_norm * win_norm + 1e-12)
+        l_min = int(pp.MIN_LOOP_SECONDS * sr)
+        l_max = len(region) - win
+        lags = np.arange(len(score))
+        mask = (lags >= l_min) & (lags <= l_max) & np.isfinite(score) & (score >= 0.90)
+        cand_lags, cand_scores = lags[mask], score[mask]
+        dv = np.abs(region[0] - region[cand_lags])
+        best_dv = float(np.min(dv))
+        tol = max(best_dv * 2.0, 0.0005 * float(np.max(np.abs(m))), 1e-9)
+        near = cand_lags[dv <= tol]
+        chosen = int(near[np.argmax(near)])
+        return s_lo, s_lo + chosen
+
+    mono_start, mono_end = find_loop_mono_reconstruction(x, SR, HOLD)
+    assert mono_end - mono_start == l_bad, (
+        "expected the mono-mix reconstruction to pick the poisoned lag "
+        "(that's the bug being reproduced) -- if it picked something "
+        "else, this test isn't exercising the cancellation case"
+    )
+
+    # The actual fix: per-channel scoring/discontinuity must NOT pick
+    # l_bad, and whatever it does pick must have a genuinely small
+    # per-channel discontinuity.
+    loop = pp.find_loop(x, SR, HOLD)
+    assert loop is not None
+    chosen_length = loop["end"] - loop["start"]
+    assert chosen_length != l_bad, (
+        "find_loop picked the same poisoned lag the mono-based scoring "
+        "did -- per-channel matching isn't actually being applied"
+    )
+    chosen_dv = np.abs(x[loop["start"]] - x[loop["end"]]).max()
+    assert chosen_dv < 0.01 * peak, (
+        f"find_loop's chosen endpoint has a {100*chosen_dv/peak:.2f}%-of-"
+        "peak per-channel discontinuity -- should have found one of the "
+        "many genuinely clean candidates on this otherwise-clean signal"
+    )
+
+
+def test_find_loop_declines_when_best_candidate_is_still_bad():
+    """Found in pilot validation while measuring the stereo-divergence fix
+    above: the 0.90 correlation gate is a WINDOWED, aggregate similarity
+    check -- it does not guarantee the boundary sample itself lines up.
+    On some real material (seen on patches like Mighty Pad and Pipe
+    Organ 1), literally every candidate that cleared 0.90 still had a
+    60-70%-of-peak per-channel endpoint jump, because the material is
+    never truly periodic and some lag just happens to clear the
+    aggregate-shape bar anyway. Without an explicit ceiling, find_loop
+    returned that "best of a bad lot" candidate as a loop -- looping
+    fraction went up, but 75/550 looped zones in one measurement still
+    failed the validator's own 5%-of-peak threshold.
+
+    A linear chirp (steadily rising frequency) is periodic nowhere, so no
+    lag is ever a genuinely clean repeat, but a nearby-in-time window can
+    still look structurally similar enough to just clear 0.90.
+    """
+    t = np.arange(int(6.0 * SR)) / SR
+    f0, f1 = 2000.0, 2600.0
+    k = (f1 - f0) / t[-1]
+    phase = 2 * np.pi * (f0 * t + 0.5 * k * t ** 2)
+    mono = 0.4 * np.sin(phase)
+    x = make_stereo(mono)
+
+    kind, _ = pp.classify(x, HOLD)
+    assert kind == "sustaining"
+
+    # Confirm this signal actually exercises the ceiling and not just the
+    # 0.90 correlation gate: with the ceiling effectively disabled, some
+    # candidate DOES clear 0.90 but with a large endpoint discontinuity.
+    original_ceiling = pp.MAX_ENDPOINT_DV_FRACTION
+    try:
+        pp.MAX_ENDPOINT_DV_FRACTION = 1.0
+        uncapped = pp.find_loop(x, SR, HOLD)
+    finally:
+        pp.MAX_ENDPOINT_DV_FRACTION = original_ceiling
+
+    assert uncapped is not None, (
+        "expected some candidate to clear the 0.90 correlation gate even "
+        "though none of them are a genuinely clean repeat -- if nothing "
+        "clears the gate at all, this test isn't exercising the ceiling"
+    )
+    peak = float(np.abs(x).max())
+    uncapped_dv = np.abs(x[uncapped["start"]] - x[uncapped["end"]]).max()
+    assert uncapped_dv > pp.MAX_ENDPOINT_DV_FRACTION * peak, (
+        "the uncapped candidate's discontinuity should clearly exceed "
+        "the ceiling -- otherwise this isn't the 'best of a bad lot' case"
+    )
+
+    # With the real ceiling active, find_loop must decline rather than
+    # hand back that bad candidate.
+    loop = pp.find_loop(x, SR, HOLD)
+    assert loop is None, (
+        "find_loop returned a loop whose only available candidates all "
+        "have a bad endpoint match -- it should decline instead, per the "
+        "design principle that no loop is better than a bad one"
+    )
+
+
+def test_prefer_longer_tolerance_never_exceeds_endpoint_ceiling():
+    """Found while measuring the endpoint-ceiling fix above on real pilot
+    data: the "prefer longer among comparable candidates" tiebreak uses a
+    tolerance of `best_dv * 2.0` -- so a best_dv of, say, 3% of peak
+    (which clears MAX_ENDPOINT_DV_FRACTION on its own) gives a tolerance
+    of 6%, letting the tiebreak pick a LONGER candidate at up to 6%,
+    silently exceeding the very ceiling it was just checked against. This
+    is what let 28/503 looped zones in one real-data measurement still
+    exceed the validator's 5% threshold even after the ceiling was added.
+
+    Uses broadband bandpass-noise (near-zero autocorrelation almost
+    everywhere, like the high-frequency regression test above) so only
+    two deliberately spliced-in candidates pass the 0.90 gate at all,
+    giving full control: a SHORTER one at 3% endpoint discontinuity (just
+    under the ceiling) and a LONGER one at 6% (just over it). Without
+    clamping the tolerance window to the ceiling, "prefer longer" picks
+    the 6% one; with the clamp, it must pick the 3% one instead.
+    """
+    from scipy.signal import butter, sosfiltfilt
+
+    n_total = int(6.0 * SR)
+    rng = np.random.default_rng(7)
+    sos = butter(4, [900, 6000], btype="bandpass", fs=SR, output="sos")
+    base = sosfiltfilt(sos, rng.standard_normal(n_total))
+    base /= np.max(np.abs(base)) + 1e-9
+    peak = 0.5
+    left = base.copy() * peak
+    right = base.copy() * peak
+
+    start_lo = int(1.0 * SR)
+    overlap = 4096  # > REF_WIN
+    l_near, l_far = int(1.0 * SR), int(1.8 * SR)
+    for l_target, delta_frac in [(l_near, 0.03), (l_far, 0.06)]:
+        idx = start_lo + l_target
+        left[idx:idx + overlap] = base[start_lo:start_lo + overlap] * peak
+        right[idx:idx + overlap] = base[start_lo:start_lo + overlap] * peak
+        delta = delta_frac * peak
+        left[idx] += delta
+        right[idx] -= delta
+
+    x = np.stack([left, right], axis=1)
+
+    kind, _ = pp.classify(x, HOLD)
+    assert kind == "sustaining"
+
+    # Confirm the setup: without the ceiling (and therefore without the
+    # tolerance clamp derived from it), the old "prefer longer" logic
+    # picks the farther, worse (6%) candidate.
+    original_ceiling = pp.MAX_ENDPOINT_DV_FRACTION
+    try:
+        pp.MAX_ENDPOINT_DV_FRACTION = 1.0
+        unclamped = pp.find_loop(x, SR, HOLD)
+    finally:
+        pp.MAX_ENDPOINT_DV_FRACTION = original_ceiling
+    assert unclamped is not None
+    assert unclamped["end"] - unclamped["start"] == l_far, (
+        "expected the unclamped tiebreak to pick the longer, worse "
+        "candidate -- if it picked something else, this test isn't "
+        "exercising the tolerance-window bug"
+    )
+
+    # With the real (clamped) logic, it must pick the shorter, genuinely
+    # acceptable candidate instead.
+    loop = pp.find_loop(x, SR, HOLD)
+    assert loop is not None
+    assert loop["end"] - loop["start"] == l_near, (
+        "expected the clamped tiebreak to pick the shorter candidate "
+        "within the ceiling, not the longer one that exceeds it"
+    )
+    chosen_dv = np.abs(x[loop["start"]] - x[loop["end"]]).max()
+    assert chosen_dv <= pp.MAX_ENDPOINT_DV_FRACTION * peak
+
+
 def test_resample_ratio():
     x = np.zeros((pp.SR_IN, 2))
     y = pp.resample_to_48k(x)
