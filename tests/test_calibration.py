@@ -706,3 +706,69 @@ def _measure_rt60_for_test(mono, sr, hold_seconds=0.1):
     if slope >= -0.01:
         return None
     return float(-60.0 / slope)
+
+
+# --- IR conditioning: level and pre-delay ------------------------------------
+# Both of these shipped wrong and were caught by ear rather than by test.
+
+def _ir_capture():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "ir_capture", Path(__file__).resolve().parent.parent / "tools" / "ir_capture.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_strip_leading_silence_removes_only_exact_zeros():
+    ic = _ir_capture()
+    x = np.zeros((1000, 2))
+    x[400:] = 0.5
+    assert len(ic.strip_leading_silence(x)) == 600
+
+    # A genuine diffuse buildup is quiet but never exactly zero, and must
+    # survive intact -- clipping the front off a real response would be worse
+    # than the artifact this removes.
+    y = np.zeros((1000, 2))
+    y[100:400] = 1e-7
+    y[400:] = 0.5
+    assert len(ic.strip_leading_silence(y)) == 900
+
+
+def test_normalize_ir_makes_convolution_gain_neutral():
+    """The shipped bank was 9-14 dB down, putting the wet 21.8 dB under the
+    dry on A.Piano 1 -- reported as inaudible reverb."""
+    ic = _ir_capture()
+    from scipy.signal import fftconvolve
+    ref = ic._pink_reference()
+    rng = np.random.default_rng(7)
+    for scale, length in ((1e-3, 4000), (0.5, 40000)):
+        ir = (rng.normal(size=(length, 2)) * np.exp(-np.linspace(0, 8, length))[:, None]) * scale
+        out = ic.normalize_ir(ir, ref)
+        # Mean across channels, not one channel: normalising L and R
+        # independently would flatten the IR's stereo image, so the function
+        # scales both by a single factor and only their average is unity.
+        ref_rms = np.sqrt(np.mean(ref ** 2))
+        gain = np.mean([np.sqrt(np.mean(fftconvolve(ref, out[:, c])[:len(ref)] ** 2)) / ref_rms
+                        for c in range(out.shape[1])])
+        assert 0.7 < gain < 1.4, f"expected gain-neutral, got {20*np.log10(gain):+.1f} dB"
+        assert np.abs(out).max() < 1.0, "must never ship a clipped IR"
+
+
+def test_shipped_ir_bank_has_no_pre_delay_or_dead_level():
+    """Guards the two defects together on the real bank: the JV's reverb
+    starts within a few ms of the note, and a preset's mix must not be
+    fighting an IR that is 10 dB down."""
+    import soundfile as sf
+    bank = sorted((Path(__file__).resolve().parent.parent / "calib" / "ir_synth").glob("*.wav"))
+    assert bank, "no IR bank on disk"
+    checked = 0
+    for f in bank:
+        x, sr = sf.read(str(f), always_2d=True)
+        m = np.abs(x).mean(axis=1)
+        if not m.any():
+            continue        # reverbtime 0 underflows to silence; see emit_presets
+        checked += 1
+        assert m[0] != 0.0 or np.nonzero(m)[0][0] / sr * 1000 < 1.0, \
+            f"{f.name}: leading silence is injection latency, not JV pre-delay"
+    assert checked >= 40, f"expected a full bank, only checked {checked}"

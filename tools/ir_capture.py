@@ -189,6 +189,22 @@ def smoothed_db_envelope(mono, hop=64, smooth=5):
     return env, db
 
 
+def strip_leading_silence(x):
+    """Drop leading samples that are EXACTLY zero.
+
+    Exact zero, not a threshold: the gap this removes is literal digital
+    silence (0 non-zero samples in the first 15 ms of Room1), whereas a
+    diffuse reverb's genuine early buildup is quiet but never exactly zero.
+    Testing for zero therefore removes the capture artifact without ever
+    clipping the front off a real response.
+    """
+    if x.ndim > 1:
+        nz = np.nonzero(np.abs(x).sum(axis=1))[0]
+    else:
+        nz = np.nonzero(x)[0]
+    return x[nz[0]:] if len(nz) else x
+
+
 def _pink_reference(n=1 << 17, seed=20260729):
     """Deterministic pink-noise probe used to normalise IR gain.
 
@@ -438,11 +454,19 @@ def cmd_capture(wave_inject, roms, tmp, out_dir, args, excitation_latency):
             assert sr == SR
             # Strip the fixed excitation latency (see cmd_proof) so sample 0
             # of the shipped IR is "the excitation just arrived", not "the
-            # excitation is still 130-260 samples from arriving" -- the
-            # remaining leading silence (if any) after this strip IS the
-            # reverb algorithm's own genuine, type-dependent pre-delay and
-            # is deliberately left alone.
+            # excitation is still 130-260 samples from arriving".
             x = x[excitation_latency:]
+            # Then strip whatever leading silence REMAINS. An earlier version
+            # kept it, on the theory that it was the reverb algorithm's own
+            # type-dependent pre-delay. It is not. Measured against the plugin
+            # -- reverb-only residual after least-squares removal of the dry,
+            # so a dry-level difference between the two renders cannot fake an
+            # instant arrival -- the JV's reverb starts within -0.3..+3.6 ms of
+            # the note, while the captured IRs carried gaps of 1.1 ms (Hall1)
+            # to 17.3 ms (Stage2). So the gap is latency in the injection path,
+            # not the algorithm, and it was audible as the reverb arriving late
+            # and sounding detached from the note.
+            x = strip_leading_silence(x)
             mono = x.mean(axis=1)
             rt60 = measure_rt60(mono, tail_start=0, sr=SR)
             trimmed = trim_and_fade(x, SR)
