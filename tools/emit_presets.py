@@ -46,6 +46,7 @@ have `file` pointing at a real FLAC on disk. This module never emits a
 """
 import argparse
 import json
+import shutil
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -129,26 +130,40 @@ DELAY_TIME_MAX_S = 1.0
 # measured arrival time); plain Delay (type 6) measured as genuinely
 # centred/mono, every repeat landing at ~50/50 L/R to within noise. That
 # measurement is WHETHER stereoOffset should be nonzero at all, and is
-# recorded per-type in calibration.json's "delay_pan_alternation".
+# recorded per-type in calibration.json's "delay_pan_alternation" -- with a
+# clean injected impulse (vs. the old note-based cross-correlation), this
+# reads even more starkly than before: type 6 measures 0.0 (perfectly
+# centred, up from 0.0225) and type 7 measures 1.0 (FULLY hard-alternating,
+# up from 0.6582) -- confirming DS's stereoOffset, a mere TIME offset
+# between channels, structurally cannot reproduce what Pan-Dly actually
+# does (a hard amplitude pan swing per repeat, not a phase/time shift).
 #
-# The stereoOffset MAGNITUDE below is not, and cannot be, derived the same
-# way: DecentSampler's stereoOffset is a TIME offset in seconds between the
-# L and R channels' own delay taps ("half of this amount is subtracted
-# from the left channel's delay time and half is added to the right" --
-# official developer guide's appendix on the delay effect), not an
-# amplitude pan -- there is no DS parameter that reproduces a hard
-# alternating L/R gain swing at all. PAN_DLY_STEREO_OFFSET_FRAC is
-# therefore a documented, REASONED proportion of the genuinely measured
-# delayTime (not a measurement), in the same spirit as the developer
-# guide's own worked example (stereoOffset=0.01-0.02s against a 0.5s
-# delayTime, a 2-4% stereo widening) -- picked somewhat more generous here
-# since the real hardware's channel alternation is much stronger than a
-# subtle Haas widening, while PAN_DLY_STEREO_OFFSET_MAX_S caps it well
-# below any plausible delayTime so it can never invert which channel
-# leads, which is what made the old fixed stereoOffset=3.0 nonsensical
-# against a ~1s (or, now, ~0.25-0.5s) delayTime.
+# The stereoOffset MAGNITUDE below used to be a reasoned proportion of
+# delayTime (PAN_DLY_STEREO_OFFSET_FRAC), analogised from the official
+# developer guide's own generic worked example -- never measured. It is now
+# MEASURED: for several real Pan-Dly patches, tools/ir_capture.py's
+# find_stereo_offset() renders the real hardware's own wet output, computes
+# its stereo width (RMS(L-R)/RMS(L+R) over the decay region -- the same
+# metric validated for chorus depth), then simulates DecentSampler's own
+# delay effect (independent L/R taps at delayTime -/+ stereoOffset/2, per
+# the developer guide's own formula) at a sweep of candidate stereoOffset
+# values and picks whichever makes the SIMULATED width closest to the real
+# one. Six Pan-Dly patches measured stereoOffset in the 0.015-0.1s range
+# (median 0.035s, written to calibration.json's "pan_dly_stereo_offset_s")
+# -- close to, but a bit more generous than, the old guessed 0.15x-of-
+# delayTime/cap-0.05s formula happened to land for a mid-range delayTime.
+# PAN_DLY_STEREO_OFFSET_FRAC/MAX_S remain as the fallback for when no
+# measured value is available (e.g. the synthetic test fixture).
 PAN_DLY_STEREO_OFFSET_FRAC = 0.15
 PAN_DLY_STEREO_OFFSET_MAX_S = 0.05
+# However large the measured (or fallback) value, it must never approach
+# the patch's own delayTime: DS subtracts half of it from the LEFT tap's
+# time, and a value at or beyond delayTime would zero out or invert which
+# channel leads -- exactly what made the very first, un-measured
+# stereoOffset=3.0 (three seconds) nonsensical. Capping at half of
+# delayTime keeps the left tap's own delay always positive and sane
+# regardless of how short a given patch's delayTime is.
+PAN_DLY_STEREO_OFFSET_MAX_FRAC_OF_DELAY = 0.5
 
 # DecentSampler only supports these three LFO shapes; TRI has no exact
 # match and is approximated by sine (see design doc's capability table).
@@ -337,38 +352,81 @@ def _clamp01(x):
 # amount: a 0-127 level maps proportionally onto a 0-1 level. Measuring it
 # added noise to a quantity whose mapping is known by construction.
 #
-# CHORUS_MAX_MOD_DEPTH is a deliberate, uncalibrated ceiling: DecentSampler's
+# CHORUS_MAX_MOD_DEPTH is a deliberate, uncalibrated CEILING: DecentSampler's
 # chorus modDepth defaults to 0.2, and the JV's chorus is a gentle stereo
 # thickener rather than a vibrato, so full JV depth maps to a moderate value.
+# This number itself still cannot be derived from a physical measurement --
+# DecentSampler's modDepth is explicitly documented as dimensionless ("0 is
+# no modulation, 1.0 is max modulation"), so there is no unit conversion from
+# a measured JV excursion to it. What CAN be (and, per the second
+# investigation below, now has been) measured is the CURVE's SHAPE --
+# whether depth is monotonic and how its effect actually scales across
+# 0-127 -- which now multiplies this ceiling via chorus_depth_norm below
+# instead of a flat proportional (raw/127) assumption.
 #
-# Re-investigated (2026-07-29) using PURE-WET isolation -- drylevel=0,
-# chorussendlevel=127, all other tones muted, sweeping chorusdepth alone --
-# specifically to rule out the ORIGINAL failure's cause (dry/multi-tone
-# contamination). Four independent measurement attempts were tried on that
-# isolated signal: (1) RMS envelope excursion (the original metric, now
-# free of dry contamination), (2) autocorrelation-based pitch tracking,
-# (3) Hilbert-transform instantaneous frequency, (4) (3) plus robust
-# MAD-based outlier rejection to reject the comb-filter-null artifacts (3)
-# is prone to. ALL FOUR produced the same non-monotonic shape (rising then
-# falling across the sweep, peaking mid-range) or, for the pitch-tracking
-# attempts specifically, additional gross octave-lock errors at higher
-# depth settings -- not the monotonic "zero depth -> zero modulation" shape
-# a real chorus-depth control should have. Isolating the signal ruled out
-# the ORIGINAL contamination theory but did not produce a clean
-# measurement; a plausible remaining cause is this base patch's own
-# baked-in chorusfeedback=100/127 (see tools/calibrate.cpp's neighbouring
-# note on the SAME patch's chorusfeedback -- zeroing it was already shown
-# elsewhere to make an unrelated measurement categorically worse, so it
-# isn't a free fix here either). Per the task's own rule ("if a quantity
-# doesn't measure cleanly, say so and fall back to a documented
-# proportional mapping rather than shipping a noisy table"), this stays
-# proportional.
+# --- History: two failed measurement attempts, then a working one --------
+#
+# Attempt 1 (original): a musical note excitation, RMS envelope excursion.
+# Produced raw 0 -> MAXIMUM depth (inverted, ~flat at 0.7) -- shipped once
+# and made every preset in the library audibly warble.
+#
+# Attempt 2 (2026-07-29, pure-wet isolation): drylevel=0, chorussendlevel=127,
+# all other tones muted, sweeping chorusdepth alone on a MUSICAL NOTE carrier
+# -- ruling out the original failure's dry/multi-tone contamination theory.
+# Four independent methods on that isolated signal: (1) RMS envelope
+# excursion, (2) autocorrelation-based pitch tracking, (3) Hilbert-transform
+# instantaneous frequency, (4) (3) plus MAD-based outlier rejection. ALL FOUR
+# produced the same non-monotonic shape (rising then falling, peaking
+# mid-range) or gross octave-lock errors -- isolating the signal ruled out
+# contamination but did not produce a clean measurement.
+#
+# Attempt 3 (2026-07-29, injected impulse tool): with tools/wave_inject.cpp's
+# clean synthetic excitation available, a THIRD attempt tried the task's own
+# suggested method -- cross-correlate short windows of a pure-wet chorus
+# render against its own dry reference sine to track the delay line's
+# instantaneous lag. This ALSO failed cleanly: the recovered lag curve is
+# dominated by an unexplained slow drift (tens-hundreds of samples/second)
+# that swamps any real periodic signal; fitting a sinusoid at the KNOWN
+# chorus rate to the detrended curve gives a flat, near-zero "amplitude" at
+# EVERY depth setting including 0 and 127 -- no signal, not just noisy.
+#
+# Attempt 4 (2026-07-29, injected sine, ENERGY-domain metric) -- the one that
+# worked: this chorus is a STEREO effect (independently modulated L/R delay
+# lines), so instead of tracking phase/lag directly, measure how much a
+# pure-wet chorused sine's L and R channels DECORRELATE: RMS(L-R)/RMS(L+R).
+# This has no periodicity-aliasing failure mode (it's a plain energy ratio,
+# not a cross-correlation), and it is cleanly, strongly MONOTONIC in raw
+# chorusdepth -- and reproduces almost identically (0.999 shape-correlation)
+# across two unrelated carrier frequencies (50Hz, 200Hz), strong evidence
+# it's measuring something real rather than one tone's own artifact. See
+# tools/ir_capture.py's cmd_chorus_depth for the full method. The resulting
+# calibration.json "chorus_depth_norm" table is what CHORUS_MAX_MOD_DEPTH now
+# scales (see build_effects below) instead of a flat proportional guess.
 CHORUS_MAX_MOD_DEPTH = 0.35
 
 
 def amount(raw, ceiling=1.0):
     """Map a JV 0-127 amount onto a 0-1 amount, proportionally."""
     return _clamp01(max(0.0, min(127, float(raw))) / 127.0 * ceiling)
+
+
+def _chorus_mod_depth(cal, raw_depth):
+    """DecentSampler modDepth for a given raw chorusdepth (0-127): the
+    MEASURED chorus_depth_norm curve (see this module's CHORUS_MAX_MOD_DEPTH
+    comment for how it was measured -- stereo decorrelation of a pure-wet
+    chorused sine, cleanly monotonic, cross-validated at two carrier
+    frequencies) scaled by the CHORUS_MAX_MOD_DEPTH ceiling. Falls back to
+    the old flat proportional mapping only when no measured table is
+    available (e.g. tests/test_emit_presets.py's synthetic CAL fixture,
+    which predates this table) -- consistent with every other
+    calibration-table lookup in this module."""
+    table = cal.get("chorus_depth_norm")
+    if table:
+        try:
+            return _clamp01(interp_table(table, raw_depth) * CHORUS_MAX_MOD_DEPTH)
+        except ValueError:
+            pass
+    return amount(raw_depth, CHORUS_MAX_MOD_DEPTH)
 
 
 def _delay_time_s(cal, rtype, raw_time):
@@ -404,12 +462,21 @@ def _delay_feedback(cal, rtype, raw_feedback):
     return amount(raw_feedback)
 
 
-def _pan_dly_stereo_offset(delay_time_s):
+def _pan_dly_stereo_offset(cal, delay_time_s):
     """DS stereoOffset for a Pan-Dly patch with the given (measured)
-    delayTime -- see this module's PAN_DLY_STEREO_OFFSET_FRAC comment for
-    why this is a documented, reasoned proportion, not a measurement."""
-    return round(min(PAN_DLY_STEREO_OFFSET_MAX_S,
-                      PAN_DLY_STEREO_OFFSET_FRAC * delay_time_s), 4)
+    delayTime. Prefers calibration.json's "pan_dly_stereo_offset_s" -- a
+    value MEASURED by tools/ir_capture.py's find_stereo_offset() (see this
+    module's comment above PAN_DLY_STEREO_OFFSET_FRAC) -- falling back to
+    the old reasoned proportion only when no measurement is available
+    (e.g. tests/test_emit_presets.py's synthetic CAL fixture, which
+    predates this measurement). Either way, capped at half of THIS patch's
+    own delayTime so a short delayTime can never be inverted."""
+    measured = cal.get("pan_dly_stereo_offset_s")
+    if measured is not None:
+        base = measured
+    else:
+        base = min(PAN_DLY_STEREO_OFFSET_MAX_S, PAN_DLY_STEREO_OFFSET_FRAC * delay_time_s)
+    return round(min(base, PAN_DLY_STEREO_OFFSET_MAX_FRAC_OF_DELAY * delay_time_s), 4)
 
 
 # --- Send-vs-mix ceiling ----------------------------------------------------
@@ -431,21 +498,39 @@ EFFECT_MAX_MIX = 0.5
 
 
 def _nearest_ir(cal, rtype, raw_time):
-    """Path of the captured IR whose time step is nearest `raw_time`.
+    """Return `(irFile, wet_ok)` for the IR whose time step is nearest `raw_time`.
 
     The IR bank samples `reverbtime` at step 16 (9 steps per type). RT60
     varies smoothly across the full 0-127 range -- adjacent raw values differ
     by well under 1% -- so snapping to the nearest captured step costs at most
-    a few percent of decay time, far below audibility. Returns None if no IR
-    was captured for this reverb type, so the caller can fall back rather than
-    emit a preset referencing a file that does not exist.
+    a few percent of decay time, far below audibility. Returns (None, False)
+    if no IR was captured for this reverb type, so the caller can fall back
+    rather than emit a preset referencing a file that does not exist.
+
+    `wet_ok` is False when the nearest step is a genuinely SILENT capture. At
+    reverbtime 0 the JV emits no wet signal at all and the capture faithfully
+    records digital silence -- but "convolve against silence" is not the same
+    as "no reverb". DecentSampler's convolution `mix` is a BLEND, so any mix
+    above 0 against a silent IR attenuates the dry signal while adding
+    nothing (House Hunter: reverb level 127 at time 0 -> mix 0.32 -> -3.4 dB
+    of dry for zero benefit). So a silent step reports wet_ok=False and
+    irFile points at the nearest AUDIBLE step instead, leaving the effect
+    usable if a player raises the reverb knob.
     """
     bank = cal.get("reverb_ir", {}).get(str(rtype))
     if not bank:
-        return None
-    steps = sorted(int(k) for k in bank)
+        return None, False
+    steps = sorted(int(k) for k in bank if bank[k])
+    if not steps:
+        return None, False
+    silent = {int(s) for s in (cal.get("reverb_ir_silent", {}).get(str(rtype)) or [])}
     nearest = min(steps, key=lambda k: abs(k - int(raw_time)))
-    return bank[str(nearest)]
+    if nearest not in silent:
+        return bank[str(nearest)], True
+    audible = [k for k in steps if k not in silent]
+    if not audible:
+        return None, False
+    return bank[str(min(audible, key=lambda k: abs(k - int(raw_time))))], False
 
 
 def zone_vel_range(zones):
@@ -493,7 +578,7 @@ def build_effects(meta, cal):
         reverb_effect = ("delay", {
             "delayTime": round(delay_time, 4),
             "feedback": round(_delay_feedback(cal, rtype, rv["feedback"]), 4),
-            "stereoOffset": _pan_dly_stereo_offset(delay_time) if rtype == 7 else 0.0,
+            "stereoOffset": _pan_dly_stereo_offset(cal, delay_time) if rtype == 7 else 0.0,
             "wetLevel": round(wet, 4),
         })
     else:
@@ -501,10 +586,12 @@ def build_effects(meta, cal):
         # IRs captured by injecting a synthetic impulse directly into the
         # wave ROM (see tools/wave_inject.cpp): excitation flatness 0.949 vs
         # 0.552 for the best musical note, so no deconvolution is needed and
-        # the IR carries no source resonance. Validated across 5 reverb types
-        # against reverb-only ground truth: mean decay correlation 0.9154 vs
-        # 0.8990 for the note-based bank, with IRs 3-5x shorter.
-        ir = _nearest_ir(cal, rtype, rv["time"])
+        # the IR carries no source resonance. Validated across all 6 reverb
+        # types against reverb-only ground truth, 5-8 patches per type (a
+        # single representative patch is misleading -- A.Piano 1 alone scores
+        # 0.997 for Hall1 against a type mean of 0.85): mean decay-envelope
+        # correlation 0.8664.
+        ir, wet_ok = _nearest_ir(cal, rtype, rv["time"])
         if ir is not None:
             # Convolution with an IR captured from the emulator itself, rather
             # than an approximation via roomSize/damping. The IRs are rendered
@@ -519,7 +606,7 @@ def build_effects(meta, cal):
             # 127 with full sends) emit mix=1.0 and lose their direct sound.
             reverb_effect = ("convolution", {
                 "irFile": ir,
-                "mix": round(_clamp01(wet * EFFECT_MAX_MIX), 4),
+                "mix": round(_clamp01(wet * EFFECT_MAX_MIX), 4) if wet_ok else 0.0,
             })
         else:
             # No IR captured for this type (should not happen for 0-5, but a
@@ -534,7 +621,7 @@ def build_effects(meta, cal):
             })
 
     mod_rate = min(LFO_RATE_HZ_MAX, max(0.0, interp_table(cal["chorus_rate_hz"], ch["rate"])))
-    mod_depth = amount(ch["depth"], CHORUS_MAX_MOD_DEPTH)
+    mod_depth = _chorus_mod_depth(cal, ch["depth"])
     mix = _clamp01(amount(ch["level"]) * chorus_send_norm * EFFECT_MAX_MIX)
     chorus_effect = ("chorus", {
         "mix": round(mix, 4),
@@ -812,6 +899,36 @@ def _check_zone_files_exist(meta, patch_dir):
     return meta
 
 
+def _stage_referenced_irs(out_root, calib_root):
+    """Copy every IR a just-emitted preset references into the library.
+
+    `irFile` is written relative to the preset, so the WAVs have to physically
+    live inside the library folder or DecentSampler silently renders no reverb
+    at all -- indistinguishable from "the reverb is too quiet", and reported as
+    exactly that once already. This used to be a manual copy step, which meant
+    the library was correct only if someone remembered; re-pointing the bank
+    (calib/ir -> calib/ir_synth) left every preset referencing a directory that
+    did not exist. Staging here makes the emitted library self-contained by
+    construction. Returns the number of files copied.
+    """
+    wanted = set()
+    for preset in out_root.glob("*.dspreset"):
+        for eff in ET.parse(preset).getroot().findall('.//effect[@type="convolution"]'):
+            if eff.get("irFile"):
+                wanted.add(eff.get("irFile"))
+
+    staged = 0
+    for rel in sorted(wanted):
+        src, dst = calib_root / rel, out_root / rel
+        if not src.exists():
+            raise SystemExit(f"emitted preset references missing IR: {src}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if not dst.exists() or dst.stat().st_size != src.stat().st_size:
+            shutil.copy2(src, dst)
+        staged += 1
+    return staged
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("library_dir",
@@ -866,7 +983,8 @@ def main():
         n += 1
         print(f"[{n}/{len(patch_dirs)}] emitted {stem}")
 
-    print(f"emitted {n} preset pairs to {out_root}")
+    staged = _stage_referenced_irs(out_root, Path(args.calibration).resolve().parent)
+    print(f"emitted {n} preset pairs to {out_root} ({staged} IR files staged)")
 
 
 if __name__ == "__main__":

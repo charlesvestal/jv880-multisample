@@ -24,17 +24,34 @@
 //   capture-irs  — inject the impulse once, then loop reverb type x time
 //                  pure-wet renders (the wet render IS the IR, no
 //                  deconvolution needed), writing WAVs.
+//   capture-delay — like capture-irs, but for Delay/Pan-Dly (reverb types
+//                  6-7): pure-wet impulse renders whose taps ARE the echo
+//                  train directly (time sweep at feedback=0, feedback sweep
+//                  at a fixed time), for direct peak-picking instead of
+//                  cross-correlation against a note's own attack shape.
+//   capture-chorus-depth — pure-wet chorus, excited by an injected sine
+//                  (not the impulse -- depth needs a sustained signal to
+//                  track modulation over multiple LFO cycles). Writes a dry
+//                  reference plus one wet render per depth sweep step.
 //   groundtruth  — render a REAL patch (e.g. A.Piano 1) both wet (native
-//                  reverb intact) and dry (reverb zeroed), using the
-//                  UNMODIFIED ROM (no injection) — for tools/ir_capture.py
-//                  to compare against dry (*) captured-IR convolution.
+//                  effect intact, chorus disabled) and dry (reverb zeroed),
+//                  using the UNMODIFIED ROM (no injection) — for
+//                  tools/ir_capture.py to validate a captured IR or the
+//                  parametric delay mapping against real hardware. Also
+//                  prints the patch's own native reverb_type/level/time/
+//                  feedback as one JSON line on stdout.
+//   effects      — dump read_effects() for one (--patch-index) or every
+//                  internal patch as JSON lines on stdout; used to find
+//                  which patches actually use a given reverb/delay type.
 //
 // Usage:
-//   wave_inject probe       --roms <dir> --wavegroup G --wavenumber N [--key 60]
-//   wave_inject impulse     --roms <dir> --wavegroup G --wavenumber N --out f.wav [--key 60] [--amp 127]
-//   wave_inject sine        --roms <dir> --wavegroup G --wavenumber N --out f.wav --freq HZ [--key 60] [--amp 100]
-//   wave_inject capture-irs --roms <dir> --wavegroup G --wavenumber N --out-dir DIR [--key 60]
-//   wave_inject groundtruth --roms <dir> --patch-index N --out-dir DIR
+//   wave_inject probe        --roms <dir> --wavegroup G --wavenumber N [--key 60]
+//   wave_inject impulse      --roms <dir> --wavegroup G --wavenumber N --out f.wav [--key 60] [--amp 127]
+//   wave_inject sine         --roms <dir> --wavegroup G --wavenumber N --out f.wav --freq HZ [--key 60] [--amp 100]
+//   wave_inject capture-irs  --roms <dir> --wavegroup G --wavenumber N --out-dir DIR [--key 60]
+//   wave_inject capture-delay --roms <dir> --wavegroup G --wavenumber N --out-dir DIR [--key 60]
+//   wave_inject groundtruth  --roms <dir> --patch-index N --out-dir DIR
+//   wave_inject effects      --roms <dir> [--patch-index N]
 
 #include "jv_render.h"
 #include "jv_rom.h"
@@ -351,7 +368,8 @@ struct ToneOffsets {
 // want pure-wet (drylevel=0, reverbsend=127) exactly like
 // tools/calibrate.cpp's pure_wet_reverb().
 std::vector<uint8_t> build_probe_patch(const std::vector<uint8_t> &tmpl, int wavegroup,
-                                        int wavenumber, uint8_t dry_level, uint8_t reverb_send) {
+                                        int wavenumber, uint8_t dry_level, uint8_t reverb_send,
+                                        uint8_t chorus_send = 0) {
     std::vector<uint8_t> p = tmpl;   // start from a real patch so untouched bytes (e.g. name) are sane
     for (int t = 0; t < TONE_COUNT; t++) {
         uint8_t *tp = p.data() + TONE_BASE + t * TONE_STRIDE;
@@ -391,10 +409,10 @@ std::vector<uint8_t> build_probe_patch(const std::vector<uint8_t> &tmpl, int wav
         tp[ToneOffsets::TVA_T4] = 0;
         tp[ToneOffsets::DRY_LEVEL] = dry_level;
         tp[ToneOffsets::REVERB_SEND] = reverb_send;
-        tp[ToneOffsets::CHORUS_SEND] = 0;
+        tp[ToneOffsets::CHORUS_SEND] = chorus_send;
     }
     p[24] = (uint8_t)(p[24] & (uint8_t)~(1 << 6));   // portamento off (patch-common)
-    p[16] = (uint8_t)(p[16] & ~0x7f);                 // choruslevel = 0
+    p[16] = (uint8_t)(p[16] & ~0x7f);                 // choruslevel = 0 (set_chorus, if used, overrides this)
     return p;
 }
 
@@ -403,6 +421,17 @@ void set_reverb(std::vector<uint8_t> &p, int type, int level, int time, int feed
     p[13] = (uint8_t)(level & 0x7f);
     p[14] = (uint8_t)(time & 0x7f);
     p[15] = (uint8_t)(feedback & 0x7f);
+}
+
+// Pokes patch-common chorus bytes 16-19 (level/depth/rate/feedback), keeping
+// byte16's own chorusoutput bit7 (Mix vs Reverb routing) untouched -- this
+// tool never needs that bit set, but zeroing it unconditionally would be an
+// unrelated side effect of a "set the chorus" call.
+void set_chorus(std::vector<uint8_t> &p, int level, int depth, int rate, int feedback) {
+    p[16] = (uint8_t)((p[16] & 0x80) | (level & 0x7f));
+    p[17] = (uint8_t)(depth & 0x7f);
+    p[18] = (uint8_t)(rate & 0x7f);
+    p[19] = (uint8_t)(feedback & 0x7f);
 }
 
 // =============================================================================
@@ -768,6 +797,38 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (cmd == "effects") {
+        // Dumps read_effects() (src/jv_patch.cpp) for every internal patch
+        // (or just --patch-index, if given) as one JSON object per line on
+        // stdout. Used by tools/ir_capture.py / ad-hoc scripts to look up a
+        // ground-truth test patch's OWN native reverb/delay type+time+
+        // feedback (instead of hardcoding it), and to scan the internal
+        // bank for patches that actually use Delay/Pan-Dly (reverb types
+        // 6/7) for the Gap 3 validation set — this repo has no static table
+        // of "which patch uses which effect", so the only honest way to
+        // find one is to read every patch's own bytes.
+        auto internal = enumerate_internal(roms);
+        // --patch-index 0 is also Args's unset default, so "was it actually
+        // passed on the command line" can't be read off a.patch_index alone
+        // -- scan argv directly to disambiguate "print everything" (no flag)
+        // from "print just index 0" (flag given, value 0).
+        bool have_index = false;
+        for (int i = 0; i < argc; i++) if (!strcmp(argv[i], "--patch-index")) have_index = true;
+        for (size_t i = 0; i < internal.size(); i++) {
+            if (have_index && (int)i != a.patch_index) continue;
+            const PatchRef &pr = internal[i];
+            Effects e = read_effects(pr.data);
+            printf("{\"index\":%zu,\"bank\":\"%s\",\"name\":\"%s\",\"reverb_type\":%d,"
+                   "\"reverb_level\":%d,\"reverb_time\":%d,\"reverb_feedback\":%d,"
+                   "\"chorus_level\":%d,\"chorus_depth\":%d,\"chorus_rate\":%d,"
+                   "\"chorus_output\":%d}\n",
+                   i, pr.bank.c_str(), pr.name.c_str(), e.reverb_type, e.reverb_level,
+                   e.reverb_time, e.reverb_feedback, e.chorus_level, e.chorus_depth,
+                   e.chorus_rate, e.chorus_output);
+        }
+        return 0;
+    }
+
     if (cmd == "playwave") {
         // Renders a wave slot's ORIGINAL, unmodified ROM content (no
         // injection at all) — a same-methodology baseline for comparing
@@ -847,6 +908,85 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (cmd == "capture-chorus-depth") {
+        // Pure-wet chorus, excited by an injected sine (not the impulse):
+        // chorus is a delay MODULATED over time, and measuring its depth
+        // needs a signal that's actually PRESENT for multiple LFO cycles to
+        // track how its delay lag wanders -- a single impulse's response
+        // would just be one more (single, static) delay tap, indistinguishable
+        // from an unmodulated echo. A held sine, cross-correlated against its
+        // own dry copy in short sliding windows, recovers the wet signal's
+        // instantaneous LAG directly (see tools/ir_capture.py's
+        // measure_chorus_depth_excursion) -- a genuine physical quantity (a
+        // delay-time excursion in ms), unlike the three earlier failed
+        // attempts (RMS excursion / autocorrelation pitch-tracking / Hilbert
+        // instantaneous frequency), none of which tracked delay time itself.
+        //
+        // rate is fixed at 127 (empirically ~9.4Hz, see calibration.json's
+        // chorus_rate_hz) purely so multiple LFO cycles fit inside the
+        // ~0.2-0.3s of unique content available from injecting into a single
+        // wave slot (this ROM has no usable loop for indefinite sustain --
+        // confirmed empirically: held well past its native length, this same
+        // host wave decays to near-silence rather than repeating). depth is
+        // independent of rate on the JV's own effect parameters (separate
+        // patch bytes), so measuring depth's effect at a fast, cycle-dense
+        // rate is a valid substitute for the sweep's own eventual (slower,
+        // patch-typical) rate value.
+        auto internal = enumerate_internal(roms);
+        std::vector<uint8_t> tmpl(internal[0].data, internal[0].data + PATCH_SIZE);
+        std::vector<uint8_t> probe_patch = build_probe_patch(tmpl, a.wavegroup, a.wavenumber, 127, 0);
+        ProbeResult pr = probe_wave(roms, probe_patch, a.key, a.vel);
+        if (!pr.found) { fprintf(stderr, "probe failed to find a voice\n"); return 1; }
+        fprintf(stderr, "probe: bank=%d half=%d start=%u end=%u loop=%u length=%u\n", pr.bank,
+                pr.half, pr.start, pr.end, pr.loop, pr.end - pr.start);
+
+        double avg_step = 1.0;
+        if (pr.trace.size() > 1) {
+            double sum = 0;
+            for (size_t i = 1; i < pr.trace.size(); i++)
+                sum += (double)pr.trace[i] - (double)pr.trace[i - 1];
+            avg_step = sum / (double)(pr.trace.size() - 1);
+        }
+        double output_samples_per_rom_step = 2.0 / std::max(1e-6, avg_step);
+
+        // Use every available ROM step in the wave slot -- more unique
+        // content means more LFO cycles observable in the fixed excitation
+        // window, which is the scarce resource here (see comment above).
+        uint32_t max_len = pr.end - pr.start + 1;
+        int n_samples = (int)max_len;
+        double effective_freq = a.freq * output_samples_per_rom_step;
+        std::vector<int64_t> ref = build_sine_ref(n_samples, a.amp, effective_freq, SAMPLE_RATE);
+        inject_wave(&roms, pr, ref, 0.02);
+
+        Renderer r;
+        if (!r.init(roms)) { fprintf(stderr, "emulator init failed\n"); return 1; }
+        mkdirs(a.out_dir);
+
+        double render_seconds = (double)n_samples * output_samples_per_rom_step / SAMPLE_RATE;
+        GridSpec g;
+        g.hold_seconds = render_seconds + 0.02;
+        g.tail_seconds = 0.1;
+        g.silence_db = -120.0;
+
+        std::vector<uint8_t> dry_patch = build_probe_patch(tmpl, a.wavegroup, a.wavenumber, 127, 0, 0);
+        write_render(r, dry_patch, g, a.key, a.vel, a.out_dir + "/chorus_depth_dry.wav");
+
+        std::vector<int> steps;
+        for (int raw = 0; raw < 128; raw += 16) steps.push_back(raw);
+        if (steps.back() != 127) steps.push_back(127);
+        const int FIXED_LEVEL = 100, FIXED_RATE = 127, FIXED_FEEDBACK = 0;
+        for (int raw : steps) {
+            std::vector<uint8_t> p = build_probe_patch(tmpl, a.wavegroup, a.wavenumber, 0, 0, 127);
+            set_chorus(p, FIXED_LEVEL, raw, FIXED_RATE, FIXED_FEEDBACK);
+            char fn[128];
+            snprintf(fn, sizeof(fn), "/chorus_depth_wet_%03d.wav", raw);
+            write_render(r, p, g, a.key, a.vel, a.out_dir + fn);
+        }
+        fprintf(stderr, "chorus depth capture: %.4fs unique content, effective sine %.2fHz\n",
+                render_seconds, effective_freq);
+        return 0;
+    }
+
     if (cmd == "capture-irs") {
         auto internal = enumerate_internal(roms);
         std::vector<uint8_t> tmpl(internal[0].data, internal[0].data + PATCH_SIZE);
@@ -883,6 +1023,96 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (cmd == "capture-delay") {
+        // Pure-wet, impulse-excited captures of Delay/Pan-Dly (reverb types
+        // 6-7). A delay's pure-wet response to a true impulse IS its taps:
+        // a spike at t=delayTime, then (if feedback>0) further decaying
+        // spikes at every multiple of the repeat period -- no
+        // cross-correlation against a note's own attack shape is needed
+        // (that was the old calibrate.cpp/analyze_calibration.py method,
+        // which excited with a Marimba strike and had to matched-filter the
+        // echo back out of a smeared, harmonically-beating decay). Direct
+        // peak-picking on these captures is both simpler and more precise.
+        //
+        // GOTCHA (see task brief): jv_render.cpp's render_note() tail
+        // early-exit threshold is derived from the HOLD phase's own peak.
+        // With drylevel=0 the hold phase is silent until the first tap
+        // arrives, so if the first tap fell in the TAIL instead of the
+        // HOLD, peak would still be 0 there, floor would be exactly 0, and
+        // the tail's quiet-run counter would hit its ~100ms threshold and
+        // truncate the render to nothing before the first (real, nonzero)
+        // tap ever arrived -- confirmed to reproduce a silent capture
+        // exactly this way in an earlier attempt. The fix used here is
+        // structural, not a threshold tweak: HOLD is always rendered in
+        // full regardless of silence_db (jv_render.cpp design note C), so
+        // every capture below sets hold_seconds long enough to contain
+        // every tap this capture needs to measure, and keeps tail_seconds
+        // short -- silence_db is irrelevant to correctness here as long as
+        // hold covers the content.
+        auto internal = enumerate_internal(roms);
+        std::vector<uint8_t> tmpl(internal[0].data, internal[0].data + PATCH_SIZE);
+        std::vector<uint8_t> probe_patch = build_probe_patch(tmpl, a.wavegroup, a.wavenumber, 127, 0);
+        ProbeResult pr = probe_wave(roms, probe_patch, a.key, a.vel);
+        if (!pr.found) { fprintf(stderr, "probe failed to find a voice\n"); return 1; }
+        fprintf(stderr, "probe: bank=%d half=%d start=%u end=%u loop=%u length=%u\n", pr.bank,
+                pr.half, pr.start, pr.end, pr.loop, pr.end - pr.start);
+
+        std::vector<int64_t> ref = build_impulse_ref(a.n_samples, (int64_t)a.amp_i * (1 << ENCODE_MAX_NIBBLE));
+        inject_wave(&roms, pr, ref);
+
+        Renderer r;
+        if (!r.init(roms)) { fprintf(stderr, "emulator init failed\n"); return 1; }
+        mkdirs(a.out_dir);
+
+        std::vector<int> steps;
+        for (int raw = 0; raw < 128; raw += 16) steps.push_back(raw);
+        if (steps.back() != 127) steps.push_back(127);
+
+        // TIME sweep: feedback=0 (only the first tap matters), so a hold
+        // comfortably above the longest plausible single delay time is
+        // enough. 1.0s is >2x the largest raw=127 time this brief's own
+        // prior (note-based) measurement found (~0.49s, type 6) -- and even
+        // if the impulse remeasurement below moves that number, a delay
+        // that took over half a second for its FIRST repeat would not read
+        // as "delay" on a percussive instrument at all.
+        GridSpec g_time;
+        g_time.hold_seconds = 1.0;
+        g_time.tail_seconds = 0.3;
+        g_time.silence_db = -90.0;
+
+        for (int type : {6, 7}) {
+            for (int raw : steps) {
+                std::vector<uint8_t> p = build_probe_patch(tmpl, a.wavegroup, a.wavenumber, 0, 127);
+                set_reverb(p, type, 127, raw, 0);
+                char fn[128];
+                snprintf(fn, sizeof(fn), "/delay_t%d_time_%03d.wav", type, raw);
+                write_render(r, p, g_time, a.key, a.vel, a.out_dir + fn);
+            }
+        }
+
+        // FEEDBACK sweep: fixed time=64 (same convention calibrate.cpp
+        // already used), raw feedback 0..127. Needs many repeat periods
+        // (measure_delay_feedback_gain-equivalent analysis below looks out
+        // to ~17 periods) all captured within HOLD -- a repeat period at
+        // time=64 measured well under 0.3s previously, so 6s of hold gives
+        // >20 periods of margin even before this task's remeasurement.
+        GridSpec g_fb;
+        g_fb.hold_seconds = 6.0;
+        g_fb.tail_seconds = 0.3;
+        g_fb.silence_db = -90.0;
+
+        for (int type : {6, 7}) {
+            for (int raw : steps) {
+                std::vector<uint8_t> p = build_probe_patch(tmpl, a.wavegroup, a.wavenumber, 0, 127);
+                set_reverb(p, type, 127, 64, raw);
+                char fn[128];
+                snprintf(fn, sizeof(fn), "/delay_t%d_feedback_%03d.wav", type, raw);
+                write_render(r, p, g_fb, a.key, a.vel, a.out_dir + fn);
+            }
+        }
+        return 0;
+    }
+
     if (cmd == "groundtruth") {
         auto internal = enumerate_internal(roms);
         if ((size_t)a.patch_index >= internal.size()) {
@@ -893,6 +1123,30 @@ int main(int argc, char **argv) {
         fprintf(stderr, "groundtruth patch: %s (bank %s, index %d)\n", pr.name.c_str(),
                 pr.bank.c_str(), pr.index);
         std::vector<uint8_t> raw(pr.data, pr.data + PATCH_SIZE);
+
+        // Machine-readable echo of this patch's own native effect bytes, on
+        // stdout, so callers (tools/ir_capture.py's multi-patch validation)
+        // can pick the right IR/type/time/feedback to compare against
+        // without a second `effects` subprocess call or hardcoding a
+        // patch's settings by hand (which is exactly how the original
+        // single-patch groundtruth check came to be hardwired to "A.Piano 1,
+        // Hall1/type4, time 64" — a value that isn't even A.Piano 1's real
+        // reverb time).
+        {
+            Effects e = read_effects(pr.data);
+            // tone_level/reverb_send arrays let a caller reproduce
+            // tools/emit_presets.py's effective_send() (average send across
+            // active tones only) exactly, so a reconstruction-vs-groundtruth
+            // comparison can use the SAME wet/mix fraction the shipped
+            // preset would actually use, not an arbitrary stand-in.
+            printf("{\"index\":%d,\"name\":\"%s\",\"reverb_type\":%d,\"reverb_level\":%d,"
+                   "\"reverb_time\":%d,\"reverb_feedback\":%d,"
+                   "\"tone_level\":[%d,%d,%d,%d],\"reverb_send\":[%d,%d,%d,%d]}\n",
+                   a.patch_index, pr.name.c_str(), e.reverb_type, e.reverb_level,
+                   e.reverb_time, e.reverb_feedback,
+                   e.tone_level[0], e.tone_level[1], e.tone_level[2], e.tone_level[3],
+                   e.reverb_send[0], e.reverb_send[1], e.reverb_send[2], e.reverb_send[3]);
+        }
 
         LfoDecision d1 = decide_lfo_strip(pr.data, 1);
         LfoDecision d2 = decide_lfo_strip(pr.data, 2);

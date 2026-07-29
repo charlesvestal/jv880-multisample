@@ -258,6 +258,43 @@ def test_plain_delay_type_has_zero_stereo_offset():
 
 
 # ---------------------------------------------------------------------------
+# Gap 3: measured pan_dly_stereo_offset_s
+# ---------------------------------------------------------------------------
+
+def test_pan_dly_stereo_offset_uses_measured_calibration_value():
+    """With a measured pan_dly_stereo_offset_s in calibration.json, that
+    value (not the old PAN_DLY_STEREO_OFFSET_FRAC formula) drives
+    stereoOffset -- verified directly via _pan_dly_stereo_offset rather than
+    through a full preset build, so the assertion is exact, not just
+    "nonzero"."""
+    cal_with_measurement = {"pan_dly_stereo_offset_s": 0.035}
+    got = ep._pan_dly_stereo_offset(cal_with_measurement, delay_time_s=0.5)
+    assert got == pytest.approx(0.035)
+
+
+def test_pan_dly_stereo_offset_falls_back_without_measurement():
+    """No measured value (e.g. the synthetic CAL fixture, which predates
+    this measurement) -- falls back to the old reasoned proportion, exactly
+    as before this task."""
+    cal_without = {}
+    got = ep._pan_dly_stereo_offset(cal_without, delay_time_s=0.2)
+    expected = min(ep.PAN_DLY_STEREO_OFFSET_MAX_S, ep.PAN_DLY_STEREO_OFFSET_FRAC * 0.2)
+    assert got == pytest.approx(expected)
+
+
+def test_pan_dly_stereo_offset_never_approaches_delay_time():
+    """The original bug this whole mapping exists to avoid repeating: a
+    stereoOffset at or beyond delayTime inverts which channel leads. Even a
+    generously large measured value must be capped well inside a SHORT
+    delayTime (regression guard for PAN_DLY_STEREO_OFFSET_MAX_FRAC_OF_DELAY)."""
+    cal_large = {"pan_dly_stereo_offset_s": 0.5}   # implausibly large on purpose
+    short_delay = 0.03
+    got = ep._pan_dly_stereo_offset(cal_large, delay_time_s=short_delay)
+    assert got <= 0.5 * short_delay + 1e-9
+    assert got < short_delay, "stereoOffset must never reach, let alone exceed, delayTime"
+
+
+# ---------------------------------------------------------------------------
 # AC 5: chorus modRate from calibration table, including the raw=24 gap
 # ---------------------------------------------------------------------------
 
@@ -275,6 +312,58 @@ def test_interp_table_matches_hand_computed_value():
     expected = 2.2734 + 0.5 * (2.9416 - 2.2734)
     got = ep.interp_table(CAL["chorus_rate_hz"], 100)
     assert got == pytest.approx(expected, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Gap 2: chorus depth (chorus_depth_norm) -- the table this task exists to
+# not repeat the "shipped inverted, no test caught it" mistake with.
+# ---------------------------------------------------------------------------
+
+def test_chorus_mod_depth_uses_calibrated_curve_when_present():
+    """A deliberately NON-linear chorus_depth_norm (unlike CAL's own
+    0.0/1.0-only fixture, whose 2-point interpolation happens to be
+    indistinguishable from the proportional fallback) must actually change
+    the result relative to the flat proportional mapping -- proving the
+    measured curve, not just amount(), is what's driving modDepth."""
+    cal = dict(CAL)
+    cal["chorus_depth_norm"] = {"0": 0.0, "64": 0.9, "127": 1.0}
+    meta = make_meta()
+    meta["effects"]["chorus"]["depth"] = 64
+    root = parse(meta, cal=cal)
+    ch = [e for e in root.findall(".//effect") if e.get("type") == "chorus"][0]
+    got = fattr(ch, "modDepth")
+    expected_calibrated = 0.9 * ep.CHORUS_MAX_MOD_DEPTH
+    expected_proportional = ep.amount(64, ep.CHORUS_MAX_MOD_DEPTH)
+    assert got == pytest.approx(expected_calibrated, abs=1e-4)
+    assert got != pytest.approx(expected_proportional, abs=1e-4)
+
+
+def test_chorus_mod_depth_falls_back_to_proportional_without_table():
+    """No chorus_depth_norm at all (e.g. a calibration.json predating this
+    measurement) -- falls back to the old flat proportional mapping, not a
+    crash or a fabricated curve."""
+    cal_without = {k: v for k, v in CAL.items() if k != "chorus_depth_norm"}
+    got = ep._chorus_mod_depth(cal_without, 64)
+    assert got == pytest.approx(ep.amount(64, ep.CHORUS_MAX_MOD_DEPTH))
+
+
+def test_chorus_mod_depth_zero_at_zero_raw_depth():
+    """raw depth=0 must produce (near-)zero modDepth regardless of whether
+    a measured curve is present -- the exact property the FIRST shipped
+    table violated (raw=0 mapped to MAXIMUM depth)."""
+    cal = {"chorus_depth_norm": {"0": 0.1335, "64": 0.519, "127": 1.0}}
+    got = ep._chorus_mod_depth(cal, 0)
+    assert got < 0.1, f"raw depth=0 should be near-zero modDepth, got {got}"
+
+
+def test_chorus_mod_depth_monotonic_across_measured_table():
+    """End-to-end sanity: modDepth must not decrease as raw depth rises,
+    for the real measured curve (if calib/calibration.json exists)."""
+    if REAL_CAL is None or "chorus_depth_norm" not in REAL_CAL:
+        pytest.skip("no real chorus_depth_norm to check")
+    values = [ep._chorus_mod_depth(REAL_CAL, raw) for raw in (0, 16, 32, 48, 64, 80, 96, 112, 127)]
+    for a, b in zip(values, values[1:]):
+        assert b >= a - 1e-9, f"modDepth decreased across the measured sweep: {values}"
 
 
 @pytest.mark.skipif(REAL_CAL is None, reason="calib/calibration.json not present")
@@ -801,9 +890,71 @@ def test_delay_types_still_emit_delay_even_with_ir_bank():
 
 def test_ir_snaps_to_nearest_captured_time_step():
     cal = _cal_with_ir()
-    assert ep._nearest_ir(cal, 4, 90).endswith("_096.wav")   # 90 -> 96
-    assert ep._nearest_ir(cal, 4, 50).endswith("_048.wav")   # 50 -> 48
-    assert ep._nearest_ir(cal, 4, 0).endswith("_000.wav")
+    assert ep._nearest_ir(cal, 4, 90)[0].endswith("_096.wav")   # 90 -> 96
+    assert ep._nearest_ir(cal, 4, 50)[0].endswith("_048.wav")   # 50 -> 48
+    assert ep._nearest_ir(cal, 4, 0)[0].endswith("_000.wav")
+    assert all(ok for ok in (ep._nearest_ir(cal, 4, r)[1] for r in (0, 50, 90)))
+
+
+def test_silent_ir_step_zeroes_wet_instead_of_eating_the_dry_signal():
+    """convolution `mix` is a BLEND, so mix>0 against an all-zero IR quietly
+    attenuates the dry signal while adding nothing. The JV really does emit no
+    wet signal at reverbtime 0, so the correct emission is mix=0 -- and the
+    irFile should point at an AUDIBLE step so the knob still works."""
+    cal = _cal_with_ir()
+    cal["reverb_ir_silent"] = {"4": [0]}
+
+    ir, wet_ok = ep._nearest_ir(cal, 4, 0)
+    assert wet_ok is False
+    assert not ir.endswith("_000.wav"), "should redirect away from the silent capture"
+
+    meta = make_meta(reverb_type="Hall1")
+    meta["effects"]["reverb"].update(time=0, level=127)
+    conv = [e for e in parse(meta, cal).findall(".//effect")
+            if e.get("type") == "convolution"][0]
+    assert float(conv.get("mix") or 0) == 0.0
+    assert not (conv.get("irFile") or "").endswith("_000.wav")
+
+
+def test_audible_step_is_unaffected_by_the_silent_manifest():
+    cal = _cal_with_ir()
+    cal["reverb_ir_silent"] = {"4": [0]}
+    meta = make_meta(reverb_type="Hall1")
+    meta["effects"]["reverb"].update(time=96, level=127)
+    conv = [e for e in parse(meta, cal).findall(".//effect")
+            if e.get("type") == "convolution"][0]
+    assert float(conv.get("mix") or 0) > 0.0
+    assert (conv.get("irFile") or "").endswith("_096.wav")
+
+
+def test_emitted_library_stages_every_ir_it_references(tmp_path):
+    """A preset's irFile is relative to the preset, so the WAV must physically
+    land in the library -- otherwise DecentSampler renders no reverb at all and
+    it reads as 'the reverb is too quiet'. Shipped broken twice already."""
+    calib_root = tmp_path / "calib"
+    (calib_root / "ir_synth").mkdir(parents=True)
+    (calib_root / "ir_synth" / "reverb_t4_time_096.wav").write_bytes(b"RIFFfake")
+
+    out_root = tmp_path / "lib"
+    out_root.mkdir()
+    (out_root / "p.dspreset").write_text(
+        '<DecentSampler><effects>'
+        '<effect type="convolution" irFile="ir_synth/reverb_t4_time_096.wav" mix="0.3"/>'
+        '</effects></DecentSampler>')
+
+    assert ep._stage_referenced_irs(out_root, calib_root) == 1
+    assert (out_root / "ir_synth" / "reverb_t4_time_096.wav").exists()
+
+
+def test_staging_fails_loudly_when_a_referenced_ir_is_absent(tmp_path):
+    out_root = tmp_path / "lib"
+    out_root.mkdir()
+    (out_root / "p.dspreset").write_text(
+        '<DecentSampler><effects>'
+        '<effect type="convolution" irFile="ir_synth/nope.wav" mix="0.3"/>'
+        '</effects></DecentSampler>')
+    with pytest.raises(SystemExit):
+        ep._stage_referenced_irs(out_root, tmp_path / "calib")
 
 
 def test_missing_ir_bank_falls_back_to_parametric_reverb():

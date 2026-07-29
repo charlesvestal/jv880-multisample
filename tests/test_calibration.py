@@ -204,6 +204,79 @@ def test_chorus_rate_127_at_least_2x_rate_0():
     )
 
 
+# ---------------------------------------------------------------------------
+# chorus_depth_norm (Gap 2): stereo-decorrelation-based chorus depth curve.
+#
+# The task's own warning is explicit: "The chorus disaster shipped precisely
+# because no test asserted anything about that table." The FIRST shipped
+# chorus_depth_norm table was inverted (raw=0 -> maximum depth); these tests
+# exist so a future regeneration that reintroduces that bug (or a flat/
+# non-monotonic one) fails loudly instead of shipping silently.
+# ---------------------------------------------------------------------------
+
+def test_chorus_depth_norm_present_and_full_sweep():
+    data = _load()
+    assert "chorus_depth_norm" in data, "missing table: chorus_depth_norm"
+    table = data["chorus_depth_norm"]
+    expected_steps = {"0", "16", "32", "48", "64", "80", "96", "112", "127"}
+    assert expected_steps <= set(table.keys()), (
+        f"chorus_depth_norm missing steps: {expected_steps - set(table.keys())}"
+    )
+
+
+def test_chorus_depth_norm_strictly_monotonic():
+    """Unlike chorus_rate_hz/reverb_rt60 (autocorrelation/decay-slope fits
+    with real estimation noise), chorus_depth_norm is a plain energy-ratio
+    measurement (RMS(L-R)/RMS(L+R) of a pure-wet chorused sine) with no
+    periodicity-aliasing failure mode -- the measured sweep is strictly
+    monotonic with ZERO violations (cross-validated at two independent
+    carrier frequencies, 0.999 shape-correlation between them -- see
+    tools/ir_capture.py's cmd_chorus_depth). A future regression that
+    reintroduces ANY non-monotonic point is a real problem, not noise to
+    tolerate."""
+    data = _load()
+    items = _sorted_present(data["chorus_depth_norm"])
+    assert len(items) >= 2
+    for (raw_prev, v_prev), (raw_cur, v_cur) in zip(items, items[1:]):
+        assert v_cur >= v_prev, (
+            f"chorus_depth_norm dropped from {v_prev} (raw={raw_prev}) to "
+            f"{v_cur} (raw={raw_cur}) -- the inverted-table failure mode "
+            f"this task exists to prevent from shipping again"
+        )
+
+
+def test_chorus_depth_norm_range_and_dynamic_range():
+    """Every value in [0, 1] (it's what CHORUS_MAX_MOD_DEPTH gets multiplied
+    by), and raw=127 substantially deeper than raw=0 -- not the ~flat curve
+    the FIRST chorus disaster shipped (raw=0..127 all landing near 0.7)."""
+    data = _load()
+    items = _sorted_present(data["chorus_depth_norm"])
+    for raw, v in items:
+        assert 0.0 <= v <= 1.0, f"chorus_depth_norm[{raw}]={v} outside 0-1"
+    lo_val = items[0][1]
+    hi_val = items[-1][1]
+    assert hi_val >= 3.0 * max(lo_val, 1e-6), (
+        f"chorus_depth_norm does not show a substantial dynamic range "
+        f"(raw=0: {lo_val}, raw=127: {hi_val})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# pan_dly_stereo_offset_s (Gap 3): measured DS stereoOffset for Pan-Dly.
+# ---------------------------------------------------------------------------
+
+def test_pan_dly_stereo_offset_measured_and_plausible():
+    """A measured value, not the old formula-derived guess -- must be
+    present, positive, and small relative to a typical delayTime (the
+    original bug this whole mapping exists to avoid repeating was a fixed
+    stereoOffset=3.0, i.e. three seconds, dwarfing and inverting the sub-
+    second delayTime it was applied to)."""
+    data = _load()
+    assert "pan_dly_stereo_offset_s" in data, "missing pan_dly_stereo_offset_s"
+    v = data["pan_dly_stereo_offset_s"]
+    assert 0.0 < v < 0.2, f"pan_dly_stereo_offset_s ({v}s) outside a plausible range"
+
+
 def test_reverb_rt60_monotonic_per_type():
     data = _load()
     rt60 = data["reverb_rt60"]
@@ -308,19 +381,33 @@ def test_delay_time_plausible_range(dtype):
     )
 
 
-def test_delay_raw_zero_is_null_not_fabricated():
-    """raw=0 is an intentional, documented measurement gap on BOTH types
-    (the echo lands too close to the attack itself to distinguish from it
-    at this setting) -- it must be recorded as null, not coerced to 0.0
-    seconds (which would be a real, if small, fabricated number, and -- via
-    interp_table -- would flatten the whole low end of the curve toward
-    zero instead of interpolating across the gap the way every other
-    missing point in this file already does)."""
+def test_delay_raw_zero_is_near_zero_not_a_large_fabrication():
+    """raw=0's status CHANGED with the impulse-based remeasurement, and per
+    the task's own instruction ("trust the impulse, say what changed") this
+    test now asserts the NEW finding rather than the old one.
+
+    The OLD note-based cross-correlation method (tools/analyze_calibration.py,
+    now superseded for this table) recorded raw=0 as an intentional NULL gap:
+    a musical note's own attack transient and the delay's first echo are both
+    smeared, broadband-ish shapes at this short a spacing, and cross-
+    correlating one against the other could not reliably tell them apart.
+    tools/ir_capture.py's find_delay_taps has no such ambiguity: excited by a
+    true impulse, the very first detected tap simply IS the delay time,
+    whatever it is -- and it measures a small but genuine, nonzero value at
+    raw=0 for both types (~0.0002s type 6, ~0.0003s type 7 -- a couple of
+    sample periods, not "no delay measured"). This is now a real
+    measurement, not a fabricated stand-in for one: assert it is small
+    (near the plausible floor) rather than requiring it be null."""
     data = _load()
     for dtype in ("6", "7"):
-        assert data["delay_time_s"][dtype].get("0") is None, (
-            f"type {dtype}: raw=0 should be an intentional null gap, not a "
-            f"fabricated value"
+        v = data["delay_time_s"][dtype].get("0")
+        assert v is not None, (
+            f"type {dtype}: raw=0 should now be measurable (a true impulse's first "
+            f"tap has no ambiguity with the excitation itself)"
+        )
+        assert 0.0 <= v < 0.005, (
+            f"type {dtype}: raw=0 delay_time_s ({v}s) is not the small near-zero "
+            f"value the impulse-based first-tap measurement should find"
         )
 
 
@@ -414,11 +501,13 @@ def test_pan_dly_alternates_channels_far_more_than_plain_delay():
 # reverb_ir (types 0-5 impulse-response bank, calib/ir/*.wav)
 # ---------------------------------------------------------------------------
 
-def _ir_entries():
+def _ir_entries(include_raw_zero=True):
     data = _load()
     ir = data["reverb_ir"]
     for rtype in range(6):
         for raw, relpath in sorted(ir[str(rtype)].items(), key=lambda kv: int(kv[0])):
+            if raw == "0" and not include_raw_zero:
+                continue
             if relpath is not None:
                 yield rtype, int(raw), relpath
 
@@ -435,6 +524,14 @@ def test_reverb_ir_files_exist_and_are_valid_audio():
         assert audio.ndim == 2 and audio.shape[1] == 2, (
             f"type={rtype} raw={raw}: expected stereo IR, got shape {audio.shape}"
         )
+        if raw == 0:
+            # reverbtime=0 is a genuine, clean near-total bypass on real
+            # hardware -- see test_reverb_type_raw_zero_is_genuinely_near_silent
+            # below for the full finding. It still produces a real (if tiny)
+            # file rather than a null entry, which is the physically correct
+            # behaviour for a patch whose own reverbtime happens to sit near
+            # 0 -- but it is not held to the "substantial IR" bar below.
+            continue
         assert len(audio) > sr * 0.05, (
             f"type={rtype} raw={raw}: IR is implausibly short "
             f"({len(audio) / sr:.3f}s) to be a usable reverb impulse response"
@@ -448,8 +545,10 @@ def test_reverb_ir_has_decaying_envelope_not_silence_or_noise():
     into the capture (pure_wet_reverb's job is to mute it) -- a leaked
     percussive attack transient would still happen to decay overall, but
     combined with test_reverb_ir_no_leaked_dry_attack below, both together
-    rule out the two ways this capture could be wrong."""
-    for rtype, raw, relpath in _ir_entries():
+    rule out the two ways this capture could be wrong.
+
+    raw=0 is excluded here -- see test_reverb_type_raw_zero_is_genuinely_near_silent."""
+    for rtype, raw, relpath in _ir_entries(include_raw_zero=False):
         path = CALIB_DIR / relpath
         sr, audio = wavfile.read(str(path))
         mono = audio.astype(np.float64).mean(axis=1)
@@ -462,6 +561,36 @@ def test_reverb_ir_has_decaying_envelope_not_silence_or_noise():
         assert rms_first > rms_second, (
             f"type={rtype} raw={raw}: IR {path} does not decay "
             f"(first-half RMS {rms_first:.1f} <= second-half RMS {rms_second:.1f})"
+        )
+
+
+def test_reverb_type_raw_zero_is_genuinely_near_silent():
+    """A genuine, clean hardware finding, not a capture defect: at
+    reverbtime=0 (raw=0), the impulse-driven pure-wet capture measures
+    EXACTLY digital zero for every one of the 6 reverb types (confirmed
+    directly on the raw, untrimmed capture -- not a trimming artifact) --
+    i.e. reverbtime=0 is a genuine near-total bypass on real hardware, not
+    merely "a very short decay". This is consistent with (not contradicted
+    by) reverb_rt60's OWN raw=0 entries being small-but-nonzero for 5/6
+    types: that table is measured completely differently (a SUSTAINED
+    4-second organ tone, not a single impulse), and a continuously-
+    re-excited near-zero-time reverb can still show some measurable output
+    during/just after a long hold, where a single impulse's response decays
+    below the measurable floor essentially instantly. Both are real
+    measurements of the same underlying near-off setting via different
+    excitations -- this test locks in the impulse-specific finding so a
+    future capture regression (e.g. a stray leaked dry attack) would be
+    caught, not the disagreement with reverb_rt60 itself."""
+    for rtype, raw, relpath in _ir_entries():
+        if raw != 0:
+            continue
+        path = CALIB_DIR / relpath
+        sr, audio = wavfile.read(str(path))
+        mono = audio.astype(np.float64).mean(axis=1)
+        assert np.abs(mono).max() < 5, (
+            f"type={rtype} raw=0: expected near-total silence (reverb bypass), "
+            f"got peak {np.abs(mono).max()} -- either the hardware finding no "
+            f"longer holds or something leaked into the capture"
         )
 
 
@@ -516,6 +645,40 @@ def test_reverb_ir_rt60_broadly_agrees_with_reverb_rt60():
         f"measured reverb_rt60 table across {len(pairs)} points -- expected "
         f"strong agreement between two independent RT60 measurements of the "
         f"same underlying reverb algorithm"
+    )
+
+
+def test_reverb_ir_bank_not_trimmed_too_shallow():
+    """Room-fidelity investigation (Gap 1): the IR trim threshold used to be
+    28dB, materially SHALLOWER than the -45dB decay floor the groundtruth
+    validation compares against (tools/ir_capture.py's DECAY_FLOOR_DB) --
+    every captured IR was silently missing real, audible decay content in
+    the -28..-45dB range, and long reverbs (which take proportionally far
+    longer to traverse that range) lost the most. Multi-patch validation
+    measured this costing up to ~0.15 correlation on the worst-hit type
+    (Hall1) before the trim was deepened (see tools/ir_capture.py's
+    IR_TRIM_DB comment for the full before/after numbers).
+
+    This locks in a coarse but meaningful regression guard: at least HALF
+    the non-degenerate (raw>0) captured IRs across the whole bank must run
+    at least 0.3s, a length no plausible re-tightening back toward the old
+    28dB default could produce (the old bank's median non-degenerate
+    duration was well under that). It intentionally does not pin an exact
+    number -- IR durations are a measured, type/time-dependent property,
+    not something to hardcode -- only that the bank as a whole hasn't
+    regressed back to being trimmed too shallow to be a fair test."""
+    data = _load()
+    durations = []
+    for rtype, raw, relpath in _ir_entries(include_raw_zero=False):
+        path = CALIB_DIR / relpath
+        sr, audio = wavfile.read(str(path))
+        durations.append(len(audio) / sr)
+    assert durations, "no non-degenerate reverb_ir entries to check"
+    durations.sort()
+    median = durations[len(durations) // 2]
+    assert median >= 0.3, (
+        f"reverb_ir bank's median non-degenerate IR duration ({median:.3f}s) "
+        f"looks trimmed too shallow again -- see this test's docstring"
     )
 
 

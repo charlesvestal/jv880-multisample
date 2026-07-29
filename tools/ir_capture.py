@@ -1,40 +1,54 @@
 #!/usr/bin/env python3
-"""ir_capture — orchestrates tools/wave_inject to prove the JV-880 wave-ROM
-DPCM injection is correct, capture reverb impulse responses from a
-mathematically exact synthetic impulse (instead of a musical note), and
-validate them against ground truth.
+"""ir_capture — orchestrates tools/wave_inject to measure three fidelity
+gaps using the injected-impulse/sine excitation wave_inject.cpp provides,
+which a musical note excitation could not measure cleanly. All emulator
+interaction (ROM loading/mutation, patch construction, rendering) lives in
+tools/wave_inject.cpp; this script shells out to the compiled `wave_inject`
+binary and does the signal analysis.
 
-This is pure orchestration + signal analysis: all emulator interaction
-(ROM loading/mutation, patch construction, rendering) lives in
-tools/wave_inject.cpp. This script never touches the ROMs or the emulator
-directly -- it shells out to the compiled `wave_inject` binary and analyzes
-the WAV files it produces.
+--stage reverb (Gap 1 -- room reverb fidelity):
+  PROOF -> render a synthetic single-sample impulse dry, measure spectral
+  flatness; refuses to proceed if it doesn't exceed the prior best (wave 17
+  musical note, 0.552).
+  CAPTURE -> sweep reverb type 0-5 x time (step 16, 9 steps), pure-wet
+  (drylevel=0, reverbsendlevel=127), pure-impulse excitation; each render
+  already IS the impulse response, no deconvolution needed. Trim where the
+  smoothed envelope falls IR_TRIM_DB below peak (60dB -- see that constant's
+  own comment for why, and what it replaced), fade out, resample to 48kHz,
+  write under calib/ir_synth/. THIS is now the bank calibration.json's
+  "reverb_ir" points at (superseding the old deconvolution-based
+  calib/ir/*.wav bank the very first version of this tool deliberately
+  avoided touching).
+  VALIDATE (cmd_groundtruth_multi) -> for every reverb type, against SEVERAL
+  real patches discovered from the whole internal ROM (a single named patch
+  was shown to be misleading), reconstruct dry*(1-mix)+convolved*mix (using
+  the real per-patch mix tools/emit_presets.py would compute) and compare to
+  the real hardware's wet render over the decay region, with a reliability
+  guard skipping patches whose post-note-off decay is too short to be a
+  meaningful test at all.
 
-Steps:
-  1. PROOF: render a synthetic single-sample impulse dry, measure spectral
-     flatness. Render known-frequency sines dry, measure the output's
-     actual spectral peak. Refuses to proceed to IR capture if flatness
-     does not exceed the prior best (wave 17, 0.552) -- matching the task's
-     "if the injection has failed, say so" requirement.
-  2. CAPTURE: sweep reverb type 0-5 x time (step 16, 9 steps), pure-wet
-     (drylevel=0, reverbsendlevel=127), pure-impulse excitation. Each
-     render already IS the impulse response -- no deconvolution. Trim each
-     one where its smoothed envelope falls ~28 dB below peak, apply a short
-     fade-out, resample to 48 kHz stereo, write under --out (default
-     calib/ir_synth/ -- a NEW directory, deliberately NOT overwriting the
-     existing deconvolution-based calib/ir/*.wav baseline, which
-     calibration.json / emit_presets.py already depend on and which this
-     task does not touch).
-  3. VALIDATE: render A.Piano 1 (internal index 0) both with its native
-     reverb intact (Hall1/type4, time 64) and dry, using the UNMODIFIED
-     ROM. Convolve the dry render with our captured type-4/time-64 IR and
-     compare against the real wet render: decay-envelope correlation and
-     per-band tail-spectrum ratios, reported against the task's stated
-     baseline (correlation 0.9532, low-band 80-250Hz ratio 1.43x).
+--stage chorus-depth (Gap 2 -- CHORUS_MAX_MOD_DEPTH's shape):
+  Pure-wet chorus (dry=0, chorussend=127) excited by an injected SINE (not
+  the impulse -- depth needs a sustained signal to see modulation over
+  multiple LFO cycles), sweeping chorusdepth. Measures stereo decorrelation
+  (RMS(L-R)/RMS(L+R)) -- the metric that finally measured cleanly after a
+  lag-tracking attempt (also tried here) failed like the two prior musical-
+  note attempts did. See cmd_chorus_depth's own module-level comment block.
+
+--stage delay (Gap 3 -- delay time/feedback/pan/stereoOffset):
+  Delay/Pan-Dly (reverb types 6-7) STAY PARAMETRIC (explicit product
+  decision: playability over freezing time/feedback/mix into an IR) but are
+  now measured from a pure-wet impulse response directly (the render's own
+  taps ARE the echo train -- no cross-correlation against a smeared note
+  attack needed) instead of the old note-based method, including a measured
+  (not analogised) DecentSampler stereoOffset. See cmd_delay_capture,
+  find_stereo_offset, cmd_delay_validate.
 
 Usage:
-  python3 tools/ir_capture.py --roms "<rom dir>" [--wave-inject build/wave_inject]
+  python3 tools/ir_capture.py --roms "<rom dir>" [--stage all|reverb|chorus-depth|delay]
+                               [--wave-inject build/wave_inject]
                                [--out calib/ir_synth] [--tmp /tmp/ir_capture]
+                               [--calibration-json calib/calibration.json] [--no-merge]
 """
 import argparse
 import json
@@ -44,15 +58,57 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from scipy.signal import fftconvolve, resample_poly
+from scipy.signal import fftconvolve, find_peaks, resample_poly
 
 SR = 64000
 IR_TARGET_SR = 48000
 IR_FADE_MS = 15
-IR_TRIM_DB = 28.0          # task spec: trim where smoothed envelope falls ~28dB below peak
+# Room-fidelity investigation (2026-07-29): the original 28dB trim was
+# measured, via a multi-patch reliability-filtered groundtruth sweep (see
+# cmd_groundtruth_multi below), to systematically starve LONGER reverb
+# tails: type4/Hall1 improved 0.7713->0.9249 and type5/Hall2 improved
+# 0.8739->0.9640 (mean decay-envelope correlation across several real
+# patches each) simply by raising this one number to 60dB, while the two
+# ROOM types -- which were hypothesised to be the ones hurt by early
+# trimming -- were UNAFFECTED or slightly improved (Room1 0.9635->0.9760,
+# Room2 0.9281->0.9307), never made worse. A sweep from 28 to 80dB (plus an
+# untrimmed control) shows correlation rising monotonically up to ~60dB and
+# then plateauing (60/70/80/untrimmed are all within +/-0.001 of each
+# other) -- 60dB captures essentially all of the achievable benefit without
+# shipping needlessly long IR files. See docs/ in the room-trim report for
+# the full sweep table.
+#
+# The reason this ended up being about DURATION, not proportional bite: the
+# validation window itself is anchored to where the REAL hardware's own
+# post-note-off decay first crosses -45dB (see cmd_groundtruth_multi's
+# DECAY_FLOOR_DB) -- a threshold materially DEEPER than the old 28dB IR
+# trim. Every captured IR was therefore missing real, audible decay content
+# in the -28..-45dB range, and a slow (long-RT60) reverb takes far longer
+# in absolute time to traverse that range than a fast one, so it lost
+# proportionally more of its true tail. Raising the trim past the
+# validation floor (with margin) fixes this for every type at once.
+IR_TRIM_DB = 60.0
 PRIOR_BEST_FLATNESS = 0.552   # wave 17, multi-pitch averaged + deconvolved (task brief)
 REVERB_TYPES = range(6)
 REVERB_TIME_STEPS = [0, 16, 32, 48, 64, 80, 96, 112, 127]
+REVERB_NAMES = ["Room1", "Room2", "Stage1", "Stage2", "Hall1", "Hall2"]
+# Full 8-entry name table (indices 6/7 are the delay types) -- matches
+# tools/emit_presets.py's own REVERB_NAMES exactly. Kept as a separate list
+# rather than extending REVERB_NAMES itself: several loops above iterate
+# `range(6)`/REVERB_TYPES against REVERB_NAMES and rely on it staying
+# reverb-only length 6.
+ALL_TYPE_NAMES = REVERB_NAMES + ["Delay", "Pan-Dly"]
+
+# Multi-patch groundtruth validation set for cmd_groundtruth_multi (gap 1).
+# One "named" representative patch per type (from the task brief) plus every
+# other internal patch that happens to use that reverb type, discovered at
+# runtime via `wave_inject effects` -- a single-patch test was already shown
+# to be misleading (task brief's own warning, confirmed here too: e.g. Hall1
+# alone via A.Piano 1 measures ~0.96-0.99, hiding a real, separate problem on
+# other Hall1 patches like Vibrobell). Capped per type to keep validation run
+# time reasonable.
+NAMED_REVERB_PATCH = {0: 3, 1: 4, 2: 38, 3: 9, 4: 0, 5: 1}
+MAX_PATCHES_PER_TYPE = 8
 
 
 # =============================================================================
@@ -332,13 +388,30 @@ def cmd_capture(wave_inject, roms, tmp, out_dir, args, excitation_latency):
             trimmed = trim_and_fade(x, SR)
             resampled = resample_poly(trimmed, up=3, down=4, axis=0)   # 64000 -> 48000
             dst = out_dir / f"reverb_t{t}_time_{raw:03d}.wav"
-            out16 = np.clip(np.round(resampled), -32768, 32767).astype(np.int16)
+            # soundfile.read() on a PCM_16 source (which every raw capture
+            # from wave_inject's wav_write_s16 is) normalizes samples to
+            # float64 in [-1, 1] -- NOT the raw int16 range. Writing
+            # `resampled` straight into an int16 file without rescaling
+            # first collapses every sample to 0 after rounding (confirmed:
+            # this bug was already present in the IR bank committed by the
+            # prior session -- every calib/ir_synth/*.wav file was silent,
+            # undetected because calibration.json's "reverb_ir" pointed at
+            # the OLD calib/ir/*.wav deconvolution bank instead, so nothing
+            # ever exercised this write path against real tests until this
+            # task wired ir_synth in as the shipped bank). Scale back up to
+            # int16 range before rounding/clipping.
+            out16 = np.clip(np.round(resampled * 32768.0), -32768, 32767).astype(np.int16)
             sf.write(str(dst), out16, IR_TARGET_SR, subtype="PCM_16")
             dur_raw = len(x) / SR
             dur_trim = len(trimmed) / SR
+            # A captured IR can be legitimately all-zero: at reverbtime 0 the
+            # JV produces no wet output whatsoever. Record that explicitly so
+            # the emitter can distinguish "no reverb here" from "reverb we
+            # failed to capture" -- convolving against silence at mix>0
+            # attenuates the dry signal instead of leaving it alone.
             bank[t][raw] = {"file": str(dst.relative_to(out_dir.parent)),
                             "raw_duration_s": dur_raw, "trimmed_duration_s": dur_trim,
-                            "rt60_s": rt60}
+                            "rt60_s": rt60, "silent": not bool(out16.any())}
             print(f"  t{t} time{raw:3d}: raw={dur_raw:6.3f}s -> trimmed={dur_trim:6.3f}s "
                   f"({100*dur_trim/dur_raw:5.1f}%), rt60={rt60}")
     return bank
@@ -372,94 +445,764 @@ def cmd_sanity_vs_baseline(bank, calibration_json):
               "an exact match, is the meaningful check here)")
 
 
-def cmd_groundtruth(wave_inject, roms, tmp, bank, args, excitation_latency):
-    print("\n=== VALIDATE: ground truth vs A.Piano 1 (index 0, Hall1/type4, time 64) ===")
-    gt_dir = tmp / "groundtruth"
-    gt_dir.mkdir(parents=True, exist_ok=True)
-    run_wave_inject(wave_inject, [
-        "groundtruth", "--roms", roms, "--patch-index", "0", "--out-dir", str(gt_dir)])
+DECAY_FLOOR_DB = -45.0   # per the task's validation method: decay region ends here
+GROUNDTRUTH_HOLD_SECONDS = 3.5   # matches wave_inject.cpp's groundtruth GridSpec.hold_seconds
+EFFECT_MAX_MIX = 0.5   # must match tools/emit_presets.py's own constant -- see its comment
+# A patch whose render_note tail exits within this long of note-off has
+# (almost always) an amplitude envelope that releases to silence almost
+# instantly for BOTH the wet and dry groundtruth render -- confirmed on
+# several concrete patches (Woody Bass 1/2, Clav 1, MIDI EPiano's own
+# Marimba SW cousin): render length settles at hold+~0.1s regardless of
+# reverb type, i.e. render_note's own quiet-run detector fired almost
+# immediately. There is then no real post-note-off decay left to compare at
+# all -- what's left is two near-silent, noise-floor-dominated signals whose
+# correlation is essentially meaningless (measured as low as -0.33 on such a
+# patch even though the SAME IR/type scored >0.97 on every patch with a real
+# tail). This is exactly the "record unmeasurable points as null" case, not
+# a genuine reconstruction failure -- skip them rather than let a handful of
+# degenerate patches dominate a type's reported mean.
+MIN_RELIABLE_DECAY_S = 0.15
 
-    wet_path = gt_dir / "groundtruth_wet.wav"
-    dry_path = gt_dir / "groundtruth_dry.wav"
-    ir_raw_path = tmp / "ir_raw" / "ir_t4_time_064.wav"
-    if not ir_raw_path.exists():
-        print(f"  MISSING {ir_raw_path} -- run capture first")
-        return None
 
-    wet, sr1 = sf.read(str(wet_path))
-    dry, sr2 = sf.read(str(dry_path))
-    ir, sr3 = sf.read(str(ir_raw_path))
-    assert sr1 == sr2 == sr3 == SR
+def _parse_last_json_line(stdout_text):
+    obj = None
+    for line in stdout_text.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                pass
+    return obj
 
-    wet_mono = wet.mean(axis=1)
-    dry_mono = dry.mean(axis=1)
-    # Strip the same fixed excitation latency stripped in cmd_capture (see
-    # its comment) -- using the UN-stripped raw IR here was the actual root
-    # cause of the first attempt's low correlation and implausible mid-band
-    # ratio: convolving against an IR with ~130-260 samples of pure
-    # voice-trigger silence glued onto its front shifts the ENTIRE
-    # reconstructed tail later by that amount relative to the real wet
-    # render, which has no such artificial delay (its reverb has been
-    # continuously excited by the dry signal for the whole hold, not
-    # freshly triggered at note-off).
-    ir_mono = ir.mean(axis=1)[excitation_latency:]
 
-    conv = fftconvolve(dry_mono, ir_mono, mode="full")[:len(dry_mono) + len(ir_mono) - 1]
+def run_groundtruth_render(wave_inject, roms, tmp, patch_index):
+    """Runs `wave_inject groundtruth --patch-index N`, returns
+    (wet_mono, dry_mono, effects_dict). effects_dict is the patch's own
+    native reverb_type/level/time/feedback plus per-tone tone_level/
+    reverb_send (see wave_inject.cpp's groundtruth stdout JSON) -- enough to
+    reproduce tools/emit_presets.py's own effective_send()/mix computation
+    exactly, so this validates what would actually ship, not an arbitrary
+    stand-in mix fraction."""
+    out_dir = tmp / f"groundtruth_{patch_index}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stdout, _ = run_wave_inject(wave_inject, [
+        "groundtruth", "--roms", roms, "--patch-index", str(patch_index),
+        "--out-dir", str(out_dir)])
+    effects = _parse_last_json_line(stdout)
+    if effects is None:
+        raise SystemExit(f"groundtruth --patch-index {patch_index}: no effects JSON on stdout")
+    wet, sr1 = sf.read(str(out_dir / "groundtruth_wet.wav"))
+    dry, sr2 = sf.read(str(out_dir / "groundtruth_dry.wav"))
+    assert sr1 == SR and sr2 == SR
+    return wet.mean(axis=1), dry.mean(axis=1), effects
 
-    hold_seconds = 3.5   # matches wave_inject.cpp's groundtruth GridSpec.hold_seconds
+
+def effective_send_from_effects(effects, which="reverb_send"):
+    """Mirrors tools/emit_presets.py's effective_send(): average `which`
+    across tones whose tone_level > 0 only."""
+    levels = effects["tone_level"]
+    sends = effects[which]
+    active = [s for s, lv in zip(sends, levels) if lv > 0]
+    return (sum(active) / len(active)) if active else 0.0
+
+
+def _amount(raw, ceiling=1.0):
+    return max(0.0, min(1.0, max(0.0, min(127, float(raw))) / 127.0 * ceiling))
+
+
+def reverb_mix_from_effects(effects):
+    """The convolution `mix` tools/emit_presets.py would actually emit for
+    this patch: amount(reverb_level) * effective_send/127, capped at the
+    same EFFECT_MAX_MIX equal-blend ceiling (see that module's own
+    docstring on why a full JV send maps to an EQUAL blend, not mix=1.0)."""
+    wet = _amount(effects["reverb_level"]) * (effective_send_from_effects(effects) / 127.0)
+    return max(0.0, min(1.0, _amount(wet) * EFFECT_MAX_MIX))
+
+
+def compare_decay_region(wet_mono, dry_mono, ir_mono, mix,
+                          hold_seconds=GROUNDTRUTH_HOLD_SECONDS,
+                          decay_floor_db=DECAY_FLOOR_DB,
+                          min_reliable_s=MIN_RELIABLE_DECAY_S):
+    """Reconstructs `dry*(1-mix) + convolved*mix` (the task's stated method,
+    using the SAME mix fraction emit_presets.py would ship) and compares it
+    against the real hardware's wet render over the decay region: from
+    note-off until the wet render's own envelope falls decay_floor_db below
+    its post-note-off peak (see the original single-patch version's comment
+    on why a fixed floor beats a fixed-duration window -- this reverb's tail
+    has a nonlinear noise floor around -47dB that a linear convolution can
+    never reproduce, so comparing past it measures noise-vs-noise, not
+    reconstruction accuracy).
+
+    Returns None (not a fabricated number) when the reference decay region
+    is too short to be a meaningful test at all -- see MIN_RELIABLE_DECAY_S's
+    comment above."""
     note_off = int(hold_seconds * SR)
+    if len(wet_mono) < note_off + int(min_reliable_s * SR):
+        return None   # render_note's own tail exited almost immediately -- nothing to compare
 
-    # Comparison window: from note-off until the REAL wet render's own
-    # envelope first drops DECAY_FLOOR_DB below its own post-note-off peak.
-    # A fixed multi-second window was tried first and is WRONG: this
-    # reverb's own tail has a nonlinear, non-decaying floor of roughly
-    # -50dB from ~1.3s onward (almost certainly the reverb algorithm's
-    # internal fixed-point quantization/limit-cycle noise -- something a
-    # perfectly linear IR convolution can never reproduce, since ours
-    # decays cleanly toward exact digital zero instead). Correlating deep
-    # into that floor measures "does a clean decay match a noise floor"
-    # instead of "does the decay SHAPE match", and (confirmed empirically)
-    # suppresses the correlation from 0.97 down to 0.92 for no reason
-    # related to injection accuracy. DECAY_FLOOR_DB=-45 sits just above
-    # where that floor kicks in (measured ~-47dB at 1.3s) so the window
-    # covers the genuine decay without reaching into hardware noise.
-    DECAY_FLOOR_DB = -45.0
+    conv = fftconvolve(dry_mono, ir_mono, mode="full")
+    n = max(len(dry_mono), len(conv))
+    dry_pad = np.zeros(n)
+    dry_pad[:len(dry_mono)] = dry_mono
+    conv_pad = np.zeros(n)
+    conv_pad[:len(conv)] = conv
+    recon = dry_pad * (1 - mix) + conv_pad * mix
+
     wet_env, wet_db = smoothed_db_envelope(wet_mono[note_off:note_off + int(6.0 * SR)])
-    below = np.where(wet_db <= DECAY_FLOOR_DB)[0]
+    below = np.where(wet_db <= decay_floor_db)[0]
     hop = 64
     window_samples = (int(below[0]) * hop) if len(below) else int(6.0 * SR)
-    window_samples = max(window_samples, int(0.3 * SR))   # never an unreasonably short window
-    print(f"  decay comparison window: {window_samples / SR:.3f}s "
-          f"(wet envelope's own -{-DECAY_FLOOR_DB:.0f}dB point after note-off)")
+    window_samples = max(window_samples, int(0.3 * SR))
+    if window_samples < int(min_reliable_s * SR):
+        return None   # degenerate: reference decayed below the floor almost immediately
 
-    # Peak-normalize each series' OWN tail independently before comparing
-    # shape (correlation is scale-invariant already; band ratios need this
-    # to mean anything, since our injected-impulse send level and the
-    # patch's own native reverbsendlevel are unrelated numbers).
     def norm_tail(x, start, n):
+        n = min(n, max(0, len(x) - start))
         t = x[start:start + n]
         peak = np.max(np.abs(t)) + 1e-12
         return t / peak
 
     wet_tail = norm_tail(wet_mono, note_off, window_samples)
-    conv_tail = norm_tail(conv, note_off, window_samples)
+    recon_tail = norm_tail(recon, note_off, window_samples)
+    corr = envelope_correlation(wet_tail, recon_tail)
 
-    corr = envelope_correlation(wet_tail, conv_tail)
-    print(f"  decay-envelope correlation: {corr:.4f}  (baseline to beat: 0.9532)")
-
-    bands = [("low (80-250Hz)", 80, 250), ("mid (250-2000Hz)", 250, 2000),
-             ("high (2000-8000Hz)", 2000, 8000)]
-    band_report = {}
+    bands = [("low_80_250", 80, 250), ("mid_250_2000", 250, 2000), ("high_2000_8000", 2000, 8000)]
+    band_ratios = {}
     for name, lo, hi in bands:
         e_wet = band_energy(wet_tail, SR, lo, hi)
-        e_conv = band_energy(conv_tail, SR, lo, hi)
-        ratio = e_conv / e_wet if e_wet > 0 else None
-        band_report[name] = ratio
-        marker = "  (baseline to beat: 1.43x, too high)" if "low" in name else ""
-        print(f"  {name} tail-energy ratio (synthetic-IR-driven / real-reverb): "
-              f"{ratio:.3f}x{marker}" if ratio is not None else f"  {name}: n/a")
+        e_recon = band_energy(recon_tail, SR, lo, hi)
+        band_ratios[name] = (e_recon / e_wet) if e_wet > 0 else None
 
-    return {"correlation": corr, "band_ratios": band_report}
+    return {"correlation": corr, "band_ratios": band_ratios, "window_s": window_samples / SR}
+
+
+def _nearest_step(raw_time):
+    return min(REVERB_TIME_STEPS, key=lambda k: abs(k - raw_time))
+
+
+def _interp_table(table, raw):
+    """Linear interpolation over a {str(raw): value} table, skipping None
+    entries -- a deliberate copy of tools/emit_presets.py's own interp_table
+    (not an import: this module treats emit_presets.py as a black box its
+    own tests exercise, and duplicating ~15 lines here is cheaper than a
+    cross-module coupling). Used by cmd_delay_validate/find_stereo_offset so
+    the delay-reconstruction validation looks up delay_time_s/delay_feedback
+    the SAME way (true interpolation, not nearest-step snapping) the shipped
+    preset actually would -- nearest-step snapping is fine for reverb_ir
+    (there is no choice, IRs are discrete files) but would be a needlessly
+    pessimistic stand-in here, where the real code path interpolates."""
+    pts = sorted((int(k), float(v)) for k, v in table.items() if v is not None)
+    if not pts:
+        raise ValueError("empty/all-null calibration table")
+    keys = [k for k, _ in pts]
+    vals = [v for _, v in pts]
+    if raw <= keys[0]:
+        return vals[0]
+    if raw >= keys[-1]:
+        return vals[-1]
+    for i in range(len(keys) - 1):
+        k0, k1 = keys[i], keys[i + 1]
+        if k0 <= raw <= k1:
+            if k1 == k0:
+                return vals[i]
+            t = (raw - k0) / (k1 - k0)
+            return vals[i] + t * (vals[i + 1] - vals[i])
+    return vals[-1]
+
+
+def _discover_test_patches(wave_inject, roms, tmp):
+    """Every internal patch's own native reverb type, via `wave_inject
+    effects` (one process call for the whole ROM) -- used to build a
+    multi-patch-per-type validation set rather than trusting a single named
+    patch, which the task brief explicitly warns is misleading."""
+    stdout, _ = run_wave_inject(wave_inject, ["effects", "--roms", roms])
+    by_type = {t: [] for t in range(8)}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        row = json.loads(line)
+        by_type[row["reverb_type"]].append(row["index"])
+    test_set = {}
+    for t in range(6):
+        named = NAMED_REVERB_PATCH[t]
+        rest = [i for i in by_type.get(t, []) if i != named]
+        test_set[t] = ([named] + rest)[:MAX_PATCHES_PER_TYPE]
+    return test_set
+
+
+def cmd_groundtruth_multi(wave_inject, roms, tmp, ir_bank_raw_dir, args, excitation_latency,
+                          trim_db_values=(28.0, IR_TRIM_DB)):
+    """Gap 1 validation: for every reverb type (0-5), against every
+    discovered patch that actually uses it, reconstruct `dry*(1-mix) +
+    convolved(dry, ir)*mix` and compare to the real hardware's wet render
+    over the decay region (see compare_decay_region). Reports per-type,
+    reliability-filtered means at each trim_db in `trim_db_values` (default:
+    the OLD 28dB default vs. the new IR_TRIM_DB), so before/after is a
+    genuine same-methodology comparison, not two different runs.
+    """
+    print("\n=== VALIDATE (multi-patch): reverb types 0-5 vs real hardware ===")
+    test_set = _discover_test_patches(wave_inject, roms, tmp)
+
+    gt_cache = {}
+    for t in range(6):
+        for idx in test_set[t]:
+            if idx in gt_cache:
+                continue
+            wet, dry, effects = run_groundtruth_render(wave_inject, roms, tmp, idx)
+            gt_cache[idx] = (wet, dry, effects, reverb_mix_from_effects(effects))
+
+    report = {}
+    for trim_db in trim_db_values:
+        print(f"\n--- trim_db={trim_db:.0f} ---")
+        type_report = {}
+        for t in range(6):
+            per_patch = []
+            n_skipped = 0
+            for idx in test_set[t]:
+                wet, dry, effects, mix = gt_cache[idx]
+                step = _nearest_step(effects["reverb_time"])
+                src = ir_bank_raw_dir / f"ir_t{t}_time_{step:03d}.wav"
+                if not src.exists():
+                    continue
+                raw_ir, sr = sf.read(str(src))
+                assert sr == SR
+                raw_ir = raw_ir[excitation_latency:]
+                ir_mono = trim_and_fade(raw_ir, SR, trim_db=trim_db).mean(axis=1)
+                result = compare_decay_region(wet, dry, ir_mono, mix)
+                if result is None:
+                    n_skipped += 1
+                    continue
+                per_patch.append((idx, effects["name"], result["correlation"]))
+            mean_corr = float(np.mean([c for _, _, c in per_patch])) if per_patch else None
+            type_report[REVERB_NAMES[t]] = {
+                "mean_correlation": mean_corr,
+                "n_reliable": len(per_patch),
+                "n_skipped_unreliable": n_skipped,
+                "per_patch": [{"index": i, "name": n, "correlation": round(c, 4)}
+                              for i, n, c in per_patch],
+            }
+            corr_str = f"{mean_corr:.4f}" if mean_corr is not None else "n/a"
+            print(f"  {REVERB_NAMES[t]:8s}  mean={corr_str}  "
+                  f"n_reliable={len(per_patch)} n_skipped={n_skipped}")
+        overall = [v["mean_correlation"] for v in type_report.values()
+                   if v["mean_correlation"] is not None]
+        print(f"  overall mean = {np.mean(overall):.4f}" if overall else "  overall mean = n/a")
+        report[f"trim_db_{trim_db:.0f}"] = type_report
+
+    return report
+
+
+# =============================================================================
+# GAP 2: chorus depth (CHORUS_MAX_MOD_DEPTH)
+#
+# Two prior attempts (documented in tools/emit_presets.py) tried to measure
+# how much chorusdepth (patch byte 17) actually modulates the chorus's delay
+# line, using a musical note as excitation, and both produced non-monotonic
+# garbage. With a clean injected sine (wave_inject's `sine` machinery, proven
+# accurate to <0.4% in the impulse-proof step) held through a PURE-WET chorus
+# (dry=0, chorussend=127, chorusfeedback=0), a direct lag-tracking attempt
+# (cross-correlating short windows of wet against dry to recover the
+# instantaneous delay) was tried FIRST here too, and also failed cleanly: the
+# recovered "lag" curve is dominated by a slow, non-periodic drift of
+# unknown origin (tens to hundreds of samples/second, varying between
+# renders) that swamps any real LFO-periodic signal -- fitting a sinusoid at
+# the KNOWN chorus rate (from chorus_rate_hz) to the detrended lag curve
+# gives a flat ~1-2 samples of "amplitude" at EVERY depth setting including
+# 0 and 127, i.e. no signal, matching the two prior failures' character.
+#
+# What DOES measure cleanly: stereo decorrelation. This chorus is a stereo
+# effect (independently modulated L/R delay lines -- confirmed by
+# tools/analyze_calibration.py's own docstring, "the JV-880 chorus is a
+# STEREO effect"), so a deeper LFO swing should measurably decorrelate L
+# from R even when the underlying carrier tone's own timbre/pitch is held
+# fixed. RMS(L-R)/RMS(L+R) over the pure-wet chorus render is a simple,
+# ENERGY-domain metric (no phase/cross-correlation involved, so none of the
+# periodicity-aliasing failure modes above apply) that turns out to be
+# cleanly, strongly MONOTONIC in raw chorusdepth, and reproduces almost
+# identically (normalized-shape correlation 0.999) across two independent,
+# unrelated carrier frequencies (50Hz and 200Hz) -- strong cross-validation
+# that this is a real, physical signal, not an artifact of one specific test
+# tone. See docs/ in the chorus-depth report for the full sweep.
+CHORUS_DEPTH_STEPS = [0, 16, 32, 48, 64, 80, 96, 112, 127]
+CHORUS_DEPTH_CARRIER_HZ = 200.0   # mid-range: strong, well-separated signal (see above)
+CHORUS_DEPTH_ANALYSIS_SKIP_S = 0.02   # skip the onset transient
+# A moderate MIDI key, NOT args.host_key (127): 127 is tuned for the IMPULSE
+# captures (minimal excitation WIDTH is what matters there), which is the
+# wrong criterion for a sustained sine at a specific target Hz -- confirmed
+# empirically, key=127 measured a noisy, non-monotonic width curve (3/8
+# violations) where key=60 (this constant) reproduces the clean, strongly
+# monotonic curve found during investigation (cross-validated at 0.999
+# shape-correlation between two independent carrier frequencies).
+CHORUS_DEPTH_KEY = 60
+
+
+def measure_stereo_width(stereo, skip_s=CHORUS_DEPTH_ANALYSIS_SKIP_S, max_s=None, sr=SR):
+    n0 = int(skip_s * sr)
+    n1 = len(stereo) if max_s is None else min(len(stereo), int(max_s * sr))
+    if n1 - n0 < int(0.01 * sr):
+        return None
+    l, r = stereo[n0:n1, 0], stereo[n0:n1, 1]
+    diff, ssum = l - r, l + r
+    denom = np.sqrt(np.mean(ssum ** 2)) + 1e-12
+    return float(np.sqrt(np.mean(diff ** 2)) / denom)
+
+
+def normalize_0_1(values):
+    """Linear min-clip-then-scale to [0, 1] by the sweep's own maximum --
+    matches tools/analyze_calibration.py's own helper of the same name and
+    the same convention already used by chorus_mix/reverb_wet: raw=0 is NOT
+    forced to exactly 0.0 if it genuinely measures a nonzero floor (a real,
+    small STATIC L/R offset this chorus implementation has even with zero
+    LFO swing -- confirmed present, and roughly proportional to carrier
+    frequency, at both tested carriers -- not fabricated away)."""
+    arr = np.clip(np.array(values, dtype=np.float64), 0.0, None)
+    mx = arr.max() if len(arr) else 0.0
+    if mx <= 1e-9:
+        return [0.0] * len(values)
+    return (arr / mx).tolist()
+
+
+def cmd_chorus_depth(wave_inject, roms, tmp, args):
+    print("\n=== GAP 2: chorus depth (stereo decorrelation vs raw chorusdepth) ===")
+    out_dir = tmp / "chorus_depth"
+    run_wave_inject(wave_inject, [
+        "capture-chorus-depth", "--roms", roms, "--wavegroup", "0",
+        "--wavenumber", str(args.host_wavenumber), "--key", str(CHORUS_DEPTH_KEY),
+        "--freq", str(CHORUS_DEPTH_CARRIER_HZ), "--amp", "100000", "--out-dir", str(out_dir)])
+
+    widths = {}
+    for raw in CHORUS_DEPTH_STEPS:
+        wet, sr = sf.read(str(out_dir / f"chorus_depth_wet_{raw:03d}.wav"))
+        assert sr == SR
+        w = measure_stereo_width(wet)
+        widths[raw] = w
+        print(f"  raw={raw:3d}  stereo_width={w}")
+
+    measured = [raw for raw in CHORUS_DEPTH_STEPS if widths[raw] is not None]
+    if len(measured) < len(CHORUS_DEPTH_STEPS):
+        print(f"  WARNING: {len(CHORUS_DEPTH_STEPS) - len(measured)} depth steps unmeasurable "
+              f"(render too short) -- omitting, not fabricating")
+
+    norm_values = normalize_0_1([widths[raw] for raw in measured])
+    chorus_depth_norm = {str(raw): round(v, 4) for raw, v in zip(measured, norm_values)}
+
+    # Monotonicity check (printed, not enforced here -- tests/test_calibration.py
+    # asserts on the shape of whatever this writes to calibration.json).
+    vals = [chorus_depth_norm[str(raw)] for raw in measured]
+    violations = sum(1 for a, b in zip(vals, vals[1:]) if b < a - 1e-6)
+    print(f"  normalized (0..1): {chorus_depth_norm}")
+    print(f"  monotonicity violations: {violations} / {len(vals) - 1} transitions")
+    print(f"  raw=0 floor (static L/R offset, not fabricated to 0): "
+          f"{chorus_depth_norm.get('0')}")
+
+    return {"chorus_depth_norm": chorus_depth_norm, "raw_stereo_width": widths,
+            "carrier_hz": CHORUS_DEPTH_CARRIER_HZ, "monotonicity_violations": violations}
+
+
+# =============================================================================
+# GAP 3: delay (types 6/7) -- stays PARAMETRIC per an explicit product
+# decision (playability: a convolution IR freezes time/feedback/mix, a
+# parametric delay stays adjustable in DecentSampler, and a delay genuinely
+# IS time+feedback+pan -- only the NUMBERS were ever unvalidated). This
+# section re-measures delay_time_s/delay_feedback/delay_pan_alternation
+# using the clean injected impulse (pure-wet, so the render IS the echo
+# train directly -- no cross-correlation against a smeared note attack
+# needed), and derives a measured stereoOffset instead of a reasoned guess.
+DELAY_TYPES = (6, 7)
+DELAY_TIME_STEPS = [0, 16, 32, 48, 64, 80, 96, 112, 127]
+DELAY_FIXED_TIME_RAW = 64   # matches tools/calibrate.cpp's own feedback-sweep convention
+# 2% of the render's own peak: comfortably above the render's actual noise
+# floor (measured ~-78dB below peak on these synthetic-impulse renders --
+# there is essentially no noise at all in this path, see the flatness
+# proof's -227dB isolation figure) but low enough to recover genuine,
+# audible low-amplitude repeats. An earlier, more conservative 0.06 (-24dB)
+# missed real decaying taps on several patches (e.g. type6 raw=32 has a
+# clean, real ~0.5 per-repeat decay visible down to -34dB and beyond) and
+# fed measure_feedback_gain_from_taps too few points, collapsing several
+# genuinely nonzero feedback settings to a fabricated-looking 0.0 floor and
+# visibly hurting the delay-reconstruction validation (patch "B Analog Seq"
+# dropped to a NEGATIVE decay-region correlation when its real ~0.5
+# per-repeat decay was floored away).
+DELAY_TAP_PROMINENCE_FRAC = 0.02
+DELAY_TAP_MERGE_SAMPLES = 8   # merges a multi-sample-wide single spike into one tap
+
+
+def find_delay_taps(stereo, prominence_frac=DELAY_TAP_PROMINENCE_FRAC,
+                    merge_samples=DELAY_TAP_MERGE_SAMPLES):
+    """Peak-picks discrete echo taps directly from a pure-wet, impulse-
+    excited Delay/Pan-Dly render: since the excitation IS a single impulse,
+    the render's own combined |L|,|R| envelope is literally the echo train
+    (a spike at each repeat), so no matched filtering/cross-correlation
+    against a note's own attack shape is needed (contrast the old note-based
+    method in tools/analyze_calibration.py). Returns a list of
+    (sample_index, amplitude, l_amplitude, r_amplitude), earliest first."""
+    combined = np.maximum(np.abs(stereo[:, 0]), np.abs(stereo[:, 1]))
+    peak_amp = combined.max()
+    if peak_amp < 1e-9:
+        return []
+    peaks, _ = find_peaks(combined, prominence=peak_amp * prominence_frac)
+    merged = []
+    for p in peaks:
+        if merged and p - merged[-1][0] <= merge_samples:
+            if combined[p] > merged[-1][1]:
+                merged[-1] = (p, combined[p])
+        else:
+            merged.append((p, combined[p]))
+    return [(int(p), float(a), float(np.abs(stereo[p, 0])), float(np.abs(stereo[p, 1])))
+            for p, a in merged]
+
+
+def measure_feedback_gain_from_taps(taps, skip_first=0):
+    """Per-repeat gain g via a log-linear fit of tap amplitude vs. tap
+    index, skipping the first `skip_first` taps -- Pan-Dly's first "there
+    and back" pair is a fixed, feedback-INDEPENDENT artifact of its ping-
+    pong routing (see the old analyze_calibration.py's own note on this,
+    confirmed there via a full feedback sweep, and cmd_delay_capture below
+    which only applies skip_first=2 for type 7 -- plain Delay/type 6 has no
+    such quirk and every tap is a genuine repeat).
+
+    Fewer than 3 taps surviving past the skipped ones is a REAL, physically
+    meaningful floor (no reliable additional-repeat trend is audible within
+    a 6-second capture at this feedback setting), reported as 0.0 -- not a
+    fabricated number, the genuine "no additional repeats" case the old
+    windowed-energy-ratio method's own docstring already described. A 2-point
+    "fit" was tried and rejected: on type 7 at low feedback it produced
+    wildly unstable, NON-monotonic readings (0.999 at raw16/32, dropping to
+    0.664 at raw48) because two isolated points either side of the noise
+    floor give an arbitrary slope, not a trend -- 3 points is the minimum for
+    a fit that isn't just connecting two dots."""
+    n_after = len(taps) - skip_first
+    if n_after <= 2:
+        return 0.0
+    idx = np.arange(len(taps))[skip_first:]
+    amps = np.array([a for _, a, _, _ in taps])[skip_first:]
+    amps = np.clip(amps, 1e-6, None)
+    slope, _ = np.polyfit(idx, np.log10(amps), 1)
+    g = 10.0 ** slope
+    return float(np.clip(g, 0.0, 0.999))
+
+
+def measure_pan_alternation_from_taps(taps, skip_first=1):
+    """max-min of each tap's L fraction (L/(L+R)) -- the exact-position
+    version of the old analyze_calibration.py's measure_pan_alternation,
+    which had to assume repeats land at exact multiples of a separately
+    measured period; here each tap's own detected sample position is used
+    directly."""
+    fracs = []
+    for _, _, l, r in taps[skip_first:]:
+        tot = l + r
+        if tot < 1e-6:
+            continue
+        fracs.append(l / tot)
+    if len(fracs) < 2:
+        return None
+    return float(max(fracs) - min(fracs))
+
+
+def cmd_delay_capture(wave_inject, roms, tmp, args, excitation_latency):
+    print("\n=== GAP 3: delay time/feedback/pan (direct peak-picking on a pure-wet impulse) ===")
+    out_dir = tmp / "delay_raw"
+    run_wave_inject(wave_inject, [
+        "capture-delay", "--roms", roms, "--wavegroup", "0",
+        "--wavenumber", str(args.host_wavenumber), "--key", str(args.host_key),
+        "--n", "8", "--amp-i", "127", "--out-dir", str(out_dir)])
+
+    delay_time_s = {}
+    delay_feedback = {}
+    delay_pan_alternation = {}
+    for t in DELAY_TYPES:
+        time_table = {}
+        for raw in DELAY_TIME_STEPS:
+            stereo, sr = sf.read(str(out_dir / f"delay_t{t}_time_{raw:03d}.wav"))
+            assert sr == SR
+            taps = find_delay_taps(stereo[excitation_latency:])
+            if not taps:
+                print(f"  WARNING: type={t} raw={raw}: delay time unmeasurable "
+                      f"(no tap found) -- recording null, not a fabricated number")
+                time_table[str(raw)] = None
+                continue
+            time_table[str(raw)] = round(taps[0][0] / SR, 4)
+        delay_time_s[str(t)] = time_table
+        print(f"  type {t} delay_time_s: {time_table}")
+
+        stereo_fb, sr = sf.read(str(out_dir / f"delay_t{t}_feedback_127.wav"))
+        taps_fb127 = find_delay_taps(stereo_fb[excitation_latency:])
+        pan_alt = measure_pan_alternation_from_taps(taps_fb127)
+        delay_pan_alternation[str(t)] = round(pan_alt, 4) if pan_alt is not None else None
+        print(f"  type {t} delay_pan_alternation (from {len(taps_fb127)} taps @ feedback=127): "
+              f"{delay_pan_alternation[str(t)]}")
+
+        # Pan-Dly's (type 7) first two taps are a fixed, feedback-independent
+        # "there and back" ping-pong pair (see measure_feedback_gain_from_taps'
+        # docstring); plain Delay (type 6) has no such quirk.
+        skip_first = 2 if t == 7 else 0
+        fb_table = {}
+        for raw in DELAY_TIME_STEPS:
+            stereo_fb, sr = sf.read(str(out_dir / f"delay_t{t}_feedback_{raw:03d}.wav"))
+            taps = find_delay_taps(stereo_fb[excitation_latency:])
+            g = measure_feedback_gain_from_taps(taps, skip_first=skip_first)
+            fb_table[str(raw)] = round(g, 4)
+        delay_feedback[str(t)] = fb_table
+        print(f"  type {t} delay_feedback: {fb_table}")
+
+    return {"delay_time_s": delay_time_s, "delay_feedback": delay_feedback,
+            "delay_pan_alternation": delay_pan_alternation, "raw_dir": str(out_dir)}
+
+
+def synth_delay_ir(delay_s, feedback, sr=SR, n_repeats=40):
+    """A finite-length FIR approximation of a single-channel feedback delay
+    (DecentSampler's own `delay` effect, per its developer guide) -- a spike
+    at every multiple of delay_s, decaying by `feedback` per repeat. Used
+    only to SIMULATE what DecentSampler's delay effect would sound like for
+    a candidate stereoOffset, so its measured stereo width can be compared
+    against the real hardware's -- not used anywhere in the shipped
+    pipeline itself (emit_presets.py just sets the effect's own parameters;
+    DecentSampler does this exact computation on playback)."""
+    d = max(1, int(round(delay_s * sr)))
+    length = d * n_repeats + 1
+    ir = np.zeros(length)
+    g = 1.0
+    for k in range(n_repeats):
+        idx = d * (k + 1)
+        if idx >= length or g < 1e-4:
+            break
+        ir[idx] = g
+        g *= feedback
+    return ir
+
+
+def simulate_ds_delay_width(dry_mono, delay_time_s, feedback, stereo_offset_s,
+                            note_off_sample, window_samples, sr=SR):
+    """Simulates DecentSampler's delay effect (independent per-channel taps,
+    L = delayTime - stereoOffset/2, R = delayTime + stereoOffset/2 -- per
+    the official developer guide's own worked example) applied to a mono
+    dry signal, and measures the SAME stereo-width metric used for the
+    chorus-depth measurement (RMS(L-R)/RMS(L+R)) over the same decay window
+    used for groundtruth validation, so it is directly comparable to a
+    measurement of the real hardware's own wet render."""
+    l_delay = max(0.0003, delay_time_s - stereo_offset_s / 2.0)
+    r_delay = max(0.0003, delay_time_s + stereo_offset_s / 2.0)
+    ir_l = synth_delay_ir(l_delay, feedback, sr)
+    ir_r = synth_delay_ir(r_delay, feedback, sr)
+    wet_l = fftconvolve(dry_mono, ir_l, mode="full")
+    wet_r = fftconvolve(dry_mono, ir_r, mode="full")
+    n = min(len(wet_l), len(wet_r))
+    stereo = np.stack([wet_l[:n], wet_r[:n]], axis=1)
+    return measure_stereo_width(stereo, skip_s=note_off_sample / sr,
+                                max_s=(note_off_sample + window_samples) / sr, sr=sr)
+
+
+def find_stereo_offset(wave_inject, roms, tmp, pan_dly_patch_indices, delay_time_table,
+                       feedback_table, candidates_s=None):
+    """Measures the real hardware's own stereo width on Pan-Dly groundtruth
+    renders (native reverb intact, chorus disabled -- same renders used for
+    the parametric validation below), then finds which candidate DS
+    stereoOffset value makes the SIMULATED parametric delay's width closest
+    to that real measurement -- i.e. measured, not analogised from the
+    developer guide's own generic example. DS's stereoOffset is a TIME
+    offset between channels and structurally CANNOT reproduce true hard
+    ping-pong alternation (a per-repeat amplitude pan), so this reports how
+    close the best achievable value gets, honestly, rather than pretending
+    a time offset can fully substitute for a pan swing.
+    """
+    if candidates_s is None:
+        candidates_s = [0.0, 0.002, 0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.1]
+    print("\n--- stereoOffset search (type 7 / Pan-Dly) ---")
+    results = []
+    for idx in pan_dly_patch_indices:
+        wet, dry, effects = run_groundtruth_render(wave_inject, roms, tmp, idx)
+        note_off = int(GROUNDTRUTH_HOLD_SECONDS * SR)
+        if len(wet) < note_off + int(MIN_RELIABLE_DECAY_S * SR):
+            print(f"  patch {idx}: unreliable (render exited almost immediately) -- skipped")
+            continue
+        wet_env, wet_db = smoothed_db_envelope(wet[note_off:note_off + int(6.0 * SR)])
+        below = np.where(wet_db <= DECAY_FLOOR_DB)[0]
+        hop = 64
+        window_samples = (int(below[0]) * hop) if len(below) else int(6.0 * SR)
+        window_samples = max(window_samples, int(0.3 * SR))
+
+        wet_stereo, _ = sf.read(str(tmp / f"groundtruth_{idx}" / "groundtruth_wet.wav"))
+        real_width = measure_stereo_width(wet_stereo, skip_s=note_off / SR,
+                                          max_s=(note_off + window_samples) / SR)
+        if real_width is None:
+            continue
+
+        try:
+            delay_time = _interp_table(delay_time_table, effects["reverb_time"])
+            feedback = _interp_table(feedback_table, effects["reverb_feedback"])
+        except ValueError:
+            print(f"  patch {idx}: missing delay_time_s/delay_feedback lookup -- skipped")
+            continue
+
+        best_so, best_diff, best_width = None, None, None
+        for so in candidates_s:
+            sim_width = simulate_ds_delay_width(dry, delay_time, feedback, so,
+                                                note_off, window_samples)
+            if sim_width is None:
+                continue
+            diff = abs(sim_width - real_width)
+            if best_diff is None or diff < best_diff:
+                best_diff, best_so, best_width = diff, so, sim_width
+        results.append({"patch": idx, "name": effects["name"], "real_width": real_width,
+                        "best_stereo_offset_s": best_so, "sim_width_at_best": best_width,
+                        "delay_time_s": delay_time, "feedback": feedback})
+        print(f"  patch {idx} ({effects['name']}): real_width={real_width:.4f}  "
+              f"best_stereoOffset={best_so}s (sim_width={best_width:.4f})  "
+              f"delayTime={delay_time}s feedback={feedback}")
+    return results
+
+
+def compare_decay_region_delay(wet_mono, dry_mono, delay_time_s, feedback, wet_level,
+                               stereo_offset_s=0.0, hold_seconds=GROUNDTRUTH_HOLD_SECONDS,
+                               decay_floor_db=DECAY_FLOOR_DB, min_reliable_s=MIN_RELIABLE_DECAY_S):
+    """Same decay-region comparison as compare_decay_region (reverb/
+    convolution), but for the PARAMETRIC delay reconstruction: DecentSampler's
+    `delay` effect return is ADDITIVE (wetLevel), like reverb's, not a BLEND
+    like chorus/convolution's `mix` -- see tools/emit_presets.py's own
+    comment on send-vs-mix semantics. Reconstruction is therefore
+    `dry + delay_tap_signal * wet_level`, averaging the simulated L/R taps to
+    mono for a like-for-like comparison against the (already mono-summed)
+    wet reference."""
+    note_off = int(hold_seconds * SR)
+    if len(wet_mono) < note_off + int(min_reliable_s * SR):
+        return None
+    l_delay = max(0.0003, delay_time_s - stereo_offset_s / 2.0)
+    r_delay = max(0.0003, delay_time_s + stereo_offset_s / 2.0)
+    ir_l = synth_delay_ir(l_delay, feedback)
+    ir_r = synth_delay_ir(r_delay, feedback)
+    tap_l = fftconvolve(dry_mono, ir_l, mode="full")
+    tap_r = fftconvolve(dry_mono, ir_r, mode="full")
+    n = max(len(dry_mono), len(tap_l), len(tap_r))
+    dry_pad = np.zeros(n)
+    dry_pad[:len(dry_mono)] = dry_mono
+    tap_mono = np.zeros(n)
+    tap_mono[:len(tap_l)] += tap_l * 0.5
+    tap_mono[:len(tap_r)] += tap_r * 0.5
+    recon = dry_pad + tap_mono * wet_level
+
+    wet_env, wet_db = smoothed_db_envelope(wet_mono[note_off:note_off + int(6.0 * SR)])
+    below = np.where(wet_db <= decay_floor_db)[0]
+    hop = 64
+    window_samples = (int(below[0]) * hop) if len(below) else int(6.0 * SR)
+    window_samples = max(window_samples, int(0.3 * SR))
+    if window_samples < int(min_reliable_s * SR):
+        return None
+
+    def norm_tail(x, start, n):
+        n = min(n, max(0, len(x) - start))
+        t = x[start:start + n]
+        peak = np.max(np.abs(t)) + 1e-12
+        return t / peak
+
+    wet_tail = norm_tail(wet_mono, note_off, window_samples)
+    recon_tail = norm_tail(recon, note_off, window_samples)
+    corr = envelope_correlation(wet_tail, recon_tail)
+    bands = [("low_80_250", 80, 250), ("mid_250_2000", 250, 2000), ("high_2000_8000", 2000, 8000)]
+    band_ratios = {}
+    for name, lo, hi in bands:
+        e_wet = band_energy(wet_tail, SR, lo, hi)
+        e_recon = band_energy(recon_tail, SR, lo, hi)
+        band_ratios[name] = (e_recon / e_wet) if e_wet > 0 else None
+    return {"correlation": corr, "band_ratios": band_ratios, "window_s": window_samples / SR}
+
+
+def _discover_delay_test_patches(wave_inject, roms, tmp, max_per_type=6):
+    stdout, _ = run_wave_inject(wave_inject, ["effects", "--roms", roms])
+    by_type = {6: [], 7: []}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        row = json.loads(line)
+        if row["reverb_type"] in by_type:
+            by_type[row["reverb_type"]].append(row)
+    # Prefer patches with SOME feedback (>0) so the reconstruction is
+    # actually tested against multiple repeats, not just a single tap --
+    # but keep a couple of feedback=0 patches too for coverage.
+    out = {}
+    for t in (6, 7):
+        rows = sorted(by_type[t], key=lambda r: -r["reverb_feedback"])
+        out[t] = [r["index"] for r in rows[:max_per_type]]
+    return out
+
+
+def cmd_delay_validate(wave_inject, roms, tmp, delay_time_s, delay_feedback,
+                       stereo_offset_by_type):
+    print("\n=== GAP 3 VALIDATE: parametric delay reconstruction vs real hardware ===")
+    test_set = _discover_delay_test_patches(wave_inject, roms, tmp)
+    report = {}
+    for t in DELAY_TYPES:
+        per_patch = []
+        n_skipped = 0
+        for idx in test_set[t]:
+            wet, dry, effects = run_groundtruth_render(wave_inject, roms, tmp, idx)
+            try:
+                dt = _interp_table(delay_time_s.get(str(t), {}), effects["reverb_time"])
+                fb = _interp_table(delay_feedback.get(str(t), {}), effects["reverb_feedback"])
+            except ValueError:
+                n_skipped += 1
+                continue
+            wet_level = max(0.0, min(1.0, _amount(effects["reverb_level"]) *
+                                     (effective_send_from_effects(effects) / 127.0)))
+            so = stereo_offset_by_type.get(t, 0.0)
+            result = compare_decay_region_delay(wet, dry, dt, fb, wet_level, stereo_offset_s=so)
+            if result is None:
+                n_skipped += 1
+                continue
+            per_patch.append((idx, effects["name"], result["correlation"]))
+        mean_corr = float(np.mean([c for _, _, c in per_patch])) if per_patch else None
+        report[t] = {"mean_correlation": mean_corr, "n_reliable": len(per_patch),
+                    "n_skipped": n_skipped,
+                    "per_patch": [{"index": i, "name": n, "correlation": round(c, 4)}
+                                  for i, n, c in per_patch]}
+        corr_str = f"{mean_corr:.4f}" if mean_corr is not None else "n/a"
+        print(f"  type {t} ({ALL_TYPE_NAMES[t]}): mean={corr_str}  "
+              f"n_reliable={len(per_patch)} n_skipped={n_skipped}  "
+              f"indiv={[(i, round(c, 3)) for i, _, c in per_patch]}")
+    return report
+
+
+def merge_into_calibration_json(calibration_json_path, report, out_dir):
+    """Writes this tool's measured tables into calib/calibration.json,
+    alongside (not replacing) the tables tools/analyze_calibration.py still
+    owns (chorus_rate_hz, reverb_rt60, etc. -- unrelated calibrate.cpp-driven
+    sweeps this task does not touch). Only overwrites the keys this tool
+    actually produced this run, so a partial run (e.g. --stage chorus-depth
+    alone) never clobbers tables it didn't recompute."""
+    cal = json.loads(calibration_json_path.read_text()) if calibration_json_path.exists() else {}
+
+    if "ir_bank" in report:
+        reverb_ir, reverb_ir_silent = {}, {}
+        for t in REVERB_TYPES:
+            table, silent = {}, []
+            for raw in REVERB_TIME_STEPS:
+                entry = report["ir_bank"].get(t, {}).get(raw)
+                if entry is None:
+                    table[str(raw)] = None
+                    continue
+                rel = Path(entry["file"])   # e.g. "ir_synth/reverb_t0_time_000.wav"
+                table[str(raw)] = str(rel)
+                if entry.get("silent"):
+                    silent.append(raw)
+            reverb_ir[str(t)] = table
+            reverb_ir_silent[str(t)] = silent
+        cal["reverb_ir"] = reverb_ir
+        cal["reverb_ir_silent"] = reverb_ir_silent
+
+    if "chorus_depth" in report:
+        cal["chorus_depth_norm"] = report["chorus_depth"]["chorus_depth_norm"]
+
+    if "delay_capture" in report:
+        cal["delay_time_s"] = report["delay_capture"]["delay_time_s"]
+        cal["delay_feedback"] = report["delay_capture"]["delay_feedback"]
+        cal["delay_pan_alternation"] = report["delay_capture"]["delay_pan_alternation"]
+    if "chosen_pan_dly_stereo_offset_s" in report:
+        cal["pan_dly_stereo_offset_s"] = round(report["chosen_pan_dly_stereo_offset_s"], 4)
+
+    calibration_json_path.write_text(json.dumps(cal, indent=2) + "\n")
+    print(f"\nMerged into {calibration_json_path}")
 
 
 def main():
@@ -469,14 +1212,20 @@ def main():
     ap.add_argument("--wave-inject", default="build/wave_inject")
     ap.add_argument("--out", default="calib/ir_synth")
     ap.add_argument("--tmp", default="/tmp/ir_capture")
+    ap.add_argument("--calibration-json", default="calib/calibration.json")
     ap.add_argument("--host-wavenumber", type=int, default=50,
                     help="wavegroup-0 wave slot to host the injected content (default: 50, "
                          "length 8852 samples, comfortable headroom)")
     ap.add_argument("--host-key", type=int, default=127,
                     help="MIDI key for the impulse proof / IR capture (127: minimal-width "
                          "excitation -- see the proof step's own findings)")
-    ap.add_argument("--skip-capture", action="store_true")
-    ap.add_argument("--skip-groundtruth", action="store_true")
+    ap.add_argument("--stage", default="all",
+                    choices=["all", "reverb", "chorus-depth", "delay"],
+                    help="which gap to run (default: all three)")
+    ap.add_argument("--skip-capture", action="store_true", help="reverb: skip re-capturing IRs")
+    ap.add_argument("--skip-groundtruth", action="store_true", help="reverb: skip validation")
+    ap.add_argument("--no-merge", action="store_true",
+                    help="don't write results into calibration.json (report only)")
     args = ap.parse_args()
 
     wave_inject = Path(args.wave_inject).resolve()
@@ -491,25 +1240,51 @@ def main():
     report["proof"] = cmd_proof(wave_inject, args.roms, tmp, args)
 
     if not report["proof"]["passed"]:
-        print("\nPROOF FAILED -- refusing to proceed to IR capture (per task instructions: "
-              "'if you cannot exceed the current 0.552 baseline, the injection has failed "
-              "and you should say so rather than proceed').")
+        print("\nPROOF FAILED -- refusing to proceed (per task instructions: 'if you cannot "
+              "exceed the current 0.552 baseline, the injection has failed and you should say "
+              "so rather than proceed').")
         Path("calib").mkdir(exist_ok=True)
         (out_dir.parent / "ir_synth_report.json").write_text(json.dumps(report, indent=2, default=str))
         sys.exit(1)
 
     excitation_latency = report["proof"]["excitation_latency_samples"]
 
-    if not args.skip_capture:
-        bank = cmd_capture(wave_inject, args.roms, tmp, out_dir, args, excitation_latency)
-        report["ir_bank"] = bank
-        cmd_sanity_vs_baseline(bank, Path("calib/calibration.json"))
-    else:
-        bank = {}
+    if args.stage in ("all", "reverb"):
+        if not args.skip_capture:
+            bank = cmd_capture(wave_inject, args.roms, tmp, out_dir, args, excitation_latency)
+            report["ir_bank"] = bank
+            cmd_sanity_vs_baseline(bank, Path("calib/calibration.json"))
+        else:
+            bank = {}
 
-    if not args.skip_groundtruth and not args.skip_capture:
-        gt = cmd_groundtruth(wave_inject, args.roms, tmp, bank, args, excitation_latency)
-        report["groundtruth"] = gt
+        if not args.skip_groundtruth:
+            raw_dir = tmp / "ir_raw"
+            report["groundtruth_multi"] = cmd_groundtruth_multi(
+                wave_inject, args.roms, tmp, raw_dir, args, excitation_latency)
+
+    if args.stage in ("all", "chorus-depth"):
+        report["chorus_depth"] = cmd_chorus_depth(wave_inject, args.roms, tmp, args)
+
+    if args.stage in ("all", "delay"):
+        delay_cap = cmd_delay_capture(wave_inject, args.roms, tmp, args, excitation_latency)
+        report["delay_capture"] = delay_cap
+
+        pan_dly_patches = _discover_delay_test_patches(wave_inject, args.roms, tmp, max_per_type=6)[7]
+        so_results = find_stereo_offset(wave_inject, args.roms, tmp, pan_dly_patches,
+                                        delay_cap["delay_time_s"]["7"], delay_cap["delay_feedback"]["7"])
+        report["stereo_offset_search"] = so_results
+        measured_so = [r["best_stereo_offset_s"] for r in so_results if r["best_stereo_offset_s"] is not None]
+        chosen_so = float(np.median(measured_so)) if measured_so else 0.0
+        report["chosen_pan_dly_stereo_offset_s"] = chosen_so
+        print(f"\n  chosen Pan-Dly stereoOffset (median of {len(measured_so)} patches): "
+              f"{chosen_so:.4f}s")
+
+        report["delay_validate"] = cmd_delay_validate(
+            wave_inject, args.roms, tmp, delay_cap["delay_time_s"], delay_cap["delay_feedback"],
+            {6: 0.0, 7: chosen_so})
+
+    if not args.no_merge:
+        merge_into_calibration_json(Path(args.calibration_json), report, out_dir)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "summary.json"

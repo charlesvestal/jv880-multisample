@@ -17,15 +17,15 @@
     "127": 9.4185
   },
   "chorus_depth_norm": {
-    "0": 1.0,
-    "16": 0.7348,
-    "32": 0.735,
-    "48": 0.7204,
-    "64": 0.6999,
-    "80": 0.6813,
-    "96": 0.6789,
-    "112": 0.7395,
-    "127": 0.6941
+    "0": 0.1335,
+    "16": 0.2049,
+    "32": 0.3248,
+    "48": 0.4446,
+    "64": 0.519,
+    "80": 0.6491,
+    "96": 0.7827,
+    "112": 0.8503,
+    "127": 1.0
   },
   "chorus_mix": {
     "0": 0.0,
@@ -119,122 +119,143 @@
   },
   "delay_time_s": {
     "6": {
-      "0": null,
+      "0": 0.0002,
       "16": 0.0611,
-      "32": 0.1221,
-      "48": 0.183,
-      "64": 0.2475,
-      "80": 0.3085,
-      "96": 0.3695,
-      "112": 0.4305,
-      "127": 0.4875
+      "32": 0.1222,
+      "48": 0.1831,
+      "64": 0.2477,
+      "80": 0.3088,
+      "96": 0.3698,
+      "112": 0.4306,
+      "127": 0.4878
     },
     "7": {
-      "0": null,
-      "16": 0.0305,
-      "32": 0.061,
-      "48": 0.0915,
+      "0": 0.0003,
+      "16": 0.0307,
+      "32": 0.0613,
+      "48": 0.0917,
       "64": 0.124,
-      "80": 0.1545,
-      "96": 0.185,
+      "80": 0.1546,
+      "96": 0.1851,
       "112": 0.2155,
-      "127": 0.244
+      "127": 0.2442
     }
   },
   "delay_feedback": {
     "6": {
       "0": 0.0,
       "16": 0.0,
-      "32": 0.0,
-      "48": 0.0,
-      "64": 0.0,
-      "80": 0.6173,
-      "96": 0.7345,
-      "112": 0.8594,
-      "127": 0.9844
+      "32": 0.2344,
+      "48": 0.3591,
+      "64": 0.4842,
+      "80": 0.6093,
+      "96": 0.7342,
+      "112": 0.8593,
+      "127": 0.999
     },
     "7": {
       "0": 0.0,
       "16": 0.0,
-      "32": 0.525,
-      "48": 0.6,
-      "64": 0.6949,
-      "80": 0.7788,
-      "96": 0.8555,
-      "112": 0.9256,
-      "127": 0.9911
+      "32": 0.5597,
+      "48": 0.6263,
+      "64": 0.7035,
+      "80": 0.7836,
+      "96": 0.8576,
+      "112": 0.927,
+      "127": 0.999
     }
   },
   "delay_pan_alternation": {
-    "6": 0.0225,
-    "7": 0.6582
+    "6": 0.0,
+    "7": 1.0
   },
   "reverb_ir": {
     "0": {
-      "0": "ir/reverb_t0_time_000.wav",
-      "16": "ir/reverb_t0_time_016.wav",
-      "32": "ir/reverb_t0_time_032.wav",
-      "48": "ir/reverb_t0_time_048.wav",
-      "64": "ir/reverb_t0_time_064.wav",
-      "80": "ir/reverb_t0_time_080.wav",
-      "96": "ir/reverb_t0_time_096.wav",
-      "112": "ir/reverb_t0_time_112.wav",
-      "127": "ir/reverb_t0_time_127.wav"
+      "0": "ir_synth/reverb_t0_time_000.wav",
+      "16": "ir_synth/reverb_t0_time_016.wav",
+      "32": "ir_synth/reverb_t0_time_032.wav",
+      "48": "ir_synth/reverb_t0_time_048.wav",
+      "64": "ir_synth/reverb_t0_time_064.wav",
+      "80": "ir_synth/reverb_t0_time_080.wav",
+      "96": "ir_synth/reverb_t0_time_096.wav",
+      "112": "ir_synth/reverb_t0_time_112.wav",
+      "127": "ir_synth/reverb_t0_time_127.wav"
     },
     "1": {
-      "0": "ir/reverb_t1_time_000.wav",
-      "16": "ir/reverb_t1_time_016.wav",
-      "32": "ir/reverb_t1_time_032.wav",
-      "48": "ir/reverb_t1_time_048.wav",
-      "64": "ir/reverb_t1_time_064.wav",
-      "80": "ir/reverb_t1_time_080.wav",
-      "96": "ir/reverb_t1_time_096.wav",
-      "112": "ir/reverb_t1_time_112.wav",
-      "127": "ir/reverb_t1_time_127.wav"
+      "0": "ir_synth/reverb_t1_time_000.wav",
+      "16": "ir_synth/reverb_t1_time_016.wav",
+      "32": "ir_synth/reverb_t1_time_032.wav",
+      "48": "ir_synth/reverb_t1_time_048.wav",
+      "64": "ir_synth/reverb_t1_time_064.wav",
+      "80": "ir_synth/reverb_t1_time_080.wav",
+      "96": "ir_synth/reverb_t1_time_096.wav",
+      "112": "ir_synth/reverb_t1_time_112.wav",
+      "127": "ir_synth/reverb_t1_time_127.wav"
     },
     "2": {
-      "0": "ir/reverb_t2_time_000.wav",
-      "16": "ir/reverb_t2_time_016.wav",
-      "32": "ir/reverb_t2_time_032.wav",
-      "48": "ir/reverb_t2_time_048.wav",
-      "64": "ir/reverb_t2_time_064.wav",
-      "80": "ir/reverb_t2_time_080.wav",
-      "96": "ir/reverb_t2_time_096.wav",
-      "112": "ir/reverb_t2_time_112.wav",
-      "127": "ir/reverb_t2_time_127.wav"
+      "0": "ir_synth/reverb_t2_time_000.wav",
+      "16": "ir_synth/reverb_t2_time_016.wav",
+      "32": "ir_synth/reverb_t2_time_032.wav",
+      "48": "ir_synth/reverb_t2_time_048.wav",
+      "64": "ir_synth/reverb_t2_time_064.wav",
+      "80": "ir_synth/reverb_t2_time_080.wav",
+      "96": "ir_synth/reverb_t2_time_096.wav",
+      "112": "ir_synth/reverb_t2_time_112.wav",
+      "127": "ir_synth/reverb_t2_time_127.wav"
     },
     "3": {
-      "0": "ir/reverb_t3_time_000.wav",
-      "16": "ir/reverb_t3_time_016.wav",
-      "32": "ir/reverb_t3_time_032.wav",
-      "48": "ir/reverb_t3_time_048.wav",
-      "64": "ir/reverb_t3_time_064.wav",
-      "80": "ir/reverb_t3_time_080.wav",
-      "96": "ir/reverb_t3_time_096.wav",
-      "112": "ir/reverb_t3_time_112.wav",
-      "127": "ir/reverb_t3_time_127.wav"
+      "0": "ir_synth/reverb_t3_time_000.wav",
+      "16": "ir_synth/reverb_t3_time_016.wav",
+      "32": "ir_synth/reverb_t3_time_032.wav",
+      "48": "ir_synth/reverb_t3_time_048.wav",
+      "64": "ir_synth/reverb_t3_time_064.wav",
+      "80": "ir_synth/reverb_t3_time_080.wav",
+      "96": "ir_synth/reverb_t3_time_096.wav",
+      "112": "ir_synth/reverb_t3_time_112.wav",
+      "127": "ir_synth/reverb_t3_time_127.wav"
     },
     "4": {
-      "0": "ir/reverb_t4_time_000.wav",
-      "16": "ir/reverb_t4_time_016.wav",
-      "32": "ir/reverb_t4_time_032.wav",
-      "48": "ir/reverb_t4_time_048.wav",
-      "64": "ir/reverb_t4_time_064.wav",
-      "80": "ir/reverb_t4_time_080.wav",
-      "96": "ir/reverb_t4_time_096.wav",
-      "112": "ir/reverb_t4_time_112.wav",
-      "127": "ir/reverb_t4_time_127.wav"
+      "0": "ir_synth/reverb_t4_time_000.wav",
+      "16": "ir_synth/reverb_t4_time_016.wav",
+      "32": "ir_synth/reverb_t4_time_032.wav",
+      "48": "ir_synth/reverb_t4_time_048.wav",
+      "64": "ir_synth/reverb_t4_time_064.wav",
+      "80": "ir_synth/reverb_t4_time_080.wav",
+      "96": "ir_synth/reverb_t4_time_096.wav",
+      "112": "ir_synth/reverb_t4_time_112.wav",
+      "127": "ir_synth/reverb_t4_time_127.wav"
     },
     "5": {
-      "0": "ir/reverb_t5_time_000.wav",
-      "16": "ir/reverb_t5_time_016.wav",
-      "32": "ir/reverb_t5_time_032.wav",
-      "48": "ir/reverb_t5_time_048.wav",
-      "64": "ir/reverb_t5_time_064.wav",
-      "80": "ir/reverb_t5_time_080.wav",
-      "96": "ir/reverb_t5_time_096.wav",
-      "112": "ir/reverb_t5_time_112.wav",
-      "127": "ir/reverb_t5_time_127.wav"
+      "0": "ir_synth/reverb_t5_time_000.wav",
+      "16": "ir_synth/reverb_t5_time_016.wav",
+      "32": "ir_synth/reverb_t5_time_032.wav",
+      "48": "ir_synth/reverb_t5_time_048.wav",
+      "64": "ir_synth/reverb_t5_time_064.wav",
+      "80": "ir_synth/reverb_t5_time_080.wav",
+      "96": "ir_synth/reverb_t5_time_096.wav",
+      "112": "ir_synth/reverb_t5_time_112.wav",
+      "127": "ir_synth/reverb_t5_time_127.wav"
     }
+  },
+  "pan_dly_stereo_offset_s": 0.0175,
+  "reverb_ir_silent": {
+    "0": [
+      0
+    ],
+    "1": [
+      0
+    ],
+    "2": [
+      0
+    ],
+    "3": [
+      0
+    ],
+    "4": [
+      0
+    ],
+    "5": [
+      0
+    ]
   }
 }
