@@ -12,6 +12,14 @@ library ships. What it is NOT for: judging the multisampling itself. With
 fewer root keys, notes are pitch-shifted further from their source sample, so
 timbre drifts across the keyboard in a way the full library does not.
 
+Keep the root keys dense. Several JV patches pan by key position -- A.Piano 2
+sweeps from 19 dB left at A2 to 19 dB right at D#5 -- which is a smooth
+gradient over the full library's 25 root keys but becomes a STAIRCASE here,
+each sample holding one pan position across its whole span. At 5 keys the
+largest jump between neighbours is 12.9 dB and reads as the reverb lurching
+into one ear; at 9 keys it is 6.9 dB, matching the full library's own 6.7 dB.
+That artifact belongs to this trimming, not to the library being auditioned.
+
 Usage:
     python3 tools/make_mini_dslibrary.py <out.dslibrary> --keys 36,48,60,72 \\
         --layers 1,3 "<lib>:<preset stem>" [...]
