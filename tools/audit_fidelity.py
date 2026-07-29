@@ -87,7 +87,21 @@ def onset_ms(x, sr, floor_db=-45.0, smooth=32):
     return float(np.argmax(env > env.max() * 10 ** (floor_db / 20)) / sr * 1000.0)
 
 
-def decay_correlation(a, b, sr):
+def decay_correlation(a, b, sr, hold_seconds=3.5):
+    """Correlation of the two decay envelopes, measured AFTER note-off.
+
+    Restricted to the release tail on purpose. The renderer holds every note
+    for 3.5 s, so on a sustained patch the analysis window is almost entirely
+    steady state: both envelopes are flat, the correlation is computed on
+    noise, and the result is meaningless -- which is what it looked like, with
+    sustained patches (Overdrive -0.244, Pan Pipe 0.116, E.Organ 2 0.173)
+    scoring far below percussive ones that genuinely decay in-window. A reverb
+    decay is only observable once the source stops driving it.
+    """
+    start = int(hold_seconds * sr)
+    n = min(len(a), len(b))
+    if n - start > sr * 0.2:
+        a, b = a[start:n], b[start:n]
     n = min(len(a), len(b))
     k = np.ones(int(sr * 0.02)) / int(sr * 0.02)
     ea = 20 * np.log10(np.maximum(np.convolve(np.abs(a[:n]), k, mode="same"), 1e-9))

@@ -569,15 +569,36 @@ def blend_makeup_gain(effects):
     return min(MAX_MAKEUP_GAIN, 1.0 / math.sqrt(attenuation))
 
 
-def _convolution_mix(wet):
+def _convolution_mix(wet, cal=None, rtype=None):
     """DecentSampler convolution `mix` reproducing the JV's wet/dry ratio.
 
     `wet` is the patch's reverb level scaled by its average send over active
     tones, i.e. the predictor the ground-truth ratios were regressed on. See
     REVERB_RATIO_SLOPE for the measurement and for why a ratio match (rather
     than a level match) is the right target for a blend control.
+
+    Uses calibration.json's per-type fit when present (see
+    tools/calibrate_reverb_ratio.py, 88 patches), falling back to the global
+    coefficients. Per-type is a small but real improvement -- mean |error|
+    3.44 -> 3.31 dB, 82% -> 84% of patches within 6 dB.
+
+    Do not expect much more from this predictor. Measured over 88 patches the
+    global correlation is 0.63, not the 0.77 an earlier 14-patch sample
+    suggested, and three separate attempts to explain the residual scatter all
+    came back negative: keeping the IRs' native per-type output gain instead of
+    normalising it was WORSE (3.66 dB), weighting each tone's send by its level
+    changed nothing (3.41 dB), and per-type fitting bought 0.13 dB. What is
+    left looks genuinely patch-dependent -- how much reverb a given patch
+    returns depends on the spectrum being fed into the algorithm, which no
+    function of level and send can capture.
     """
-    ratio = REVERB_RATIO_SLOPE * _clamp01(wet) + REVERB_RATIO_INTERCEPT
+    slope, intercept = REVERB_RATIO_SLOPE, REVERB_RATIO_INTERCEPT
+    if cal:
+        f = (cal.get("reverb_ratio_fit") or {}).get(str(rtype)) \
+            or cal.get("reverb_ratio_fit_global")
+        if f:
+            slope, intercept = float(f["slope"]), float(f["intercept"])
+    ratio = slope * _clamp01(wet) + intercept
     ratio = max(0.0, min(REVERB_RATIO_MAX, ratio))
     return round(_clamp01(ratio / (1.0 + ratio)), 4)
 
@@ -707,7 +728,7 @@ def build_effects(meta, cal):
             # 127 with full sends) emit mix=1.0 and lose their direct sound.
             reverb_effect = ("convolution", {
                 "irFile": ir,
-                "mix": _convolution_mix(wet) if wet_ok else 0.0,
+                "mix": _convolution_mix(wet, cal, rtype) if wet_ok else 0.0,
             })
         else:
             # No IR captured for this type (should not happen for 0-5, but a
