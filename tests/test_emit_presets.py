@@ -764,3 +764,50 @@ def test_main_uses_flat_sample_prefix_matching_real_layout(tmp_path, monkeypatch
     assert samples
     missing = [s.get("path") for s in samples if not (library_dir / s.get("path")).exists()]
     assert missing == []
+
+
+# ---------------------------------------------------------------------------
+# Convolution IR path (reverb types 0-5)
+# ---------------------------------------------------------------------------
+
+def _cal_with_ir():
+    cal = dict(CAL)
+    cal["reverb_ir"] = {
+        str(t): {str(step): f"ir/reverb_t{t}_time_{step:03d}.wav"
+                 for step in (0, 16, 32, 48, 64, 80, 96, 112, 127)}
+        for t in range(6)
+    }
+    return cal
+
+
+def test_reverb_types_emit_convolution_when_ir_bank_present():
+    """With an IR bank, true reverbs use the captured JV algorithm."""
+    root = parse(make_meta(reverb_type="Hall1"), _cal_with_ir())
+    effects = {e.get("type") for e in root.findall(".//effect")}
+    assert "convolution" in effects
+    assert "reverb" not in effects, "should not emit both a modelled and a captured reverb"
+    conv = [e for e in root.findall(".//effect") if e.get("type") == "convolution"][0]
+    assert conv.get("irFile", "").endswith(".wav")
+    assert 0.0 <= float(conv.get("mix")) <= 1.0
+
+
+def test_delay_types_still_emit_delay_even_with_ir_bank():
+    """Delay/Pan-Dly are genuinely time+feedback+pan; an IR is the wrong model."""
+    root = parse(make_meta(reverb_type="Pan-Dly"), _cal_with_ir())
+    effects = {e.get("type") for e in root.findall(".//effect")}
+    assert "delay" in effects
+    assert "convolution" not in effects
+
+
+def test_ir_snaps_to_nearest_captured_time_step():
+    cal = _cal_with_ir()
+    assert ep._nearest_ir(cal, 4, 90).endswith("_096.wav")   # 90 -> 96
+    assert ep._nearest_ir(cal, 4, 50).endswith("_048.wav")   # 50 -> 48
+    assert ep._nearest_ir(cal, 4, 0).endswith("_000.wav")
+
+
+def test_missing_ir_bank_falls_back_to_parametric_reverb():
+    """A missing IR must degrade to an audible reverb, never to silence."""
+    root = parse(make_meta(reverb_type="Hall1"), CAL)   # CAL has no reverb_ir
+    effects = {e.get("type") for e in root.findall(".//effect")}
+    assert "reverb" in effects and "convolution" not in effects

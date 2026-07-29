@@ -385,6 +385,38 @@ def _pan_dly_stereo_offset(delay_time_s):
                       PAN_DLY_STEREO_OFFSET_FRAC * delay_time_s), 4)
 
 
+def _nearest_ir(cal, rtype, raw_time):
+    """Path of the captured IR whose time step is nearest `raw_time`.
+
+    The IR bank samples `reverbtime` at step 16 (9 steps per type). RT60
+    varies smoothly across the full 0-127 range -- adjacent raw values differ
+    by well under 1% -- so snapping to the nearest captured step costs at most
+    a few percent of decay time, far below audibility. Returns None if no IR
+    was captured for this reverb type, so the caller can fall back rather than
+    emit a preset referencing a file that does not exist.
+    """
+    bank = cal.get("reverb_ir", {}).get(str(rtype))
+    if not bank:
+        return None
+    steps = sorted(int(k) for k in bank)
+    nearest = min(steps, key=lambda k: abs(k - int(raw_time)))
+    return bank[str(nearest)]
+
+
+def zone_vel_range(zones):
+    """Per-zone (lovel, hivel), preferring the renderer's own values.
+
+    jv_sampler now derives velocity layers from each patch's real tone
+    switch points and writes explicit `lovel`/`hivel` per zone, so a patch
+    that switches at velocity 100 gets a layer boundary exactly there rather
+    than at an arbitrary third. Fall back to even division only for
+    patch.json files written before that change.
+    """
+    if all("lovel" in z and "hivel" in z for z in zones):
+        return [(int(z["lovel"]), int(z["hivel"])) for z in zones]
+    return vel_ranges(len(zones))
+
+
 def build_effects(meta, cal):
     """Return [(type, {attr: value}), ...] in signal-chain order.
 
@@ -420,14 +452,30 @@ def build_effects(meta, cal):
             "wetLevel": round(wet, 4),
         })
     else:
-        rt60 = interp_table(cal["reverb_rt60"][str(rtype)], rv["time"])
-        room_size = round(min(1.0, max(ROOMSIZE_FLOOR, rt60 / ROOMSIZE_RT60_REF)), 4)
         wet = _clamp01(amount(rv["level"]) * reverb_send_norm)
-        reverb_effect = ("reverb", {
-            "roomSize": room_size,
-            "damping": REVERB_DAMPING[rtype],
-            "wetLevel": round(wet, 4),
-        })
+        ir = _nearest_ir(cal, rtype, rv["time"])
+        if ir is not None:
+            # Convolution with an IR captured from the emulator itself, rather
+            # than an approximation via roomSize/damping. The IRs are rendered
+            # pure-wet (drylevel=0, reverbsendlevel=127) so they are the JV's
+            # own reverb algorithm, not a model of it -- which no roomSize
+            # value can be. The user's verdict on the parametric version was
+            # that they could barely hear it.
+            reverb_effect = ("convolution", {
+                "irFile": ir,
+                "mix": round(wet, 4),
+            })
+        else:
+            # No IR captured for this type (should not happen for 0-5, but a
+            # missing file must degrade to something audible rather than to
+            # silence).
+            rt60 = interp_table(cal["reverb_rt60"][str(rtype)], rv["time"])
+            room_size = round(min(1.0, max(ROOMSIZE_FLOOR, rt60 / ROOMSIZE_RT60_REF)), 4)
+            reverb_effect = ("reverb", {
+                "roomSize": room_size,
+                "damping": REVERB_DAMPING[rtype],
+                "wetLevel": round(wet, 4),
+            })
 
     mod_rate = min(LFO_RATE_HZ_MAX, max(0.0, interp_table(cal["chorus_rate_hz"], ch["rate"])))
     mod_depth = amount(ch["depth"], CHORUS_MAX_MOD_DEPTH)
@@ -559,7 +607,7 @@ def build_dspreset(meta, cal, sample_prefix):
     by_key = _group_zones_by_key(zones)
     for key, lo, hi in key_ranges(by_key.keys()):
         layer_zones = sorted(by_key[key], key=lambda z: z["velocity"])
-        for z, (vlo, vhi) in zip(layer_zones, vel_ranges(len(layer_zones))):
+        for z, (vlo, vhi) in zip(layer_zones, zone_vel_range(layer_zones)):
             attrs = {
                 "path": f"{sample_prefix}/{z['file']}",
                 "rootNote": str(key),
@@ -661,7 +709,7 @@ def build_sfz(meta, sample_prefix):
     by_key = _group_zones_by_key(zones)
     for key, lo, hi in key_ranges(by_key.keys()):
         layer_zones = sorted(by_key[key], key=lambda z: z["velocity"])
-        for z, (vlo, vhi) in zip(layer_zones, vel_ranges(len(layer_zones))):
+        for z, (vlo, vhi) in zip(layer_zones, zone_vel_range(layer_zones)):
             lines.append("<region>")
             lines.append(f"sample={z['file']}")
             lines.append(f"lokey={lo} hikey={hi} pitch_keycenter={key}")
