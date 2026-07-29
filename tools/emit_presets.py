@@ -496,6 +496,45 @@ def _pan_dly_stereo_offset(cal, delay_time_s):
 # which is an equal blend. So a full JV send maps to mix 0.5, not 1.0.
 EFFECT_MAX_MIX = 0.5
 
+# Reverb depth for the CONVOLUTION path is no longer that flat ceiling. The
+# ceiling was calibrated against a simulation that normalised the wet path,
+# so it silently assumed a gain-neutral IR; the shipped IRs were 9-14 dB down,
+# and the two errors compounded into a wet signal 21.8 dB below the dry on
+# A.Piano 1 -- reported as "I'm not sure I hear the reverb". The IRs are now
+# gain-neutral (ir_capture.normalize_ir), and how much reverb a patch gets is
+# set here, from measurement instead of reasoning.
+#
+# Ground truth: for 14 internal patches spanning all 6 convolution types, the
+# JV's own reverb-only contribution was measured against its own dry render as
+# a wet/dry RMS ratio R. Regressed on the patch's reverb level x average send
+# over active tones, R = 1.428*p - 0.048 (r = 0.77 across R = 0.33..1.49).
+#
+# Correlation 0.77, not 0.99: R also depends on reverb type and on the
+# patch's own spectrum, and 14 patches will not resolve that. This is a
+# measured central tendency, not a per-patch prediction.
+#
+# A blend cannot reproduce the JV exactly in any case -- the JV ADDS reverb
+# beside undiminished dry, whereas `mix` trades one for the other. Matching
+# the RATIO is what preserves the character, so mix = R/(1+R); the small
+# overall level drop that comes with it is a volume-knob problem, not a tonal
+# one. The cap keeps some direct sound on the wettest patches.
+REVERB_RATIO_SLOPE = 1.428
+REVERB_RATIO_INTERCEPT = -0.048
+REVERB_RATIO_MAX = 1.5          # highest ratio measured; mix caps at 0.6
+
+
+def _convolution_mix(wet):
+    """DecentSampler convolution `mix` reproducing the JV's wet/dry ratio.
+
+    `wet` is the patch's reverb level scaled by its average send over active
+    tones, i.e. the predictor the ground-truth ratios were regressed on. See
+    REVERB_RATIO_SLOPE for the measurement and for why a ratio match (rather
+    than a level match) is the right target for a blend control.
+    """
+    ratio = REVERB_RATIO_SLOPE * _clamp01(wet) + REVERB_RATIO_INTERCEPT
+    ratio = max(0.0, min(REVERB_RATIO_MAX, ratio))
+    return round(_clamp01(ratio / (1.0 + ratio)), 4)
+
 
 def _nearest_ir(cal, rtype, raw_time):
     """Return `(irFile, wet_ok)` for the IR whose time step is nearest `raw_time`.
@@ -622,7 +661,7 @@ def build_effects(meta, cal):
             # 127 with full sends) emit mix=1.0 and lose their direct sound.
             reverb_effect = ("convolution", {
                 "irFile": ir,
-                "mix": round(_clamp01(wet * EFFECT_MAX_MIX), 4) if wet_ok else 0.0,
+                "mix": _convolution_mix(wet) if wet_ok else 0.0,
             })
         else:
             # No IR captured for this type (should not happen for 0-5, but a

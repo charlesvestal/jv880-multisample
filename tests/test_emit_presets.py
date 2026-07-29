@@ -927,6 +927,28 @@ def test_audible_step_is_unaffected_by_the_silent_manifest():
     assert (conv.get("irFile") or "").endswith("_096.wav")
 
 
+def test_convolution_mix_targets_the_measured_wet_dry_ratio():
+    """mix must reproduce the JV's measured wet/dry ratio. The old flat 0.5
+    ceiling assumed a gain-neutral IR that the bank did not provide, leaving
+    A.Piano 1's wet 21.8 dB under its dry."""
+    # A.Piano 1: reverb level 91, average send 100 -> predictor 0.564,
+    # ground-truth ratio 0.927. mix/(1-mix) should land in that neighbourhood.
+    mix = ep._convolution_mix(91 / 127 * (100 / 127))
+    ratio = mix / (1 - mix)
+    assert 0.6 < ratio < 1.1, f"expected a ratio near the measured 0.93, got {ratio}"
+    assert mix > 0.4, "the old mapping emitted 0.28 here, which was inaudible"
+
+
+def test_convolution_mix_is_monotonic_and_leaves_dry_intact():
+    prev = -1.0
+    for raw in range(0, 128, 8):
+        mix = ep._convolution_mix(raw / 127.0)
+        assert 0.0 <= mix <= 0.62, f"mix {mix} would erase the direct sound"
+        assert mix >= prev, "more reverb send must not yield less reverb"
+        prev = mix
+    assert ep._convolution_mix(0.0) == 0.0, "no send must mean no wet signal"
+
+
 def test_emitted_library_stages_every_ir_it_references(tmp_path):
     """A preset's irFile is relative to the preset, so the WAV must physically
     land in the library -- otherwise DecentSampler renders no reverb at all and

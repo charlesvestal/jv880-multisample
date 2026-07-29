@@ -81,15 +81,15 @@ def apply_convolution(dry, ir, mix):
     """DecentSampler's convolution: a straight blend of dry and convolved."""
     if mix <= 0:
         return dry.copy()
+    # Deliberately NOT normalised. An earlier version scaled the wet path to
+    # the dry peak before blending, which made the A/B sound right while the
+    # shipped preset was 21.8 dB quiet in DecentSampler -- the simulation was
+    # hiding the exact defect it existed to find. DS convolves with the IR as
+    # written, so the IR's own level is part of what is under test, and the
+    # level is now fixed where it belongs: in the IR (see ir_capture's
+    # normalize_ir), not here.
     wet = np.stack([fftconvolve(dry[:, c], ir[:, c % ir.shape[1]])[:len(dry)]
                     for c in range(dry.shape[1])], axis=1)
-    peak = np.abs(wet).max()
-    if peak > 0:
-        # Convolution sums energy across the whole IR, so raw output level
-        # depends on IR length. Normalise the wet path to the dry peak before
-        # blending so `mix` behaves as a mix control rather than as a wildly
-        # level-dependent one.
-        wet *= np.abs(dry).max() / peak
     return dry * (1.0 - mix) + wet * mix
 
 

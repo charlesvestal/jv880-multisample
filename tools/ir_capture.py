@@ -189,6 +189,66 @@ def smoothed_db_envelope(mono, hop=64, smooth=5):
     return env, db
 
 
+def _pink_reference(n=1 << 17, seed=20260729):
+    """Deterministic pink-noise probe used to normalise IR gain.
+
+    Pink rather than white because it is far closer to the long-term spectrum
+    of musical material, and these IRs differ in spectral shape as well as
+    energy -- normalising against white leaves the perceived wet level
+    type-dependent even when the maths says the gain is equal.
+    """
+    rng = np.random.default_rng(seed)
+    spec = rng.normal(size=n // 2 + 1) + 1j * rng.normal(size=n // 2 + 1)
+    freqs = np.arange(len(spec))
+    spec[1:] /= np.sqrt(freqs[1:])      # -3 dB/octave
+    spec[0] = 0.0
+    x = np.fft.irfft(spec, n)
+    return x / np.abs(x).max()
+
+
+def normalize_ir(x, reference=None):
+    """Scale an IR so that convolving program material with it is gain-neutral.
+
+    Without this the wet level depends on whatever total energy the captured
+    IR happens to hold, which varies with reverb type and decay time. The
+    previously shipped bank measured -13.6 dB of convolution gain for Hall1
+    and -9.2 dB for Room1, so a preset asking for mix=0.28 got its wet signal
+    21.8 dB under the dry -- audible only as "is there actually reverb on
+    this?", which is exactly how it was reported.
+
+    Normalising by measured gain against a fixed pink-noise reference, rather
+    than by the IR's own energy: unit energy is only gain-neutral for a white
+    input, and against real material it still left a 4.6 dB spread across the
+    bank (+0.9 dB for Hall1 vs +5.5 dB for Room1). With this, `mix` means the
+    same thing for every type and time step, and how much reverb a patch gets
+    is decided solely by the mix value emit_presets derives from its own
+    reverb level and sends.
+
+    Returns the input unchanged if it is all zero (see the underflow note in
+    the caller).
+    """
+    if not np.abs(x).any():
+        return x
+    if reference is None:
+        reference = _pink_reference()
+    ref_rms = np.sqrt(np.mean(reference ** 2))
+    gains = []
+    for c in range(x.shape[1] if x.ndim > 1 else 1):
+        ch = x[:, c] if x.ndim > 1 else x
+        wet = fftconvolve(reference, ch)[:len(reference)]
+        gains.append(np.sqrt(np.mean(wet ** 2)) / ref_rms)
+    gain = float(np.mean(gains))
+    if gain <= 0:
+        return x
+    scaled = x / gain
+    peak = np.abs(scaled).max()
+    if peak >= 1.0:
+        # A gain-neutral IR peaks well below full scale in this bank, but a
+        # future capture must never ship a clipped IR.
+        scaled = scaled / peak * 0.99
+    return scaled
+
+
 def trim_and_fade(mono_or_stereo, sr, trim_db=IR_TRIM_DB, fade_ms=IR_FADE_MS, hop=64):
     """Trims a captured IR where its smoothed envelope falls trim_db below
     peak, then applies a short linear fade-out over the last fade_ms so the
@@ -388,20 +448,17 @@ def cmd_capture(wave_inject, roms, tmp, out_dir, args, excitation_latency):
             trimmed = trim_and_fade(x, SR)
             resampled = resample_poly(trimmed, up=3, down=4, axis=0)   # 64000 -> 48000
             dst = out_dir / f"reverb_t{t}_time_{raw:03d}.wav"
-            # soundfile.read() on a PCM_16 source (which every raw capture
-            # from wave_inject's wav_write_s16 is) normalizes samples to
-            # float64 in [-1, 1] -- NOT the raw int16 range. Writing
-            # `resampled` straight into an int16 file without rescaling
-            # first collapses every sample to 0 after rounding (confirmed:
-            # this bug was already present in the IR bank committed by the
-            # prior session -- every calib/ir_synth/*.wav file was silent,
-            # undetected because calibration.json's "reverb_ir" pointed at
-            # the OLD calib/ir/*.wav deconvolution bank instead, so nothing
-            # ever exercised this write path against real tests until this
-            # task wired ir_synth in as the shipped bank). Scale back up to
-            # int16 range before rounding/clipping.
-            out16 = np.clip(np.round(resampled * 32768.0), -32768, 32767).astype(np.int16)
-            sf.write(str(dst), out16, IR_TARGET_SR, subtype="PCM_16")
+            normalized = normalize_ir(resampled)
+            # 24-bit, not 16. A unit-energy IR peaks around -17 dBFS (the
+            # energy constraint sets the level, so the peak lands where it
+            # lands), and the raw emulator capture is itself only about
+            # -39 dBFS -- in 16 bits that leaves the tail sitting on the
+            # quantisation floor. Also note soundfile.read() returns floats
+            # in [-1,1] regardless of the source's bit depth: writing such an
+            # array to an int-subtype file WITHOUT rescaling rounds every
+            # sample to zero, which is exactly how the previously committed
+            # bank came to be entirely silent.
+            sf.write(str(dst), normalized, IR_TARGET_SR, subtype="PCM_24")
             dur_raw = len(x) / SR
             dur_trim = len(trimmed) / SR
             # A captured IR can come back all-zero. This happens at reverbtime
@@ -414,7 +471,7 @@ def cmd_capture(wave_inject, roms, tmp, out_dir, args, excitation_latency):
             # signal instead of leaving it alone.
             bank[t][raw] = {"file": str(dst.relative_to(out_dir.parent)),
                             "raw_duration_s": dur_raw, "trimmed_duration_s": dur_trim,
-                            "rt60_s": rt60, "silent": not bool(out16.any())}
+                            "rt60_s": rt60, "silent": not bool(np.abs(resampled).any())}
             print(f"  t{t} time{raw:3d}: raw={dur_raw:6.3f}s -> trimmed={dur_trim:6.3f}s "
                   f"({100*dur_trim/dur_raw:5.1f}%), rt60={rt60}")
     return bank
