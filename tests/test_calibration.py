@@ -17,9 +17,12 @@ omitted, unreliable raw settings: 24 and 80).
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
+from scipy.io import wavfile
 
 CALIB_PATH = Path(__file__).resolve().parents[1] / "calib" / "calibration.json"
+CALIB_DIR = CALIB_PATH.parent
 
 # "Small tolerance" per the task spec, interpreted as: a later raw setting's
 # measured value may sit up to this many Hz BELOW the value at the previous
@@ -53,6 +56,26 @@ RT60_ABS_TOL_S = 0.25
 # real table (2.47x-6.66x).
 RT60_MIN_MAX_RATIO = 2.0
 
+# delay_time_s (Delay/Pan-Dly echo spacing, types 6-7): the measured table is
+# a clean, essentially noise-free ramp (cross-correlation against a known
+# template, not peak-picking a noisy envelope -- see
+# tools/analyze_calibration.py's DELAY_HOP block), so unlike chorus_rate_hz
+# / reverb_rt60 this is checked with STRICT monotonicity, not a tolerance.
+# A JV delay/echo is expected to top out well under a second -- this is the
+# exact property this task exists to fix (the previous invented curve
+# reached 1.0s, producing a 1-second ping-pong echo on every max-time
+# patch, reported by listening as "pads all have an odd ping-pong delay").
+DELAY_TIME_MAX_PLAUSIBLE_S = 0.7
+DELAY_TIME_MIN_MAX_RATIO = 3.0
+
+# delay_feedback (per-repeat gain, types 6-7): real data has a genuine FLAT
+# floor at 0.0 for several of the lowest raw settings (below some threshold,
+# no additional repeat is audible within the measurement window at all --
+# see measure_delay_feedback_gain's docstring on Pan-Dly's fixed
+# feedback-independent first repeat pair), so equal-to-previous does not
+# count as a violation -- only a genuine decrease does.
+DELAY_FEEDBACK_TOL = 1e-6
+
 
 def _load():
     if not CALIB_PATH.exists():
@@ -78,6 +101,18 @@ def test_all_five_tables_present_and_nonempty():
                 "reverb_rt60", "reverb_wet"):
         assert key in data, f"missing table: {key}"
         assert len(data[key]) > 0, f"table is empty: {key}"
+
+
+def test_delay_tables_present_and_nonempty():
+    data = _load()
+    for key in ("delay_time_s", "delay_feedback", "delay_pan_alternation",
+                "reverb_ir"):
+        assert key in data, f"missing table: {key}"
+        assert len(data[key]) > 0, f"table is empty: {key}"
+    for key in ("delay_time_s", "delay_feedback", "reverb_ir"):
+        for dtype in ("6", "7") if key != "reverb_ir" else map(str, range(6)):
+            assert dtype in data[key], f"{key} missing entry for type {dtype}"
+            assert len(data[key][dtype]) > 0, f"{key}[{dtype}] is empty"
 
 
 def test_chorus_rate_trend_and_plausible_band():
@@ -223,3 +258,288 @@ def test_reverb_wet_max_greater_than_min():
     assert hi_val > lo_val, (
         f"reverb_wet does not increase across the sweep (min={lo_val}, max={hi_val})"
     )
+
+
+# ---------------------------------------------------------------------------
+# delay_time_s (Delay/Pan-Dly echo spacing, types 6-7)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("dtype", ["6", "7"])
+def test_delay_time_strictly_monotonic(dtype):
+    """Unlike chorus_rate_hz/reverb_rt60, delay_time_s is measured via
+    cross-correlation against a known template (see
+    tools/analyze_calibration.py's measure_first_echo_time_s), which -- on
+    the real measured table -- produced a clean, essentially noise-free
+    ramp with no local dips at all. That's a genuine property of the data,
+    not an assumption, so this is checked with strict (not tolerant)
+    monotonicity; if a future re-measurement introduces real noise, this
+    test is the one that should be loosened, not silently worked around."""
+    data = _load()
+    items = _sorted_present(data["delay_time_s"][dtype])
+    assert len(items) >= 2, f"need at least 2 measured delay_time_s points for type {dtype}"
+    for (raw_prev, v_prev), (raw_cur, v_cur) in zip(items, items[1:]):
+        assert v_cur > v_prev, (
+            f"type {dtype}: delay_time_s dropped from {v_prev}s (raw={raw_prev}) "
+            f"to {v_cur}s (raw={raw_cur})"
+        )
+
+
+@pytest.mark.parametrize("dtype", ["6", "7"])
+def test_delay_time_plausible_range(dtype):
+    """The property this whole task exists to fix: a JV delay/echo tops out
+    at tens-to-a-few-hundred ms, not a full second. The previous invented
+    curve (DELAY_TIME_MIN_S=0.02, DELAY_TIME_MAX_S=1.0) put every max-time
+    Pan-Dly/Delay patch at a literal 1-second echo -- reported by listening
+    as "pads all have an odd ping-pong delay". The real measured max is
+    ~0.49s (Delay) / ~0.24s (Pan-Dly)."""
+    data = _load()
+    items = _sorted_present(data["delay_time_s"][dtype])
+    vals = [v for _, v in items]
+    lo, hi = min(vals), max(vals)
+    assert lo > 0.0, f"type {dtype}: minimum measured delay_time_s must be > 0s"
+    assert hi <= DELAY_TIME_MAX_PLAUSIBLE_S, (
+        f"type {dtype}: max measured delay_time_s ({hi}s) exceeds the plausible "
+        f"JV delay/echo ceiling of {DELAY_TIME_MAX_PLAUSIBLE_S}s -- this is "
+        f"exactly the bug (a ~1s 'ping-pong echo') this task exists to fix"
+    )
+    assert hi >= DELAY_TIME_MIN_MAX_RATIO * lo, (
+        f"type {dtype}: delay_time_s range ({lo}s..{hi}s) does not span at "
+        f"least {DELAY_TIME_MIN_MAX_RATIO}x"
+    )
+
+
+def test_delay_raw_zero_is_null_not_fabricated():
+    """raw=0 is an intentional, documented measurement gap on BOTH types
+    (the echo lands too close to the attack itself to distinguish from it
+    at this setting) -- it must be recorded as null, not coerced to 0.0
+    seconds (which would be a real, if small, fabricated number, and -- via
+    interp_table -- would flatten the whole low end of the curve toward
+    zero instead of interpolating across the gap the way every other
+    missing point in this file already does)."""
+    data = _load()
+    for dtype in ("6", "7"):
+        assert data["delay_time_s"][dtype].get("0") is None, (
+            f"type {dtype}: raw=0 should be an intentional null gap, not a "
+            f"fabricated value"
+        )
+
+
+def test_delay_type6_max_at_least_type7_max():
+    """Cross-type sanity check: Delay (mono, type 6) measured roughly DOUBLE
+    Pan-Dly's (type 7) delay time for the same raw setting across the whole
+    sweep. This asserts the weaker, structural half of that finding (type 6's
+    ceiling is not smaller than type 7's) so a future re-measurement that
+    swapped the two tables' data, or collapsed them to be identical, would
+    be caught."""
+    data = _load()
+    max6 = max(v for v in data["delay_time_s"]["6"].values() if v is not None)
+    max7 = max(v for v in data["delay_time_s"]["7"].values() if v is not None)
+    assert max6 > max7, (
+        f"type 6 (Delay) max delay_time_s ({max6}s) should exceed type 7 "
+        f"(Pan-Dly)'s ({max7}s) -- measured ~2x on real hardware"
+    )
+
+
+# ---------------------------------------------------------------------------
+# delay_feedback (per-repeat gain, types 6-7)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("dtype", ["6", "7"])
+def test_delay_feedback_non_decreasing(dtype):
+    """Real data has a genuine flat floor at 0.0 for several of the lowest
+    raw settings (below some threshold, no additional repeat is audible
+    within the measurement window -- see measure_delay_feedback_gain's
+    docstring), so equal-to-previous is expected and allowed; only an
+    actual decrease would indicate a real problem."""
+    data = _load()
+    items = _sorted_present(data["delay_feedback"][dtype])
+    assert len(items) >= 2, f"need at least 2 measured delay_feedback points for type {dtype}"
+    for (raw_prev, v_prev), (raw_cur, v_cur) in zip(items, items[1:]):
+        assert v_cur >= v_prev - DELAY_FEEDBACK_TOL, (
+            f"type {dtype}: delay_feedback dropped from {v_prev} (raw={raw_prev}) "
+            f"to {v_cur} (raw={raw_cur})"
+        )
+
+
+@pytest.mark.parametrize("dtype", ["6", "7"])
+def test_delay_feedback_range_and_endpoints(dtype):
+    data = _load()
+    items = _sorted_present(data["delay_feedback"][dtype])
+    vals = [v for _, v in items]
+    for raw, v in items:
+        assert 0.0 <= v <= 1.0, f"type {dtype}: delay_feedback {v} (raw={raw}) outside 0-1"
+    lo_raw, lo_val = items[0]
+    hi_raw, hi_val = items[-1]
+    assert lo_val <= 0.1, (
+        f"type {dtype}: delay_feedback at the lowest raw ({lo_raw}) should be "
+        f"near 0 (no/negligible repeats), got {lo_val}"
+    )
+    assert hi_val >= 0.9, (
+        f"type {dtype}: delay_feedback at the highest raw ({hi_raw}) should be "
+        f"near max (near-sustained repeats), got {hi_val}"
+    )
+    assert max(vals) > min(vals), f"type {dtype}: delay_feedback never varies"
+
+
+# ---------------------------------------------------------------------------
+# delay_pan_alternation (Pan-Dly channel behaviour, types 6-7)
+# ---------------------------------------------------------------------------
+
+def test_pan_dly_alternates_channels_far_more_than_plain_delay():
+    """The measurement this task's stereoOffset decision is actually based
+    on: does the effect alternate successive echoes between channels at
+    all? Plain Delay (mono, type 6) measured genuinely centred (~0.02, i.e.
+    every repeat lands within a couple percent of dead-centre L/R); Pan-Dly
+    (type 7) measured strongly alternating (~0.66 -- repeats swing between
+    mostly-L and mostly-R). This is what determines whether emit_presets.py
+    should ever emit a nonzero stereoOffset for a given type."""
+    data = _load()
+    alt = data["delay_pan_alternation"]
+    assert alt["6"] is not None and alt["7"] is not None
+    assert alt["6"] < 0.15, (
+        f"type 6 (Delay) pan alternation ({alt['6']}) should be near zero "
+        f"(measured as genuinely centred/mono)"
+    )
+    assert alt["7"] > 0.3, (
+        f"type 7 (Pan-Dly) pan alternation ({alt['7']}) should be clearly "
+        f"nonzero (measured as strongly alternating L/R)"
+    )
+    assert alt["7"] > 3.0 * alt["6"], (
+        f"type 7's alternation ({alt['7']}) should be far larger than type "
+        f"6's ({alt['6']}), not just marginally so"
+    )
+
+
+# ---------------------------------------------------------------------------
+# reverb_ir (types 0-5 impulse-response bank, calib/ir/*.wav)
+# ---------------------------------------------------------------------------
+
+def _ir_entries():
+    data = _load()
+    ir = data["reverb_ir"]
+    for rtype in range(6):
+        for raw, relpath in sorted(ir[str(rtype)].items(), key=lambda kv: int(kv[0])):
+            if relpath is not None:
+                yield rtype, int(raw), relpath
+
+
+def test_reverb_ir_files_exist_and_are_valid_audio():
+    data = _load()
+    entries = list(_ir_entries())
+    assert entries, "no captured reverb_ir entries to check"
+    for rtype, raw, relpath in entries:
+        path = CALIB_DIR / relpath
+        assert path.exists(), f"type={rtype} raw={raw}: missing IR file {path}"
+        sr, audio = wavfile.read(str(path))
+        assert sr > 0, f"type={rtype} raw={raw}: invalid sample rate in {path}"
+        assert audio.ndim == 2 and audio.shape[1] == 2, (
+            f"type={rtype} raw={raw}: expected stereo IR, got shape {audio.shape}"
+        )
+        assert len(audio) > sr * 0.05, (
+            f"type={rtype} raw={raw}: IR is implausibly short "
+            f"({len(audio) / sr:.3f}s) to be a usable reverb impulse response"
+        )
+
+
+def test_reverb_ir_has_decaying_envelope_not_silence_or_noise():
+    """A real IR must actually decay: its first half should be louder (in
+    RMS) than its second half by a healthy margin, and it must not be
+    silence. This also indirectly guards against the dry attack leaking
+    into the capture (pure_wet_reverb's job is to mute it) -- a leaked
+    percussive attack transient would still happen to decay overall, but
+    combined with test_reverb_ir_no_leaked_dry_attack below, both together
+    rule out the two ways this capture could be wrong."""
+    for rtype, raw, relpath in _ir_entries():
+        path = CALIB_DIR / relpath
+        sr, audio = wavfile.read(str(path))
+        mono = audio.astype(np.float64).mean(axis=1)
+        assert np.abs(mono).max() > 50, (
+            f"type={rtype} raw={raw}: IR {path} is effectively silent"
+        )
+        half = len(mono) // 2
+        rms_first = float(np.sqrt(np.mean(mono[:half] ** 2)))
+        rms_second = float(np.sqrt(np.mean(mono[half:] ** 2))) + 1e-9
+        assert rms_first > rms_second, (
+            f"type={rtype} raw={raw}: IR {path} does not decay "
+            f"(first-half RMS {rms_first:.1f} <= second-half RMS {rms_second:.1f})"
+        )
+
+
+def test_reverb_ir_no_leaked_dry_attack():
+    """pure_wet_reverb mutes every tone's drylevel, so the captured IR
+    should have very little energy in its first few milliseconds (before
+    the reverb's own early reflections build up) compared to its overall
+    peak -- a real percussive attack transient leaking through would spike
+    immediately at sample 0, which a genuine reverb response (which takes
+    at least a few ms to build up any energy) does not."""
+    for rtype, raw, relpath in _ir_entries():
+        path = CALIB_DIR / relpath
+        sr, audio = wavfile.read(str(path))
+        mono = np.abs(audio.astype(np.float64)).mean(axis=1)
+        onset_n = max(1, int(0.001 * sr))   # first 1ms
+        onset_peak = float(mono[:onset_n].max())
+        overall_peak = float(mono.max()) + 1e-9
+        assert onset_peak < 0.5 * overall_peak, (
+            f"type={rtype} raw={raw}: IR {path} has a strong onset-sample "
+            f"peak ({onset_peak:.0f} vs overall {overall_peak:.0f}) -- looks "
+            f"like a leaked dry attack transient, not a pure reverb response"
+        )
+
+
+def test_reverb_ir_rt60_broadly_agrees_with_reverb_rt60():
+    """Cross-validation: RT60 measured directly on each pure-wet IR capture
+    (hold=0.1s, essentially just a decay tail) should broadly agree with
+    reverb_rt60 (measured completely independently: dry+wet mixed, a
+    sustained organ source, hold=4s). Genuine local dips (see
+    test_reverb_rt60_monotonic_per_type's hybrid tolerance) mean a handful
+    of individual points can disagree by more -- this checks the AGGREGATE
+    correlation across the whole bank is strong, not that every single
+    point matches within a tight band."""
+    data = _load()
+    pairs = []
+    for rtype, raw, _ in _ir_entries():
+        ref = data["reverb_rt60"].get(str(rtype), {}).get(str(raw))
+        if ref is None:
+            continue
+        path = CALIB_DIR / data["reverb_ir"][str(rtype)][str(raw)]
+        sr, audio = wavfile.read(str(path))
+        mono = audio.astype(np.float64).mean(axis=1)
+        ir_rt60 = _measure_rt60_for_test(mono, sr)
+        if ir_rt60 is not None:
+            pairs.append((ir_rt60, ref))
+    assert len(pairs) >= 10, f"too few IR/reverb_rt60 pairs to cross-validate ({len(pairs)})"
+    a = np.array([p[0] for p in pairs])
+    b = np.array([p[1] for p in pairs])
+    corr = float(np.corrcoef(a, b)[0, 1])
+    assert corr > 0.85, (
+        f"IR-measured RT60 correlates only {corr:.3f} with the independently "
+        f"measured reverb_rt60 table across {len(pairs)} points -- expected "
+        f"strong agreement between two independent RT60 measurements of the "
+        f"same underlying reverb algorithm"
+    )
+
+
+def _measure_rt60_for_test(mono, sr, hold_seconds=0.1):
+    """Minimal reimplementation of analyze_calibration.py's measure_rt60,
+    parameterized on the IR's own sample rate (48kHz, vs. the 64kHz
+    everything else in this file is measured at) -- kept local to this test
+    file rather than importing tools/analyze_calibration.py, which this
+    test suite otherwise treats as a black box producing calibration.json."""
+    tail = mono[int(hold_seconds * sr):]
+    if len(tail) < int(0.2 * sr):
+        return None
+    hop = max(1, int(0.001 * sr))
+    n = (len(tail) // hop) * hop
+    env = np.abs(tail[:n]).reshape(-1, hop).max(axis=1) + 1e-9
+    ref = float(env[:max(1, int(0.3 * sr / hop))].max())
+    if ref <= 1e-9:
+        return None
+    db = 20 * np.log10(env / ref)
+    t = np.arange(len(env)) * hop / sr
+    mask = (db <= -5) & (db >= -35)
+    if int(mask.sum()) < 5:
+        return None
+    slope = np.polyfit(t[mask], db[mask], 1)[0]
+    if slope >= -0.01:
+        return None
+    return float(-60.0 / slope)

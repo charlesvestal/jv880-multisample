@@ -76,15 +76,52 @@ REVERB_DAMPING = {0: 0.55, 1: 0.50, 2: 0.45, 3: 0.40, 4: 0.30, 5: 0.20}
 ROOMSIZE_RT60_REF = 6.0
 ROOMSIZE_FLOOR = 0.05
 
-# Delay/Pan-Dly (reverb types 6-7) were never swept by calibrate.cpp (it
-# only sweeps type in 0..5 -- see tools/calibrate.cpp's `with_reverb` loop
-# and tools/analyze_calibration.py's TYPE_RE, which never sees "6"/"7").
-# There is therefore no measured delay-time table; this is an explicit,
-# documented, uncalibrated best-effort mapping of the same raw "time" byte
-# onto a musically sane slapback/delay range, not a measured curve.
+# Delay/Pan-Dly (reverb types 6-7) time/feedback are now measured --
+# calibrate.cpp sweeps both types' reverbtime (on a percussive Marimba base
+# patch, dry signal present) and analyze_calibration.py locates the first
+# echo via cross-correlation against the same patch's own dry-attack shape,
+# writing calib/calibration.json's "delay_time_s" and "delay_feedback"
+# tables (see that file's DELAY_HOP block for the measurement rationale).
+# Real numbers: Delay (type 6) reaches ~0.49s at raw=127, Pan-Dly (type 7)
+# ~0.24s -- both comfortably in "slapback/short delay" territory, not the
+# ~1s ping-pong echo the previous invented DELAY_TIME_MAX_S=1.0 produced on
+# every max-time patch (reported by listening: "pads all have an odd
+# ping-pong delay").
+#
+# DELAY_TIME_MIN_S/MAX_S remain ONLY as an explicit, documented fallback
+# for when a real measured table isn't available (e.g.
+# tests/test_emit_presets.py's synthetic CAL fixture, which predates
+# delay_time_s) -- see _delay_time_s() below. They are never used when a
+# real calibration.json is loaded.
 DELAY_TIME_MIN_S = 0.02
 DELAY_TIME_MAX_S = 1.0
-PAN_DLY_STEREO_OFFSET = 3.0
+
+# Pan-Dly (type 7) measurably alternates its successive echoes between
+# channels (each repeat lands close to hard-panned, alternating sides --
+# confirmed directly by comparing L/R peak amplitude at each repeat's
+# measured arrival time); plain Delay (type 6) measured as genuinely
+# centred/mono, every repeat landing at ~50/50 L/R to within noise. That
+# measurement is WHETHER stereoOffset should be nonzero at all, and is
+# recorded per-type in calibration.json's "delay_pan_alternation".
+#
+# The stereoOffset MAGNITUDE below is not, and cannot be, derived the same
+# way: DecentSampler's stereoOffset is a TIME offset in seconds between the
+# L and R channels' own delay taps ("half of this amount is subtracted
+# from the left channel's delay time and half is added to the right" --
+# official developer guide's appendix on the delay effect), not an
+# amplitude pan -- there is no DS parameter that reproduces a hard
+# alternating L/R gain swing at all. PAN_DLY_STEREO_OFFSET_FRAC is
+# therefore a documented, REASONED proportion of the genuinely measured
+# delayTime (not a measurement), in the same spirit as the developer
+# guide's own worked example (stereoOffset=0.01-0.02s against a 0.5s
+# delayTime, a 2-4% stereo widening) -- picked somewhat more generous here
+# since the real hardware's channel alternation is much stronger than a
+# subtle Haas widening, while PAN_DLY_STEREO_OFFSET_MAX_S caps it well
+# below any plausible delayTime so it can never invert which channel
+# leads, which is what made the old fixed stereoOffset=3.0 nonsensical
+# against a ~1s (or, now, ~0.25-0.5s) delayTime.
+PAN_DLY_STEREO_OFFSET_FRAC = 0.15
+PAN_DLY_STEREO_OFFSET_MAX_S = 0.05
 
 # DecentSampler only supports these three LFO shapes; TRI has no exact
 # match and is approximated by sine (see design doc's capability table).
@@ -276,12 +313,76 @@ def _clamp01(x):
 # CHORUS_MAX_MOD_DEPTH is a deliberate, uncalibrated ceiling: DecentSampler's
 # chorus modDepth defaults to 0.2, and the JV's chorus is a gentle stereo
 # thickener rather than a vibrato, so full JV depth maps to a moderate value.
+#
+# Re-investigated (2026-07-29) using PURE-WET isolation -- drylevel=0,
+# chorussendlevel=127, all other tones muted, sweeping chorusdepth alone --
+# specifically to rule out the ORIGINAL failure's cause (dry/multi-tone
+# contamination). Four independent measurement attempts were tried on that
+# isolated signal: (1) RMS envelope excursion (the original metric, now
+# free of dry contamination), (2) autocorrelation-based pitch tracking,
+# (3) Hilbert-transform instantaneous frequency, (4) (3) plus robust
+# MAD-based outlier rejection to reject the comb-filter-null artifacts (3)
+# is prone to. ALL FOUR produced the same non-monotonic shape (rising then
+# falling across the sweep, peaking mid-range) or, for the pitch-tracking
+# attempts specifically, additional gross octave-lock errors at higher
+# depth settings -- not the monotonic "zero depth -> zero modulation" shape
+# a real chorus-depth control should have. Isolating the signal ruled out
+# the ORIGINAL contamination theory but did not produce a clean
+# measurement; a plausible remaining cause is this base patch's own
+# baked-in chorusfeedback=100/127 (see tools/calibrate.cpp's neighbouring
+# note on the SAME patch's chorusfeedback -- zeroing it was already shown
+# elsewhere to make an unrelated measurement categorically worse, so it
+# isn't a free fix here either). Per the task's own rule ("if a quantity
+# doesn't measure cleanly, say so and fall back to a documented
+# proportional mapping rather than shipping a noisy table"), this stays
+# proportional.
 CHORUS_MAX_MOD_DEPTH = 0.35
 
 
 def amount(raw, ceiling=1.0):
     """Map a JV 0-127 amount onto a 0-1 amount, proportionally."""
     return _clamp01(max(0.0, min(127, float(raw))) / 127.0 * ceiling)
+
+
+def _delay_time_s(cal, rtype, raw_time):
+    """Measured echo spacing for reverb type `rtype` (6=Delay, 7=Pan-Dly)
+    at raw byte `raw_time`, from calibration.json's "delay_time_s" table
+    (see this module's comment above PAN_DLY_STEREO_OFFSET_FRAC for how it
+    was measured). Falls back to the documented-but-uncalibrated linear
+    guess (DELAY_TIME_MIN_S..MAX_S) only when no real table is available at
+    all -- e.g. tests/test_emit_presets.py's synthetic CAL fixture, which
+    predates this table; a real calib/calibration.json always has it."""
+    table = cal.get("delay_time_s", {}).get(str(rtype))
+    if table:
+        try:
+            return interp_table(table, raw_time)
+        except ValueError:
+            pass
+    return DELAY_TIME_MIN_S + (raw_time / 127.0) * (DELAY_TIME_MAX_S - DELAY_TIME_MIN_S)
+
+
+def _delay_feedback(cal, rtype, raw_feedback):
+    """Measured per-repeat gain for reverb type `rtype` at raw byte
+    `raw_feedback`, from calibration.json's "delay_feedback" table. Falls
+    back to a straight proportional mapping when unavailable -- DS's own
+    `feedback` parameter is ALSO defined as a 0-1 linear per-repeat gain
+    (see the official developer guide), so this fallback is a reasonable
+    amount()-style default, not a wild guess, even when unmeasured."""
+    table = cal.get("delay_feedback", {}).get(str(rtype))
+    if table:
+        try:
+            return interp_table(table, raw_feedback)
+        except ValueError:
+            pass
+    return amount(raw_feedback)
+
+
+def _pan_dly_stereo_offset(delay_time_s):
+    """DS stereoOffset for a Pan-Dly patch with the given (measured)
+    delayTime -- see this module's PAN_DLY_STEREO_OFFSET_FRAC comment for
+    why this is a documented, reasoned proportion, not a measurement."""
+    return round(min(PAN_DLY_STEREO_OFFSET_MAX_S,
+                      PAN_DLY_STEREO_OFFSET_FRAC * delay_time_s), 4)
 
 
 def build_effects(meta, cal):
@@ -311,11 +412,11 @@ def build_effects(meta, cal):
 
     if rtype in DELAY_TYPE_INDICES:
         wet = _clamp01(amount(rv["level"]) * reverb_send_norm)
-        delay_time = DELAY_TIME_MIN_S + (rv["time"] / 127.0) * (DELAY_TIME_MAX_S - DELAY_TIME_MIN_S)
+        delay_time = _delay_time_s(cal, rtype, rv["time"])
         reverb_effect = ("delay", {
             "delayTime": round(delay_time, 4),
-            "feedback": round(rv["feedback"] / 127.0, 4),
-            "stereoOffset": PAN_DLY_STEREO_OFFSET if rtype == 7 else 0.0,
+            "feedback": round(_delay_feedback(cal, rtype, rv["feedback"]), 4),
+            "stereoOffset": _pan_dly_stereo_offset(delay_time) if rtype == 7 else 0.0,
             "wetLevel": round(wet, 4),
         })
     else:

@@ -146,6 +146,7 @@ import sys
 
 import numpy as np
 from scipy.io import wavfile
+from scipy.signal import find_peaks, resample_poly
 
 SR = 64000
 HOLD_SECONDS = 4.0   # must match calibrate.cpp's default GridSpec.hold_seconds
@@ -160,6 +161,50 @@ ARTIFACT_BANDS_HZ = [(3.2, 3.6), (6.6, 7.1), (10.0, 11.0)]
 
 RAW_RE = re.compile(r"_(\d+)\.wav$")
 TYPE_RE = re.compile(r"reverb_t(\d+)_time_")
+DELAY_FB_TYPE_RE = re.compile(r"delay_t(\d+)_feedback_")
+IR_TYPE_RE = re.compile(r"ir_t(\d+)_time_")
+
+# --- Delay/Pan-Dly (reverb types 6-7) echo-time measurement ----------------
+#
+# calibrate.cpp renders these on the Marimba base patch (percussive, unlike
+# the sustained Pipe Organ 3 used above) with the dry signal PRESENT, so the
+# render contains both the original strike and its echo(es). The first echo
+# is located by cross-correlating the render's envelope against a TEMPLATE
+# -- the same patch's own dry attack shape, from delay_dry.wav -- rather
+# than by peak-picking the render's own envelope directly.
+#
+# Peak-picking was tried first and failed: a percussive attack's natural
+# decay is not smooth (harmonic beating in this 4-tone patch produces
+# incidental bumps of up to ~30%, confirmed by direct inspection), so both
+# "look for a local maximum" and "look for a rebound above the recent local
+# minimum" produced false positives on that ripple, often well before the
+# genuine echo, and were confused entirely once the echo grew TALLER than
+# the original attack (which happens routinely here). Cross-correlating
+# against the attack's own shape is far more selective: an unrelated ripple
+# in the natural decay does not resemble a scaled copy of the attack ONSET,
+# so it does not produce a comparably tall cross-correlation peak, while a
+# genuine echo -- being an actual delayed, scaled copy of that same attack
+# -- does, regardless of its absolute amplitude.
+DELAY_HOP = 32                  # 0.5ms/bin @ 64kHz -- resolves the shortest
+                                 # measured delay times (tens of ms) cleanly
+DELAY_TEMPLATE_S = 0.025        # dry-attack template length for cross-correlation
+DELAY_GUARD_S = 0.004           # skip this much of the cross-correlation's own
+                                 # near-zero-lag self-similarity before searching
+DELAY_MIN_PROM_FRAC = 0.12      # min peak prominence, as a fraction of the
+                                 # template's own zero-lag autocorrelation height
+
+# Windows for the feedback (per-repeat decay) measurement, in units of the
+# repeat period T. Both windows are placed well past Pan-Dly's fixed,
+# feedback-INDEPENDENT first "there and back" pair (2 repeats -- see
+# measure_delay_feedback_gain's docstring), and are 2 periods wide so each
+# one averages over multiple repeat cycles rather than depending on exactly
+# where a single repeat lands.
+DELAY_FB_EARLY_MULT = (3.0, 5.0)
+DELAY_FB_LATE_MULT = (15.0, 17.0)
+
+IR_TARGET_SR = 48000            # standard rate for a shipped IR file
+IR_FADE_MS = 15                 # short linear fade-out to avoid a click at the
+                                 # silence-threshold truncation point
 
 
 def raw_from_name(path):
@@ -171,6 +216,20 @@ def raw_from_name(path):
 
 def type_from_name(path):
     m = TYPE_RE.search(os.path.basename(path))
+    if not m:
+        raise ValueError(f"can't parse reverb type from {path}")
+    return int(m.group(1))
+
+
+def delay_fb_type_from_name(path):
+    m = DELAY_FB_TYPE_RE.search(os.path.basename(path))
+    if not m:
+        raise ValueError(f"can't parse reverb type from {path}")
+    return int(m.group(1))
+
+
+def ir_type_from_name(path):
+    m = IR_TYPE_RE.search(os.path.basename(path))
     if not m:
         raise ValueError(f"can't parse reverb type from {path}")
     return int(m.group(1))
@@ -202,6 +261,21 @@ def load_lr_diff(path):
     if len(shape) < 2 or shape[1] < 2:
         return np.zeros(len(data))
     return data[:, 0] - data[:, 1]
+
+
+def load_stereo(path):
+    """Raw stereo samples as float64, shape (n, 2). The delay/pan
+    measurements below need L and R separately (to measure pan) as well as
+    combined (to locate echoes), unlike the mono/L-R-difference helpers
+    above."""
+    sr, data = wavfile.read(path)
+    assert sr == SR, f"unexpected sample rate {sr} in {path}"
+    data = data.astype(np.float64)
+    shape = data.shape
+    if len(shape) < 2 or shape[1] < 2:
+        mono = data if len(shape) == 1 else data[:, 0]
+        return np.stack([mono, mono], axis=1)
+    return data
 
 
 def env_rms(x, hop):
@@ -471,6 +545,213 @@ def measure_rt60(mono, hold_seconds=HOLD_SECONDS):
     return float(-60.0 / slope)
 
 
+# --- Delay/Pan-Dly (reverb types 6-7): echo time, feedback, pan ------------
+
+def env_max_combined(stereo, hop):
+    """Per-hop peak magnitude of max(|L|, |R|). Used (instead of a mono
+    downmix) to locate delay/echo events: Pan-Dly's measured ping-pong
+    behaviour (see measure_pan_alternation) puts successive repeats almost
+    entirely in ONE channel at a time, and an L+R downmix would attenuate --
+    or for a hard-panned repeat, nearly cancel -- whichever repeat lands
+    opposite the previous one. Taking the max per channel never misses one."""
+    combined = np.maximum(np.abs(stereo[:, 0]), np.abs(stereo[:, 1]))
+    return env_max(combined, hop)
+
+
+def delay_template(dry_path, hop=DELAY_HOP, template_s=DELAY_TEMPLATE_S):
+    """The dry attack's own envelope shape (from delay_dry.wav), used as a
+    cross-correlation template by measure_first_echo_time_s to locate
+    copies of it later in a wet render -- see that function's docstring for
+    why matched filtering, not peak-picking."""
+    stereo = load_stereo(dry_path)
+    env = env_max_combined(stereo, hop)
+    n = max(4, int(template_s * SR / hop))
+    return env[:n]
+
+
+def measure_first_echo_time_s(wet_path, template, hop=DELAY_HOP,
+                               guard_s=DELAY_GUARD_S,
+                               min_prom_frac=DELAY_MIN_PROM_FRAC):
+    """Locate the first echo of the dry attack in a Delay/Pan-Dly render
+    (see the DELAY_HOP block's module-level comment for the full rationale).
+    Cross-correlates the render's envelope against `template`; the dry
+    attack itself produces a strong self-match at lag 0 (returned as
+    `peak0` below), and the delay's first repeat produces a second, weaker
+    match at lag = delay time.
+
+    Returns None when no echo is confidently located -- observed at raw=0
+    on both types, where the delay time is short enough that any echo is
+    indistinguishable from the attack's own onset. Callers must not
+    fabricate a number in that case."""
+    stereo = load_stereo(wet_path)
+    env = env_max_combined(stereo, hop)
+    tpl = template / (np.linalg.norm(template) + 1e-9)
+    n = len(tpl)
+    if len(env) <= n:
+        return None
+    xc = np.correlate(env, tpl, mode="full")
+    zero_lag = n - 1
+    xc_pos = xc[zero_lag:]              # lag >= 0
+    if len(xc_pos) < 3:
+        return None
+    peak0 = xc_pos[0]                    # the dry attack's own self-match
+    if peak0 <= 0:
+        return None
+    guard_hops = max(1, int(guard_s * SR / hop))
+    if guard_hops >= len(xc_pos):
+        return None
+    search = xc_pos[guard_hops:]
+    pk, _ = find_peaks(search, prominence=peak0 * min_prom_frac)
+    if len(pk) == 0:
+        return None
+    k = int(pk[0]) + guard_hops
+    k_ref = parabolic_peak(xc_pos, k)
+    return float(k_ref * hop / SR)
+
+
+def _rms_window(stereo, t0, t1):
+    """RMS over [t0, t1) seconds, zero-padded if the render is shorter than
+    t1. A low-feedback render legitimately decays to true silence -- and
+    can be truncated early by render_note()'s own tail early-exit -- well
+    before a late window like this; that IS "no signal left here", not a
+    measurement failure, so it must contribute true silence to the RMS, not
+    be skipped (matching measure_tail_extra_energy's zero-padding
+    approach above)."""
+    n_total = int(round((t1 - t0) * SR))
+    if n_total <= 0:
+        return 0.0
+    i0 = int(round(t0 * SR))
+    i1 = i0 + n_total
+    avail = stereo[max(0, i0):max(0, i1)]
+    if len(avail) == 0:
+        return 0.0
+    acc = np.sum(avail[:, 0] ** 2) + np.sum(avail[:, 1] ** 2)
+    return float(np.sqrt(acc / (2 * n_total)))
+
+
+def measure_delay_feedback_gain(wet_path, repeat_period_s,
+                                 early_mult=DELAY_FB_EARLY_MULT,
+                                 late_mult=DELAY_FB_LATE_MULT):
+    """Per-repeat gain (0-1) of a Delay/Pan-Dly's feedback: the ratio of
+    echo-train energy far out (15-17 repeat periods after the strike) vs.
+    only a few repeats out (3-5 periods), converted to an equivalent
+    per-repeat gain g via g**(dt/T) = ratio, where T is the repeat period
+    and dt is the gap between the two windows' centres (12T).
+
+    Why a windowed energy ratio, not per-echo peak-picking: peak-picking
+    each individual repeat (tried first, and used successfully by
+    measure_first_echo_time_s to locate the FIRST echo) does not generalise
+    to measuring feedback decay here, because Pan-Dly's ping-pong routing
+    gives it one full "there and back" pair (2 repeats) at a FIXED,
+    feedback-INDEPENDENT strength even at feedback=0 -- confirmed
+    empirically: those two repeats' heights are identical to 3-4
+    significant figures across the entire 0-127 feedback sweep -- before
+    feedback-scaled decay takes over from the 3rd repeat onward. Treating
+    those two fixed repeats as part of a single geometric decay biases a
+    fitted decay rate. A ratio between two WIDE (2-period) windows, both
+    placed well past that fixed pair, sidesteps needing to classify which
+    individual repeat is "real" vs. "free" at all, and each window averages
+    over multiple repeat cycles, which is robust to individual echoes
+    landing at different absolute levels depending on which channel a
+    ping-pong repeat happens to be panned to.
+
+    Returns None if repeat_period_s is missing/non-positive (the raw=64
+    delay-time point this sweep depends on was itself unmeasurable) --
+    callers must not fabricate a period to divide by."""
+    if repeat_period_s is None or repeat_period_s <= 0:
+        return None
+    stereo = load_stereo(wet_path)
+    T = repeat_period_s
+    e0, e1 = early_mult
+    l0, l1 = late_mult
+    early = _rms_window(stereo, e0 * T, e1 * T)
+    late = _rms_window(stereo, l0 * T, l1 * T)
+    if early <= 1e-9:
+        return None
+    ratio = late / early
+    if ratio <= 0:
+        return 0.0
+    dt = ((l0 + l1) / 2.0 - (e0 + e1) / 2.0) * T
+    if dt <= 0:
+        return None
+    g = ratio ** (T / dt)
+    return float(np.clip(g, 0.0, 0.999))
+
+
+def measure_pan_alternation(wet_path, repeat_period_s, n_repeats=8):
+    """How strongly a Delay/Pan-Dly's successive echoes alternate between
+    channels: the range (max - min) of each repeat's L fraction (L_peak /
+    (L_peak + R_peak)), sampled at the ALREADY-measured repeat spacing (n *
+    repeat_period_s for n=1..n_repeats). ~0 means every repeat is centred
+    the same way (a genuinely mono/centred delay, as measured for type 6);
+    a large range (measured ~0.5 for type 7) means repeats swing between
+    mostly-L and mostly-R -- a real ping-pong.
+
+    Repeat times are taken from the already-measured repeat period rather
+    than re-detecting each one independently: this is meant to be run on a
+    HIGH-feedback render (many repeats, needed to see an alternation
+    pattern at all), where individual repeats increasingly overlap/smear
+    together and independent per-repeat cross-correlation is unreliable --
+    but the repeat SPACING itself is already known precisely from
+    measure_first_echo_time_s, so re-deriving it isn't necessary."""
+    if repeat_period_s is None or repeat_period_s <= 0:
+        return None
+    stereo = load_stereo(wet_path)
+    win = max(1, int(0.006 * SR))   # +/-6ms peak window around each repeat
+    fracs = []
+    for n in range(1, n_repeats + 1):
+        centre = int(n * repeat_period_s * SR)
+        i0, i1 = centre - win, centre + win
+        if i0 < 0 or i1 > len(stereo):
+            break
+        seg = stereo[i0:i1]
+        l = np.abs(seg[:, 0]).max()
+        r = np.abs(seg[:, 1]).max()
+        tot = l + r
+        if tot < 1e-6:
+            continue
+        fracs.append(l / tot)
+    if len(fracs) < 2:
+        return None
+    return float(max(fracs) - min(fracs))
+
+
+# --- Reverb impulse-response capture (types 0-5) ---------------------------
+
+def write_ir_wav(src_path, dst_path, target_sr=IR_TARGET_SR, fade_ms=IR_FADE_MS):
+    """Resample a captured pure-wet reverb render (calibrate.cpp's
+    pure_wet_reverb sweep) to `target_sr` and write it as the final IR file
+    DecentSampler's <effect type="convolution"> consumes, with a short
+    linear fade-out at the very end: the render's own silence-threshold
+    truncation (GridSpec.silence_db=-60 in calibrate.cpp) is an abrupt stop
+    once the tail drops below that floor, not a natural decay to nothing,
+    so a few milliseconds of fade avoids an audible click there.
+
+    Returns the written file's duration in seconds, or None if the source
+    render was too short to be a usable IR (shouldn't happen in practice --
+    every captured type/raw combination produced a real decaying tail --
+    but this is the same "don't fabricate, report the gap" policy as every
+    other measurement in this file)."""
+    sr, data = wavfile.read(src_path)
+    assert sr == SR, f"unexpected sample rate {sr} in {src_path}"
+    data = data.astype(np.float64)
+    if data.ndim == 1:
+        data = np.stack([data, data], axis=1)
+    if len(data) < 8:
+        return None
+    resampled = resample_poly(data, target_sr, sr, axis=0)
+    fade_n = min(len(resampled), int(fade_ms / 1000.0 * target_sr))
+    if fade_n > 1:
+        fade = np.linspace(1.0, 0.0, fade_n)[:, None]
+        resampled[-fade_n:] *= fade
+    dst_dir = os.path.dirname(dst_path)
+    if dst_dir:
+        os.makedirs(dst_dir, exist_ok=True)
+    out16 = np.clip(np.round(resampled), -32768, 32767).astype(np.int16)
+    wavfile.write(dst_path, target_sr, out16)
+    return len(resampled) / float(target_sr)
+
+
 def collect(pattern, key_fn=raw_from_name):
     files = sorted(glob.glob(pattern), key=key_fn)
     return [(key_fn(f), f) for f in files]
@@ -491,6 +772,10 @@ def main():
         "chorus_mix": {},
         "reverb_rt60": {},
         "reverb_wet": {},
+        "delay_time_s": {},
+        "delay_feedback": {},
+        "delay_pan_alternation": {},
+        "reverb_ir": {},
     }
 
     # --- chorus rate -----------------------------------------------------
@@ -566,6 +851,120 @@ def main():
                       for _, f in wet_items]
         for raw, v in zip(wet_raws, normalize_0_1(wet_metric)):
             result["reverb_wet"][str(raw)] = round(v, 4)
+
+    # --- Delay/Pan-Dly (types 6-7): echo time --------------------------
+    # See the DELAY_HOP block's module-level comment for the measurement
+    # rationale (cross-correlation against the dry attack's own shape,
+    # from delay_dry.wav).
+    delay_dry_path = os.path.join(calib_dir, "delay_dry.wav")
+    if os.path.exists(delay_dry_path):
+        tpl = delay_template(delay_dry_path)
+        for dtype in (6, 7):
+            pattern = os.path.join(calib_dir, f"reverb_t{dtype}_time_*.wav")
+            items = collect(pattern)
+            table = {}
+            for raw, f in items:
+                t_s = measure_first_echo_time_s(f, tpl)
+                if t_s is None:
+                    print(f"WARNING: delay time unmeasurable for type={dtype} "
+                          f"raw={raw} (no echo confidently distinguishable from "
+                          f"the attack itself at this setting) -- recording "
+                          f"null, not a fabricated number", file=sys.stderr)
+                    table[str(raw)] = None
+                else:
+                    table[str(raw)] = round(t_s, 4)
+            result["delay_time_s"][str(dtype)] = table
+    else:
+        print(f"WARNING: missing {delay_dry_path} -- skipping delay_time_s, "
+              f"delay_feedback, delay_pan_alternation entirely", file=sys.stderr)
+
+    # --- Delay/Pan-Dly (types 6-7): feedback (per-repeat gain) + pan ----
+    # calibrate.cpp fixes time=64 for this sweep -- look up the repeat
+    # period T for that exact raw value from delay_time_s (just measured
+    # above) rather than re-deriving it, so the two measurements stay
+    # self-consistent with whatever this run's own delay_time_s reported.
+    for dtype in (6, 7):
+        time_table = result["delay_time_s"].get(str(dtype), {})
+        T = time_table.get("64")
+        fb_table = {}
+        items = collect(os.path.join(calib_dir, f"delay_t{dtype}_feedback_*.wav"))
+        if T is None:
+            if items:
+                print(f"WARNING: delay_time_s[{dtype}]['64'] unmeasurable -- "
+                      f"can't convert type={dtype}'s feedback sweep into a "
+                      f"per-repeat gain (needs the repeat period); recording "
+                      f"nulls, not fabricated numbers", file=sys.stderr)
+            for raw, _ in items:
+                fb_table[str(raw)] = None
+        else:
+            for raw, f in items:
+                g = measure_delay_feedback_gain(f, T)
+                if g is None:
+                    print(f"WARNING: delay feedback gain unmeasurable for "
+                          f"type={dtype} raw={raw} -- recording null, not a "
+                          f"fabricated number", file=sys.stderr)
+                    fb_table[str(raw)] = None
+                else:
+                    fb_table[str(raw)] = round(g, 4)
+        result["delay_feedback"][str(dtype)] = fb_table
+
+        # Pan alternation: measured on the SAME sweep's highest-feedback
+        # render (most repeats -> most reliable), reusing T from above.
+        fb127_path = os.path.join(calib_dir, f"delay_t{dtype}_feedback_127.wav")
+        if T is not None and os.path.exists(fb127_path):
+            alt = measure_pan_alternation(fb127_path, T)
+            if alt is None:
+                print(f"WARNING: pan alternation unmeasurable for type={dtype} "
+                      f"-- recording null, not a fabricated number",
+                      file=sys.stderr)
+            result["delay_pan_alternation"][str(dtype)] = (
+                round(alt, 4) if alt is not None else None)
+        else:
+            result["delay_pan_alternation"][str(dtype)] = None
+
+    # --- Reverb impulse responses (types 0-5) ---------------------------
+    # Resample each pure-wet capture to calib/ir/*.wav (see write_ir_wav),
+    # record its path in reverb_ir, and cross-check its own RT60 (measured
+    # directly on the IR, which -- being pure-wet -- IS essentially just a
+    # decay tail) against the reverb_rt60 table above, computed completely
+    # independently (dry+wet mixed, sustained organ source, hold=4s vs.
+    # this capture's hold=0.1s). Agreement between the two is a genuine
+    # cross-validation, not a tautology.
+    ir_items_by_type = {}
+    for rtype in range(6):
+        items = collect(os.path.join(calib_dir, f"ir_t{rtype}_time_*.wav"))
+        if items:
+            ir_items_by_type[rtype] = items
+
+    if ir_items_by_type:
+        print("--- reverb IR bank: RT60 cross-check (independent measurement "
+              "vs. the IR capture itself) ---", file=sys.stderr)
+    for rtype, items in ir_items_by_type.items():
+        table = {}
+        for raw, src in items:
+            dst = os.path.join(calib_dir, "ir", f"reverb_t{rtype}_time_{raw:03d}.wav")
+            dur = write_ir_wav(src, dst)
+            if dur is None:
+                print(f"WARNING: IR unusable for type={rtype} raw={raw} "
+                      f"(captured render too short) -- omitting, not "
+                      f"fabricating a placeholder file", file=sys.stderr)
+                table[str(raw)] = None
+                continue
+            table[str(raw)] = f"ir/reverb_t{rtype}_time_{raw:03d}.wav"
+
+            ir_rt60 = measure_rt60(load_mono(src), hold_seconds=0.1)
+            ref_rt60 = result["reverb_rt60"].get(str(rtype), {}).get(str(raw))
+            if ir_rt60 is not None and ref_rt60 is not None:
+                rel = abs(ir_rt60 - ref_rt60) / max(ref_rt60, 0.05)
+                flag = "" if rel <= 0.25 else "  <-- DISAGREES (>25%)"
+                print(f"  type={rtype} raw={raw:3d}  ir_rt60={ir_rt60:6.3f}s  "
+                      f"reverb_rt60={ref_rt60:6.3f}s  dur={dur:5.2f}s{flag}",
+                      file=sys.stderr)
+            else:
+                print(f"  type={rtype} raw={raw:3d}  ir_rt60={ir_rt60}  "
+                      f"reverb_rt60={ref_rt60}  dur={dur:5.2f}s (no cross-check)",
+                      file=sys.stderr)
+        result["reverb_ir"][str(rtype)] = table
 
     out_path = os.path.join(calib_dir, "calibration.json")
     with open(out_path, "w") as fh:
