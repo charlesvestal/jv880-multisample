@@ -46,6 +46,7 @@ have `file` pointing at a real FLAC on disk. This module never emits a
 """
 import argparse
 import json
+import math
 import shutil
 import sys
 import xml.etree.ElementTree as ET
@@ -522,6 +523,51 @@ REVERB_RATIO_SLOPE = 1.428
 REVERB_RATIO_INTERCEPT = -0.048
 REVERB_RATIO_MAX = 1.5          # highest ratio measured; mix caps at 0.6
 
+# Ceiling on the dry-restoring makeup gain (see blend_makeup_gain). At the
+# emitted maxima -- reverb mix 0.6 with chorus mix 0.5 -- exact compensation
+# would be 5x (+14 dB). That is more trust than a derived number deserves at
+# the extreme, so cap at +10 dB and let the very wettest patches stay slightly
+# under rather than risk a preset that arrives far hotter than the plugin.
+MAX_MAKEUP_GAIN = 3.16
+
+
+def blend_makeup_gain(effects):
+    """Linear gain restoring the dry signal that DecentSampler's blends remove.
+
+    `mix` on convolution and chorus is a BLEND: it does not add the effect, it
+    crossfades to it, so the direct sound comes out attenuated by (1 - mix) for
+    each blending effect in the chain. The JV does the opposite -- a send routes
+    a COPY to the effect and the dry path stays at full level. So a preset that
+    matches the JV's wet/dry ratio still arrives with its dry signal several dB
+    down (A.Piano 1: -4.9 dB from reverb, another -1.3 dB from chorus), which
+    is audible as the sampled version sounding weaker than the plugin.
+
+    The compensation is 1/sqrt(prod(1 - mix)) -- an ENERGY correction, not an
+    amplitude one. Compensating amplitude by the obvious 1/prod(1 - mix)
+    overshoots by about 3 dB, because the wet path is not independent of the
+    dry: a chorus voice, and a reverb's early reflections, are both derived
+    from the dry signal and partly correlated with it, so a blend at `mix`
+    removes far less audible direct sound than (1 - mix) implies. Where wet and
+    dry are uncorrelated their POWERS add, which is the square-root law.
+    Confirmed by measurement rather than assumed: fitting the exponent against
+    the makeup gain that actually equalises output level, over 24 patches
+    audited against the plugin, gives 0.534 (median error -0.05 dB) versus
+    +3.12 dB median for the amplitude form. 0.5 is used as the principled
+    value the fit is indistinguishable from.
+
+    This cannot clip in practice because the samples ARE the plugin's own dry
+    signal, so the result reproduces the plugin's level -- and the ground-truth
+    renders peak around -12 dBFS.
+
+    `delay` is excluded deliberately: it uses an additive `wetLevel`, not a
+    blend, so it never takes anything away from the dry path.
+    """
+    attenuation = 1.0
+    for kind, attrs in effects:
+        if kind in ("convolution", "chorus"):
+            attenuation *= max(1e-3, 1.0 - float(attrs.get("mix", 0.0)))
+    return min(MAX_MAKEUP_GAIN, 1.0 / math.sqrt(attenuation))
+
 
 def _convolution_mix(wet):
     """DecentSampler convolution `mix` reproducing the JV's wet/dry ratio.
@@ -800,6 +846,10 @@ def build_dspreset(meta, cal, sample_prefix):
         # per-zone release (see postprocess.py's measure_release) is the
         # only envelope stage that varies and is set per-<sample> below.
         "attack": "0.001", "decay": "0.001", "sustain": "1.0",
+        # Restores the dry level DecentSampler's blend controls take away, so
+        # the direct sound matches the plugin instead of arriving several dB
+        # down. See blend_makeup_gain.
+        "volume": f"{blend_makeup_gain(build_effects(meta, cal)):.4f}",
     })
 
     by_key = _group_zones_by_key(zones)

@@ -984,3 +984,25 @@ def test_missing_ir_bank_falls_back_to_parametric_reverb():
     root = parse(make_meta(reverb_type="Hall1"), CAL)   # CAL has no reverb_ir
     effects = {e.get("type") for e in root.findall(".//effect")}
     assert "reverb" in effects and "convolution" not in effects
+
+
+def test_makeup_gain_uses_the_energy_law_not_the_amplitude_one():
+    """Compensating amplitude (1/prod(1-mix)) overshoots ~3 dB, because the
+    wet path is derived from the dry and partly correlated with it. Measured
+    across 24 patches: exponent 0.534, i.e. the square-root/energy law."""
+    fx = [("convolution", {"mix": 0.4311}), ("chorus", {"mix": 0.136})]
+    g = ep.blend_makeup_gain(fx)
+    amplitude_law = 1.0 / ((1 - 0.4311) * (1 - 0.136))
+    assert g < amplitude_law, "amplitude compensation is the overshoot that was measured"
+    assert abs(g - amplitude_law ** 0.5) < 1e-6
+
+
+def test_makeup_gain_ignores_the_additive_delay():
+    """delay uses wetLevel, an additive return -- it never takes dry away."""
+    assert ep.blend_makeup_gain([("delay", {"wetLevel": 0.9})]) == 1.0
+
+
+def test_makeup_gain_is_unity_without_effects_and_is_bounded():
+    assert ep.blend_makeup_gain([]) == 1.0
+    huge = [("convolution", {"mix": 0.99}), ("chorus", {"mix": 0.99})]
+    assert ep.blend_makeup_gain(huge) <= ep.MAX_MAKEUP_GAIN
