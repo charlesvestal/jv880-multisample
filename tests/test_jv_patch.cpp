@@ -1,12 +1,39 @@
 #include "jv_patch.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <vector>
 
 static int failures = 0;
 static void check(bool c, const char *what) {
     if (!c) { fprintf(stderr, "FAIL: %s\n", what); failures++; }
     else    { fprintf(stderr, "ok: %s\n", what); }
+}
+
+// A valid region list must tile 1..127 exactly: starts at 1, ends at 127,
+// every region non-empty (lo <= hi), and each region's hi+1 equals the
+// next region's lo -- no gap, no overlap, regardless of what produced it.
+static bool tiles_exactly(const std::vector<jv::VelocityRegion> &regions) {
+    if (regions.empty()) return false;
+    if (regions.front().lo != 1) return false;
+    if (regions.back().hi != 127) return false;
+    for (size_t i = 0; i < regions.size(); i++) {
+        if (regions[i].lo > regions[i].hi) return false;
+        if (i + 1 < regions.size() && regions[i].hi + 1 != regions[i + 1].lo) return false;
+    }
+    return true;
+}
+
+// Sets tone `tone`'s velocityrangelower/upper (bytes 3/4) and level (byte
+// 67, 0 = inactive) on a patch buffer that's otherwise whatever the caller
+// already put there -- callers are expected to memset a fresh buffer
+// first so unrelated bytes don't leak state between synthetic patches.
+static void set_tone_vel_range(uint8_t *patch, int tone, int lo, int hi, int level) {
+    uint8_t *tp = patch + jv::TONE_BASE + tone * jv::TONE_STRIDE;
+    tp[3] = (uint8_t)lo;
+    tp[4] = (uint8_t)hi;
+    tp[67] = (uint8_t)level;
 }
 
 int main(int argc, char **argv) {
@@ -238,6 +265,140 @@ int main(int argc, char **argv) {
         if ((o[13] & 0x7f) != 0 || (o[16] & 0x7f) != 0) { preprocess_ok = false; break; }
     }
     check(preprocess_ok, "preprocess dry on all 192 ROM patches");
+
+    // ---- Velocity-region tests (adaptive velocity layers) ----
+
+    // read_tone_velocity_range reads the raw bytes with no interpretation.
+    {
+        uint8_t rp[jv::PATCH_SIZE];
+        memset(rp, 0, sizeof(rp));
+        set_tone_vel_range(rp, 0, 37, 91, 50);
+        jv::ToneVelocityRange r = jv::read_tone_velocity_range(rp, 0);
+        check(r.lo == 37 && r.hi == 91, "read_tone_velocity_range reads bytes 3/4 raw");
+    }
+
+    // A synthetic patch with tones split at a known velocity must produce
+    // regions whose boundaries match exactly. min_layers=2 here (not the
+    // production default of 3) isolates the raw switch-boundary detection
+    // from the separate minimum-layer apportionment tested below.
+    {
+        uint8_t sp[jv::PATCH_SIZE];
+        memset(sp, 0, sizeof(sp));
+        set_tone_vel_range(sp, 0, 1, 99, 100);     // active, low layer
+        set_tone_vel_range(sp, 1, 100, 127, 90);   // active, high layer
+        set_tone_vel_range(sp, 2, 1, 127, 0);      // inactive: level 0, must be ignored
+        set_tone_vel_range(sp, 3, 1, 127, 0);      // inactive: level 0, must be ignored
+        auto regions = jv::compute_velocity_regions(sp, /*min_layers=*/2, /*max_layers=*/5);
+        check(regions.size() == 2, "known 99/100 switch yields exactly 2 raw regions");
+        if (regions.size() == 2) {
+            check(regions[0].lo == 1 && regions[0].hi == 99,
+                  "raw region 0 matches the real tone range [1,99] exactly");
+            check(regions[1].lo == 100 && regions[1].hi == 127,
+                  "raw region 1 matches the real tone range [100,127] exactly");
+        }
+        check(tiles_exactly(regions), "known-switch regions tile 1..127 with no gaps/overlaps");
+    }
+
+    // Same known switch, but at the PRODUCTION default (min_layers=3):
+    // the real 99/100 boundary must survive apportionment untouched --
+    // only the wider side (1-99) may gain an extra internal split.
+    {
+        uint8_t sp[jv::PATCH_SIZE];
+        memset(sp, 0, sizeof(sp));
+        set_tone_vel_range(sp, 0, 1, 99, 100);
+        set_tone_vel_range(sp, 1, 100, 127, 90);
+        auto regions = jv::compute_velocity_regions(sp);   // default min=3, max=5
+        check(regions.size() == 3, "2 raw regions apportioned up to the default minimum of 3");
+        check(tiles_exactly(regions), "apportioned known-switch regions tile 1..127");
+        bool boundary_kept = false;
+        for (const auto &r : regions)
+            if (r.hi == 99) boundary_kept = true;
+        check(boundary_kept,
+              "the real switch boundary (...99|100...) survives minimum-layer apportionment");
+    }
+
+    // A patch with all tones spanning 1-127 (no switching at all) must
+    // produce the minimum layer count, tiling 1-127 with no gaps -- and,
+    // per the coordinator's "as now" requirement, must reproduce today's
+    // exact fixed-thirds split (1-42/43-85/86-127), not just some other
+    // 3-way division.
+    {
+        uint8_t np[jv::PATCH_SIZE];
+        memset(np, 0, sizeof(np));
+        set_tone_vel_range(np, 0, 1, 127, 100);
+        auto regions = jv::compute_velocity_regions(np);   // default min=3, max=5
+        check(regions.size() == 3, "no-switching patch gets exactly the minimum (3) layers");
+        check(tiles_exactly(regions), "no-switching regions tile 1..127 with no gaps");
+        check(regions.size() == 3 &&
+              regions[0].lo == 1  && regions[0].hi == 42  &&
+              regions[1].lo == 43 && regions[1].hi == 85  &&
+              regions[2].lo == 86 && regions[2].hi == 127,
+              "no-switching split reproduces today's exact fixed-thirds default (1-42/43-85/86-127)");
+    }
+
+    // The maximum-layer cap must engage on a patch with more regions than
+    // the cap, still tiling 1-127 with no gaps or overlaps. Four
+    // non-overlapping, staggered tone ranges (the most any JV patch can
+    // contribute, one per tone) plus the implicit top gap yield 8 raw
+    // regions -- comfortably past the default cap of 5.
+    {
+        uint8_t mp[jv::PATCH_SIZE];
+        memset(mp, 0, sizeof(mp));
+        set_tone_vel_range(mp, 0, 1,  10, 100);
+        set_tone_vel_range(mp, 1, 15, 25, 100);
+        set_tone_vel_range(mp, 2, 30, 40, 100);
+        set_tone_vel_range(mp, 3, 50, 60, 100);
+        auto raw = jv::compute_velocity_regions(mp, /*min_layers=*/1, /*max_layers=*/127);
+        check(raw.size() == 8, "pathological patch raw-partitions into more than the default cap (8)");
+        auto capped = jv::compute_velocity_regions(mp);   // default min=3, max=5
+        check(capped.size() == 5, "max-layer cap engages and reduces to exactly 5");
+        check(tiles_exactly(capped), "capped regions still tile 1..127 with no gaps or overlaps");
+    }
+
+    // Region bounds must always tile 1-127 exactly, regardless of input:
+    // a deterministic pseudo-random sweep over active-tone count, raw
+    // (possibly inverted/out-of-range) lo/hi bytes, and min/max_layers.
+    {
+        srand(0x1880);   // fixed seed: deterministic, reproducible
+        bool all_tiled = true;
+        const int TRIALS = 500;
+        for (int trial = 0; trial < TRIALS; trial++) {
+            uint8_t fp[jv::PATCH_SIZE];
+            memset(fp, 0, sizeof(fp));
+            int n_active = rand() % (jv::TONE_COUNT + 1);
+            for (int t = 0; t < n_active; t++) {
+                int a = rand() % 130;         // occasionally out of [1,127] or 0
+                int b = rand() % 130;
+                int level = 1 + rand() % 127; // always active when chosen
+                set_tone_vel_range(fp, t, a, b, level);
+            }
+            int min_l = 1 + rand() % 5;                 // 1..5
+            int max_l = min_l + rand() % (6 - min_l);   // min_l..5
+            auto regions = jv::compute_velocity_regions(fp, min_l, max_l);
+            if (!tiles_exactly(regions)) { all_tiled = false; break; }
+            if ((int)regions.size() < min_l && (int)regions.size() < 127) all_tiled = false;
+            if ((int)regions.size() > max_l) all_tiled = false;
+        }
+        check(all_tiled, "500-trial fuzz sweep: regions always tile 1..127 and respect min/max_layers");
+    }
+
+    // Run against all 192 internal patches and confirm every one produces
+    // a valid tiling, and tally the resulting layer-count distribution
+    // (this is the same computation the render-cost estimate is based on).
+    {
+        bool all_real_tiled = true;
+        int hist[8] = {0};   // hist[n] = number of patches with n layers (n <= 7)
+        for (const auto &pr : patches) {
+            auto regions = jv::compute_velocity_regions(pr.data);   // default min=3, max=5
+            if (!tiles_exactly(regions)) { all_real_tiled = false; break; }
+            int n = (int)regions.size();
+            if (n >= 0 && n < 8) hist[n]++;
+        }
+        check(all_real_tiled, "all 192 internal patches produce a valid 1..127 tiling");
+        fprintf(stderr, "info: internal-patch layer-count distribution: "
+                "3=%d 4=%d 5=%d (others: 0=%d 1=%d 2=%d 6=%d 7=%d)\n",
+                hist[3], hist[4], hist[5], hist[0], hist[1], hist[2], hist[6], hist[7]);
+    }
 
     fprintf(stderr, failures ? "\n%d FAILURES\n" : "\nALL TESTS PASSED\n", failures);
     return failures ? 1 : 0;

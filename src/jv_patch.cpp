@@ -1,5 +1,7 @@
 #include "jv_patch.h"
+#include <algorithm>
 #include <assert.h>
+#include <cmath>
 
 namespace jv {
 
@@ -83,6 +85,152 @@ ToneLfo read_tone_lfo(const uint8_t *patch, int tone, int lfo_index) {
         l.tva_depth   = (int8_t)tp[36];
     }
     return l;
+}
+
+ToneVelocityRange read_tone_velocity_range(const uint8_t *patch, int tone) {
+    const uint8_t *tp = tone_ptr(patch, tone);
+    ToneVelocityRange r;
+    r.lo = tp[3];   // velocityrangelower
+    r.hi = tp[4];   // velocityrangeupper
+    return r;
+}
+
+namespace {
+
+// Clamp+order a raw tone velocity range into a valid [1,127] interval with
+// lo <= hi. Real hardware constrains velocityrangelower/upper to exactly
+// that, but nothing stops a malformed byte from violating it, and
+// compute_velocity_regions must never build an out-of-domain or inverted
+// breakpoint from one.
+VelocityRegion clamp_tone_range(ToneVelocityRange r) {
+    int lo = r.lo, hi = r.hi;
+    if (lo < 1) lo = 1;
+    if (lo > 127) lo = 127;
+    if (hi < 1) hi = 1;
+    if (hi > 127) hi = 127;
+    if (lo > hi) std::swap(lo, hi);
+    return {lo, hi};
+}
+
+// Splits [r.lo, r.hi] into `count` contiguous, evenly-sized sub-bands using
+// the same even-division formula the fixed-thirds default already used
+// (1 + round(i * span / n)), so subdividing a single no-switching region
+// into min_layers pieces reproduces the exact 1-42/43-85/86-127 split
+// rather than a visibly different scheme.
+std::vector<VelocityRegion> split_even(VelocityRegion r, int count) {
+    if (count <= 1) return {r};
+    int span = r.hi - r.lo + 1;
+    std::vector<int> bounds(count + 1);
+    for (int i = 0; i < count; i++)
+        bounds[i] = r.lo + (int)std::lround(i * (double)span / count);
+    bounds[count] = r.hi + 1;   // force the exact end, no rounding drift
+    std::vector<VelocityRegion> out;
+    out.reserve(count);
+    for (int i = 0; i < count; i++)
+        out.push_back({bounds[i], bounds[i + 1] - 1});
+    return out;
+}
+
+} // namespace
+
+std::vector<VelocityRegion> compute_velocity_regions(const uint8_t *patch,
+                                                      int min_layers,
+                                                      int max_layers) {
+    // Defensive clamp mirroring tone_ptr's assert+clamp pattern: the
+    // precondition is a caller bug (every call site in this codebase uses
+    // sane literals), but Release builds compile asserts out, so a
+    // release build must still behave sanely rather than produce garbage
+    // (e.g. an inverted-range apportionment loop) if it's ever violated.
+    assert(min_layers >= 1 && min_layers <= max_layers);
+    if (max_layers < 1) max_layers = 1;
+    if (min_layers < 1) min_layers = 1;
+    if (min_layers > max_layers) min_layers = max_layers;
+
+    // Step 1: raw regions where the SET of active tones is constant.
+    // Every active tone contributes two breakpoints (its lo, and one past
+    // its hi); 1 and 128 are always present as sentinels, so this tiles
+    // 1..127 exactly even with zero active tones (a silent/degenerate
+    // patch still needs a valid region to render *something* into).
+    std::vector<int> breaks = {1, 128};
+    for (int t = 0; t < TONE_COUNT; t++) {
+        if (!tone_active(patch, t)) continue;
+        VelocityRegion r = clamp_tone_range(read_tone_velocity_range(patch, t));
+        breaks.push_back(r.lo);
+        breaks.push_back(r.hi + 1);
+    }
+    std::sort(breaks.begin(), breaks.end());
+    breaks.erase(std::unique(breaks.begin(), breaks.end()), breaks.end());
+
+    std::vector<VelocityRegion> regions;
+    regions.reserve(breaks.size());
+    for (size_t i = 0; i + 1 < breaks.size(); i++)
+        regions.push_back({breaks[i], breaks[i + 1] - 1});
+
+    // Step 2: cap at max_layers. Repeatedly merge whichever ADJACENT PAIR
+    // has the smallest combined width -- that pair loses the least
+    // switch-point resolution of any available merge, and it's the pair
+    // (not a lone region merged into a neighbor) that's "narrowest": the
+    // measured corpus tops out at 4 raw regions per patch, so in practice
+    // this is a safety net against a patch this codebase hasn't seen
+    // rather than something that fires on the known data.
+    while ((int)regions.size() > max_layers) {
+        size_t best = 0;
+        int best_width = regions[1].hi - regions[0].lo + 1;
+        for (size_t i = 1; i + 1 < regions.size(); i++) {
+            int width = regions[i + 1].hi - regions[i].lo + 1;
+            if (width < best_width) { best_width = width; best = i; }
+        }
+        regions[best].hi = regions[best + 1].hi;
+        regions.erase(regions.begin() + best + 1);
+    }
+
+    // Step 3: ensure at least min_layers. Velocity still modulates
+    // level/filter cutoff continuously within a single tone's range, so
+    // even a patch with a single switch-derived region needs more than
+    // one sampled layer. The shortfall is apportioned across the EXISTING
+    // regions proportional to width (greedy largest-quotient: repeatedly
+    // give the next split to whichever region currently has the largest
+    // width-per-sub-layer share), so a genuine switch boundary is never
+    // discarded to make room -- each region only ever gains additional
+    // even sub-splits inside itself. For the common case of one raw
+    // region spanning the whole keyboard, every slot goes to that one
+    // region, which is exactly today's fixed-thirds split (see
+    // split_even's comment).
+    int n = (int)regions.size();
+    if (n < min_layers) {
+        std::vector<int> sub_count(regions.size(), 1);
+        int extra = min_layers - n;
+        for (int k = 0; k < extra; k++) {
+            // A region can never usefully take more sub-layers than its
+            // own width (each sub-piece needs at least 1 velocity value);
+            // skip any region already at that ceiling so split_even()
+            // below can never be asked for more pieces than a region has
+            // room for. For any min_layers actually used in this codebase
+            // (<=5) this never triggers -- 1..127 always tiles exactly,
+            // so pigeonhole guarantees the widest of n<5 regions has
+            // ample width -- but it makes the function safe for
+            // arbitrary/adversarial min_layers too.
+            size_t best = 0;
+            double best_share = -1.0;
+            bool found = false;
+            for (size_t i = 0; i < regions.size(); i++) {
+                int width = regions[i].hi - regions[i].lo + 1;
+                if (sub_count[i] >= width) continue;
+                double share = (double)width / sub_count[i];
+                if (share > best_share) { best_share = share; best = i; found = true; }
+            }
+            if (!found) break;   // every region already down to 1-wide sub-pieces
+            sub_count[best]++;
+        }
+        std::vector<VelocityRegion> out;
+        for (size_t i = 0; i < regions.size(); i++) {
+            auto pieces = split_even(regions[i], sub_count[i]);
+            out.insert(out.end(), pieces.begin(), pieces.end());
+        }
+        regions = std::move(out);
+    }
+
+    return regions;
 }
 
 // True when every value in `vals` falls within a window of `tol` of every

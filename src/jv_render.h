@@ -20,9 +20,14 @@ static const int WARMUP_STEPS  = 100000;
 static const int NVRAM_PATCH_OFFSET = 0x0d70;
 static const int NVRAM_MODE_OFFSET  = 0x11;
 
+// Velocity is deliberately NOT part of GridSpec: lokey/hikey/key_step/
+// hold/tail/settle/silence_db apply uniformly to every patch, but velocity
+// layering is now patch-specific (see jv_patch.h's compute_velocity_regions)
+// -- each patch's own tone velocity-switch points determine its layer
+// count and placement, so it's computed fresh per patch by the caller
+// (jv_sampler.cpp) rather than fixed here.
 struct GridSpec {
     int lokey = 24, hikey = 96, key_step = 3;   // C1..C7 every 3 semitones
-    std::vector<int> velocities = {32, 72, 110};
     double hold_seconds   = 3.5;
     double tail_seconds   = 2.5;
     double settle_seconds = 0.5;

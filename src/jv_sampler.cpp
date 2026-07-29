@@ -202,6 +202,15 @@ int main(int argc, char **argv) {
         LfoDecision d2 = decide_lfo_strip(pr.data, 2);
         std::vector<uint8_t> bytes = preprocess(pr.data, d1, d2);
 
+        // Adaptive velocity layers: derive this patch's own layer count and
+        // boundaries from its tones' velocity-switch points (jv_patch.h),
+        // instead of always sampling 3 fixed thirds. Read from the
+        // original ROM bytes, not `bytes` -- preprocess() never touches
+        // the velocity-range bytes, but the ranges are patch identity, not
+        // a render-time transform, so reading the source of truth directly
+        // is the more obviously-correct choice regardless.
+        std::vector<VelocityRegion> regions = compute_velocity_regions(pr.data);
+
         char idx[16];
         snprintf(idx, sizeof(idx), "%03d", (int)pi);
         std::string pdir = out_dir + "/" + idx + "_" + sanitize(pr.name);
@@ -214,9 +223,17 @@ int main(int argc, char **argv) {
         r.load_patch_bytes(bytes, grid);
 
         std::string zones;
+        int zone_count = 0;
         for (int key = grid.lokey; key <= grid.hikey; key += grid.key_step) {
-            for (size_t v = 0; v < grid.velocities.size(); v++) {
-                int velocity = grid.velocities[v];
+            for (size_t v = 0; v < regions.size(); v++) {
+                const VelocityRegion &region = regions[v];
+                // Representative velocity: the region's midpoint,
+                // floor-biased on odd widths (matches jv_patch.cpp's
+                // split_even, which produced this region in the first
+                // place) -- simple, deterministic, and centered so a
+                // single sample best represents the whole band it covers.
+                int velocity = region.lo + (region.hi - region.lo) / 2;
+
                 std::vector<int16_t> pcm = r.render_note(key, velocity, grid);
                 int frames = (int)(pcm.size() / 2);
 
@@ -228,10 +245,12 @@ int main(int argc, char **argv) {
 
                 char zbuf[512];
                 snprintf(zbuf, sizeof(zbuf),
-                         "%s{\"key\":%d,\"velocity\":%d,\"layer\":%d,\"frames\":%d,\"file\":\"%s\"}",
-                         zones.empty() ? "" : ", ", key, velocity, (int)v + 1, frames,
-                         json_escape(fn).c_str());
+                         "%s{\"key\":%d,\"velocity\":%d,\"layer\":%d,\"lovel\":%d,\"hivel\":%d,"
+                         "\"frames\":%d,\"file\":\"%s\"}",
+                         zones.empty() ? "" : ", ", key, velocity, (int)v + 1,
+                         region.lo, region.hi, frames, json_escape(fn).c_str());
                 zones += zbuf;
+                zone_count++;
             }
         }
 
@@ -286,9 +305,9 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        int n_zones = (int)(((grid.hikey - grid.lokey) / grid.key_step) + 1) *
-                      (int)grid.velocities.size();
-        fprintf(stderr, "rendered %03d_%s (%d zones)\n", (int)pi, pr.name.c_str(), n_zones);
+        fprintf(stderr, "rendered %03d_%s (%d zones, %d velocity layer%s)\n",
+                (int)pi, pr.name.c_str(), zone_count,
+                (int)regions.size(), regions.size() == 1 ? "" : "s");
     }
 
     return 0;

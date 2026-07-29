@@ -35,6 +35,23 @@ struct LfoDecision {
     ToneLfo lfo;   // representative (mean of active tones) when strip is true
 };
 
+// Raw tone velocity-range bytes (offsets 3/4 within the 84-byte tone),
+// exactly as stored -- not clamped or validated. Real hardware constrains
+// these to 1-127 with lo <= hi, but nothing guarantees a ROM byte can't
+// violate that; callers that need a safe interval (compute_velocity_regions)
+// clamp it themselves rather than this raw accessor silently doing so.
+struct ToneVelocityRange {
+    int lo = 1, hi = 127;
+};
+
+// One contiguous MIDI velocity band, inclusive on both ends. A vector of
+// these returned by compute_velocity_regions() always tiles 1..127
+// exactly: the first region's lo is 1, the last region's hi is 127, and
+// consecutive regions abut with no gap or overlap.
+struct VelocityRegion {
+    int lo = 1, hi = 127;
+};
+
 // Every `patch` pointer below must point to at least PATCH_SIZE (see
 // jv_rom.h) readable bytes — a full 362-byte patch image, whether taken
 // from PatchRef::data or a synthetic test buffer. None of these functions
@@ -44,6 +61,32 @@ Effects     read_effects(const uint8_t *patch);
 ToneLfo     read_tone_lfo(const uint8_t *patch, int tone, int lfo_index /*1 or 2*/);
 bool        tone_active(const uint8_t *patch, int tone);
 LfoDecision decide_lfo_strip(const uint8_t *patch, int lfo_index);
+
+// Raw velocityrangelower/velocityrangeupper (tone bytes 3/4) for the given
+// tone, regardless of whether that tone is active. See ToneVelocityRange's
+// contract note above: unclamped.
+ToneVelocityRange read_tone_velocity_range(const uint8_t *patch, int tone);
+
+// Partitions MIDI velocity 1..127 into contiguous regions in which the SET
+// of active (level > 0) tones sounding is constant, derived from every
+// active tone's own [velocityrangelower, velocityrangeupper]. The raw
+// switch-derived count is then adjusted to land in [min_layers,
+// max_layers]:
+//   - Too few (a patch with no velocity switching yields exactly one raw
+//     region): the shortfall is apportioned across the existing regions
+//     proportional to width, each gaining that many even internal
+//     sub-splits -- a single whole-keyboard region reproduces today's
+//     exact fixed-thirds default; a genuinely-switching patch keeps its
+//     real boundaries intact and only subdivides further within whichever
+//     side is widest. A real switch boundary is never discarded to make
+//     room for the minimum.
+//   - Too many: the narrowest ADJACENT PAIR (by combined width) is merged,
+//     repeated until the count is within max_layers.
+// Always returns a valid tiling of 1..127 (see VelocityRegion). See
+// jv_patch.cpp for the full algorithm.
+std::vector<VelocityRegion> compute_velocity_regions(const uint8_t *patch,
+                                                      int min_layers = 3,
+                                                      int max_layers = 5);
 
 // Render-ready bytes: dry, portamento off, LFOs stripped per decision.
 // `patch` must point to at least PATCH_SIZE readable bytes (see above).
