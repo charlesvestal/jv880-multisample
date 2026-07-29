@@ -43,42 +43,72 @@ report) found two real, confirmed causes and fixed both:
    1/window_duration). calibrate.cpp already renders the chorus_rate sweep
    with a 12s hold (vs. 4s for every other sweep) specifically for this.
 
-Even with both fixes, two further hazards remain and are handled explicitly:
+Even with both fixes, further hazards remain and are handled explicitly:
 
-3. Octave ambiguity: autocorrelation of an amplitude envelope routinely
-   finds a taller peak at 2x the true period (a well-known failure mode in
-   pitch/period detection). `_pick_candidate` checks for a comparably-tall
-   genuine local maximum at ~half the top candidate's lag and prefers it
-   when found -- never invents a period, only chooses among real local
-   maxima that are actually present in that render's own autocorrelation.
+3. Octave ambiguity, generalised to a full subharmonic FAMILY: autocorrelation
+   of an amplitude envelope routinely finds a taller peak at an integer
+   multiple of the true period -- not just 2x, but 3x, 5x, 7x... (longer
+   lags accumulate more correlation over a fixed-length window). Walk T/k for
+   k=2..8 and collect every comparably-tall genuine peak found; report the
+   TALLEST one across the whole family, not simply the last k examined.
+   Never invents a period -- only chooses among real local maxima that are
+   actually present in that render's own autocorrelation.
+
+   (An earlier version of this fix only probed half the top lag, which
+   cannot reach a 3rd- or 5th-order subharmonic, and separately, an earlier
+   version of the family walk kept overwriting its answer with whichever k
+   it examined LAST rather than the tallest -- both produced confirmed,
+   measured misreads; see measure_chorus_rate_hz's inline comments for the
+   specific raw settings and numbers each version got wrong.)
 
 4. A handful of fixed frequencies (~3.2-3.6 Hz, ~6.6-7.1 Hz, ~10-11 Hz)
    recur at IDENTICAL values across many unrelated raw settings -- the
    defining signature of an artifact unrelated to the swept parameter, not
    real chorus content (confirmed: present regardless of chorusrate, and
    the exact values are consistent to 3-4 significant figures across many
-   independent analysis-window/hop choices). Candidates landing in these
-   bands are excluded before candidate selection.
+   independent analysis-window/hop choices; also confirmed present, at
+   comparable relative strength, in dry.wav -- i.e. with chorus fully off --
+   so it is patch/render behaviour, not something the chorus effect itself
+   generates). Candidates landing in these bands are excluded before
+   candidate selection.
 
-Even after all of this, ONE raw setting (24) still measures as unreliable:
-the artifact described in (4) is measurably TALLER there than any surviving
-real candidate, at every window/hop tried. Per the task's own instruction
-("if a measurement is unreliable ... record a sentinel or omit the entry
-and explain, rather than inventing a number"), that one entry is omitted
-from chorus_rate_hz with a warning printed, rather than reporting a number
-we know is dominated by a non-chorus artifact.
+   (A dry.wav-envelope subtraction/gating approach was also tried, on the
+   reasoning that anything present in the chorus-off reference can't be
+   chorus. It does NOT generalise here: dry.wav's own window is only ~4.3s
+   (vs. the chorus-rate sweep's 12s), and at the high end of the sweep
+   (raw>=104, true rates ~6-9 Hz) dry.wav shows substantial apparent energy
+   at the SAME frequencies as the genuine, confidently-measured chorus
+   signal there -- a short reference window can't tell a few cycles of real
+   high-rate modulation apart from a few cycles of its own short-window
+   noise. Gating on it would have wrongly suppressed several of the
+   cleanest points in the table. The fixed ARTIFACT_BANDS_HZ, characterised
+   directly from repeated identical values across the WET sweep itself,
+   remains the reliable signal here.)
+
+Even after all of this, TWO raw settings (24 and 80) still measure as
+unreliable: the artifact described in (4) is at least as tall there as any
+surviving real candidate, at every window/hop tried. Per the task's own
+instruction ("if a measurement is unreliable ... record a sentinel or omit
+the entry and explain, rather than inventing a number"), those two entries
+are omitted from chorus_rate_hz with a warning printed, rather than
+reporting a number we know is dominated by a non-chorus artifact. (raw=80
+was, before the reliability check's grace margin was removed, silently
+reporting 1.6974 Hz -- its in-band artifact peak was already outright taller
+than its own best surviving candidate, an even closer artifact-dominance
+call than raw=24's; the old 10% grace margin was masking it.)
 
 --- IMPORTANT for anything (Task 6 or otherwise) consuming calibration.json -
 
-1. chorusrate raw=24 is an intentional INTERPOLATION GAP, not a zero and
-   not "no chorus at this setting". A naive `table.get("24")` or `table[24]`
-   read against chorus_rate_hz will come back missing/None -- a consumer
-   that doesn't handle that could silently produce 0 Hz for a setting the
-   real hardware clearly does modulate at some nonzero rate we just
-   couldn't pin down cleanly (see point 4 above). The correct handling is
-   to interpolate between the neighbouring present raw values (16 -> 0.7782
-   Hz, 32 -> 0.9009 Hz), the same way every OTHER raw value in between the
-   sampled step-8/step-16 points already has to be interpolated. Task 6's
+1. chorusrate raw=24 and raw=80 are intentional INTERPOLATION GAPS, not a
+   zero and not "no chorus at this setting". A naive `table.get("24")` or
+   `table[24]` read against chorus_rate_hz will come back missing/None -- a
+   consumer that doesn't handle that could silently produce 0 Hz for a
+   setting the real hardware clearly does modulate at some nonzero rate we
+   just couldn't pin down cleanly (see point 4 above). The correct handling
+   is to interpolate between the neighbouring present raw values (raw=24:
+   16 -> 1.5573 Hz, 32 -> 1.8002 Hz; raw=80: 72 -> 2.9157 Hz, 88 -> 3.9109
+   Hz), the same way every OTHER raw value in between the sampled
+   step-8/step-16 points already has to be interpolated. Task 6's
    `interp_table` does this correctly by construction (it interpolates
    between whatever keys are present); this note exists so a future change
    to that interpolation logic can't silently start treating a missing key
@@ -95,6 +125,18 @@ we know is dominated by a non-chorus artifact.
    accurate, not more. Every other reverb type has similar small local
    dips (see tests/test_calibration.py's RT60_REL_TOL comment) -- none of
    this should be "corrected."
+
+3. chorus_rate_hz has an analogous genuine local DIP: raw=120 (6.1005 Hz)
+   measures LOWER than raw=112 (7.6893 Hz), by far more than plausible
+   estimation noise. Unlike a fitting-precision question, this was checked
+   directly: splitting raw=120's 12s render into independent first-half and
+   second-half windows and re-measuring each gives 6.104 Hz and 6.099 Hz --
+   tighter agreement than most other points in the table, i.e. a highly
+   reproducible, stable read, not a fragile artifact lock (contrast raw=104
+   and raw=127, whose "clean-looking" single dominant peaks actually
+   DISAGREE by 0.3-3.2 Hz between their own first and second halves). Per
+   the same principle as point 2 above, this is reported as measured, not
+   interpolated past or smoothed into line with its neighbours.
 """
 import glob
 import json
@@ -210,10 +252,10 @@ def _local_maxima(ac, lo_lag, hi_lag):
     return out
 
 
-def measure_chorus_rate_hz(path, oct_frac=0.6, reliability_frac=0.90):
+def measure_chorus_rate_hz(path, oct_frac=0.6, reliability_frac=1.0):
     """Dominant chorus modulation frequency, via autocorrelation of the L-R
     envelope (see module docstring for why L-R, why autocorrelation, and
-    the two-stage octave/artifact correction below). Returns None when the
+    the multi-stage octave/artifact correction below). Returns None when the
     measurement is judged unreliable at this raw setting (module docstring
     point 4) -- callers must not fabricate a number in that case."""
     hop = 160
@@ -262,11 +304,30 @@ def measure_chorus_rate_hz(path, oct_frac=0.6, reliability_frac=0.90):
     # exactly that: raw 48 reported 0.43 Hz where ~2.2 Hz was expected (~1/5),
     # raw 16 reported 0.52 Hz where ~1.5 Hz was expected (~1/3).
     #
-    # Generalise: walk the family T/k for k = 2..MAX_SUBHARMONIC and choose the
-    # SHORTEST lag (highest frequency) that still carries a comparably tall
-    # genuine peak.  That is the fundamental; the rest are its aliases.
+    # Generalise: walk the family T/k for k = 2..MAX_SUBHARMONIC and, among
+    # every genuine (comparably tall) peak found across the WHOLE family,
+    # report the TALLEST -- not simply the last one examined. An earlier
+    # version kept overwriting `chosen` with whichever k it found last
+    # (reasoning "a higher k may be the true fundamental"), but that greedily
+    # walks past a strong, confident mid-family peak to a much weaker,
+    # barely-above-threshold peak at a higher k purely because it was
+    # examined later. Measured failures were exactly that: raw 16 had a
+    # confident k=3 match (h=0.464) overwritten by a weak k=4 match
+    # (h=0.330, reporting 2.02 Hz instead of 1.56 Hz); raw 48 had a
+    # confident k=5 match (h=0.422) overwritten by a weak k=7 match (h=0.310,
+    # reporting 3.14 Hz instead of 2.14 Hz). The tallest family member is the
+    # best-evidenced fundamental.
+    #
+    # This comparison is deliberately only AMONG the matched family members,
+    # not against top_surviving's own height: top_surviving is by hypothesis
+    # itself a subharmonic alias (that's the entire reason this search
+    # exists), and the paragraph above already explains why the true
+    # fundamental is routinely QUIETER than the alias it's found from
+    # ("multiples are frequently TALLER than the fundamental") -- requiring
+    # a family match to out-height top_surviving would silently disable the
+    # fix for exactly the common case it exists to handle.
     MAX_SUBHARMONIC = 8
-    chosen = top_surviving
+    family_matches = []
     for k in range(2, MAX_SUBHARMONIC + 1):
         target_lag = top_surviving[0] / k
         if target_lag < lo_lag:
@@ -278,13 +339,24 @@ def measure_chorus_rate_hz(path, oct_frac=0.6, reliability_frac=0.90):
                 if best_k is None or h > best_k[1]:
                     best_k = (lag, h, f)
         if best_k is not None:
-            chosen = best_k   # keep going; a higher k may be the true fundamental
+            family_matches.append(best_k)
+    chosen = max(family_matches, key=lambda c: c[1]) if family_matches else top_surviving
 
     # Reliability check: if the UNCONSTRAINED tallest peak anywhere in the
-    # search band falls inside a known artifact band and is measurably
-    # taller than what we're about to report, the real chorus signal is
-    # weaker than the artifact at this specific raw setting -- don't report
-    # a number we don't trust.
+    # search band falls inside a known artifact band and is at least as tall
+    # as what we're about to report, the real chorus signal is no stronger
+    # than the artifact at this specific raw setting -- don't report a
+    # number we don't trust. reliability_frac=1.0 means a straight height
+    # contest (no grace margin): an earlier version divided by 0.90, giving
+    # the reported candidate an unexplained 10% head start over the artifact
+    # before distrusting it. That masked exactly the failure this check
+    # exists to catch: raw 80's in-band artifact peak (h=0.4674) is OUTRIGHT
+    # taller than its own best surviving candidate (h=0.4533) -- a closer
+    # contest than raw 24's already-excluded case -- but the 10% margin let
+    # it slide through and get reported as 1.70 Hz anyway. No other raw
+    # setting in the measured sweep ever has its global (unconstrained) top
+    # peak land in an artifact band at all, so this tightening changes
+    # nothing else in the measured table.
     if _in_artifact_band(global_top[2]) and global_top[1] > chosen[1] / reliability_frac:
         return None
 

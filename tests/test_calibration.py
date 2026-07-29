@@ -11,8 +11,8 @@ checkout. Regenerate with:
 Tolerances below are deliberately documented, not tuned to force a pass:
 this file must never be adjusted to paper over a genuinely bad measurement
 (see tools/analyze_calibration.py's module docstring for the investigation
-that shaped the chorus-rate measurement approach and its one intentionally
-omitted, unreliable raw setting).
+that shaped the chorus-rate measurement approach and its two intentionally
+omitted, unreliable raw settings: 24 and 80).
 """
 import json
 from pathlib import Path
@@ -86,15 +86,19 @@ def test_chorus_rate_trend_and_plausible_band():
     NOT a strict monotonicity assertion, deliberately.  The measurement is
     autocorrelation peak-picking on the L-R envelope, and a fixed non-chorus
     artifact in the emulator's output competes with the real signal.  After the
-    subharmonic-family correction, 4 of 15 transitions still read out of order
-    (raw 16, 48, 72, 112) by roughly +-40%.
+    subharmonic-family correction PLUS choosing the tallest genuine peak across
+    the whole subharmonic family (not just the last one examined) and tightening
+    the artifact-vs-signal reliability check to a straight height contest, only
+    1 of 15 transitions still reads out of order: raw 112 (7.6893 Hz) -> raw 120
+    (6.1005 Hz). See test_chorus_rate_112_to_120_dip_is_not_noise below for why
+    that one point is left alone rather than "fixed."
 
-    Asserting monotonicity here would either fail permanently or invite someone
-    to sort/smooth the measured data to make it pass -- which would fabricate
-    numbers that get baked into ~4,200 presets.  So this asserts what the data
-    genuinely supports: a strong overall trend, and every point inside a
-    physically plausible LFO band.  The per-point noise is documented in
-    tools/analyze_calibration.py and smoothed by interpolation in Task 6.
+    Asserting FULL monotonicity here would either fail permanently or invite
+    someone to sort/smooth the measured data to make it pass -- which would
+    fabricate numbers that get baked into ~4,200 presets.  So this asserts what
+    the data genuinely supports: a strong overall trend, and every point inside
+    a physically plausible LFO band.  (See test_chorus_rate_near_monotonic for
+    the point-wise check, now that the data supports one at this precision.)
     """
     data = _load()
     items = _sorted_present(data["chorus_rate_hz"])
@@ -110,6 +114,46 @@ def test_chorus_rate_trend_and_plausible_band():
     last_third = values[-max(1, len(values) // 3):]
     assert sum(last_third) / len(last_third) > 2.0 * (sum(first_third) / len(first_third)), (
         "chorus rate does not rise substantially across the sweep"
+    )
+
+
+def test_chorus_rate_near_monotonic():
+    """Point-wise monotonicity, tolerant of AT MOST ONE violation.
+
+    This is a real tightening over test_chorus_rate_trend_and_plausible_band
+    (which only checks the aggregate trend), licensed by an actual algorithm
+    improvement: fixing the subharmonic-family search to report the tallest
+    genuine peak across the whole family (rather than whichever k it happened
+    to examine last) took the measured table from 4 out-of-order transitions
+    down to 1. That's not "close enough to sort" -- it's the data now
+    genuinely supporting a stronger check than before.
+
+    It still isn't full monotonicity: raw 120 measures BELOW raw 112, by far
+    more than plausible estimation noise (7.6893 -> 6.1005 Hz). Split-window
+    analysis (measuring the first and second half of that render's 12s hold
+    independently) shows this is a highly reproducible, stable read at raw
+    120 (6.104 Hz vs 6.099 Hz across independent halves -- tighter agreement
+    than most other points in the table), not a fragile artifact lock. Per
+    the calibration task's own rules, a well-evidenced non-monotonic point is
+    reported as measured, not smoothed into line -- the same reasoning
+    already applied to reverb_rt60 type 4's genuine local dip (see
+    tools/analyze_calibration.py's module docstring). If a future
+    measurement change produces MORE than one violation, that's a regression
+    this test should catch; if it produces zero, tighten further.
+    """
+    data = _load()
+    items = _sorted_present(data["chorus_rate_hz"])
+    assert len(items) >= 2, "need at least 2 measured chorus-rate points"
+
+    violations = []
+    for i in range(1, len(items)):
+        (raw_prev, v_prev), (raw_cur, v_cur) = items[i - 1], items[i]
+        if v_cur < v_prev - CHORUS_RATE_TOL_HZ:
+            violations.append((raw_prev, v_prev, raw_cur, v_cur))
+
+    assert len(violations) <= 1, (
+        f"expected at most 1 non-monotonic transition (the documented raw "
+        f"112->120 dip), found {len(violations)}: {violations}"
     )
 
 
