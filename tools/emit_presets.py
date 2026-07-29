@@ -385,6 +385,24 @@ def _pan_dly_stereo_offset(delay_time_s):
                       PAN_DLY_STEREO_OFFSET_FRAC * delay_time_s), 4)
 
 
+# --- Send-vs-mix ceiling ----------------------------------------------------
+#
+# On the JV, `choruslevel` and `reverblevel` are SEND amounts: the dry signal
+# always continues at full level and the effect is added alongside it. In
+# DecentSampler, `mix` (chorus, convolution) is a BLEND -- the docs are
+# explicit that "1.0 is just chorus, 0 is just dry signal" -- so mapping a
+# full send straight onto mix=1.0 DELETES the direct sound.
+#
+# Measured on the 192 internal patches, the naive mapping produced mix > 0.5
+# on 102 of them and > 0.8 on 39, i.e. half the library had its direct sound
+# mostly replaced by pure effect output. That is both washy and, for chorus,
+# maximally modulated -- the effect return is 100% modulated signal.
+#
+# A send at maximum means the effect sits at full level ALONGSIDE full dry,
+# which is an equal blend. So a full JV send maps to mix 0.5, not 1.0.
+EFFECT_MAX_MIX = 0.5
+
+
 def _nearest_ir(cal, rtype, raw_time):
     """Path of the captured IR whose time step is nearest `raw_time`.
 
@@ -443,7 +461,7 @@ def build_effects(meta, cal):
     chorus_send_norm = effective_send(meta, "chorus") / 127.0
 
     if rtype in DELAY_TYPE_INDICES:
-        wet = _clamp01(amount(rv["level"]) * reverb_send_norm)
+        wet = _clamp01(amount(rv["level"]) * reverb_send_norm * EFFECT_MAX_MIX)
         delay_time = _delay_time_s(cal, rtype, rv["time"])
         reverb_effect = ("delay", {
             "delayTime": round(delay_time, 4),
@@ -452,7 +470,7 @@ def build_effects(meta, cal):
             "wetLevel": round(wet, 4),
         })
     else:
-        wet = _clamp01(amount(rv["level"]) * reverb_send_norm)
+        wet = _clamp01(amount(rv["level"]) * reverb_send_norm * EFFECT_MAX_MIX)
         ir = _nearest_ir(cal, rtype, rv["time"])
         if ir is not None:
             # Convolution with an IR captured from the emulator itself, rather
@@ -479,7 +497,7 @@ def build_effects(meta, cal):
 
     mod_rate = min(LFO_RATE_HZ_MAX, max(0.0, interp_table(cal["chorus_rate_hz"], ch["rate"])))
     mod_depth = amount(ch["depth"], CHORUS_MAX_MOD_DEPTH)
-    mix = _clamp01(amount(ch["level"]) * chorus_send_norm)
+    mix = _clamp01(amount(ch["level"]) * chorus_send_norm * EFFECT_MAX_MIX)
     chorus_effect = ("chorus", {
         "mix": round(mix, 4),
         "modDepth": round(mod_depth, 4),
