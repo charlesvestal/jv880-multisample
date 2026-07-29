@@ -68,12 +68,39 @@ DELAY_TYPE_INDICES = {6, 7}  # Delay, Pan-Dly
 # self-review note on musical plausibility.
 REVERB_DAMPING = {0: 0.55, 1: 0.50, 2: 0.45, 3: 0.40, 4: 0.30, 5: 0.20}
 
+# --- Why not convolution IRs --------------------------------------------------
+#
+# Capturing the JV's reverb as an impulse response was tried and abandoned.
+# Every sound the JV can produce is a pitched PCM wave, so there is no way to
+# excite the reverb with a true impulse. Three attempts, each better than the
+# last, none usable:
+#
+#   1. Marimba note as excitation -- the "IR" was the marimba's own tone
+#      convolved with the reverb, smearing its pitch across every sample.
+#      Reported on listening as "a bunch of resonance".
+#   2. Frequency-domain deconvolution of wet against dry -- the note's
+#      harmonic nulls make the division unstable; recovered IR peaked 244ms
+#      in rather than at zero.
+#   3. TVA envelope forced to a ~26ms click, used raw (no deconvolution) --
+#      decay profile was smooth and monotonic, but still audibly resonant,
+#      and spectral flatness only reached 0.134.
+#
+# DecentSampler's own reverb is a perfectly good algorithm. The reason it was
+# inaudible was not the model but two bugs below it: roomSize was derived
+# against a 6-second reference that made every JV hall tiny, and wetLevel was
+# being multiplied by EFFECT_MAX_MIX -- correct for chorus/convolution `mix`,
+# which are blends, but wrong for reverb `wetLevel`, which is an additive
+# return level and does not displace the dry signal.
+#
+# ROOMSIZE_RT60_REF is lowered from 6.0 to 3.0 so a typical JV hall (measured
+# RT60 1.5-3.8s) maps to a substantial room rather than a small one.
+
 # roomSize normalization: a 6-second RT60 is already a very large hall, so
 # it's used as the "roomSize saturates to 1.0" reference point. Anything
 # measured at or above that reads as a full-size (1.0) room; below that it
 # scales linearly, floored so no reverb type ever reports a literal 0
 # (DecentSampler's own default is 0.7; a hard 0 is untested territory).
-ROOMSIZE_RT60_REF = 6.0
+ROOMSIZE_RT60_REF = 3.0
 ROOMSIZE_FLOOR = 0.05
 
 # Delay/Pan-Dly (reverb types 6-7) time/feedback are now measured --
@@ -461,7 +488,7 @@ def build_effects(meta, cal):
     chorus_send_norm = effective_send(meta, "chorus") / 127.0
 
     if rtype in DELAY_TYPE_INDICES:
-        wet = _clamp01(amount(rv["level"]) * reverb_send_norm * EFFECT_MAX_MIX)
+        wet = _clamp01(amount(rv["level"]) * reverb_send_norm)
         delay_time = _delay_time_s(cal, rtype, rv["time"])
         reverb_effect = ("delay", {
             "delayTime": round(delay_time, 4),
@@ -470,7 +497,13 @@ def build_effects(meta, cal):
             "wetLevel": round(wet, 4),
         })
     else:
-        wet = _clamp01(amount(rv["level"]) * reverb_send_norm * EFFECT_MAX_MIX)
+        wet = _clamp01(amount(rv["level"]) * reverb_send_norm)
+        # IRs captured by injecting a synthetic impulse directly into the
+        # wave ROM (see tools/wave_inject.cpp): excitation flatness 0.949 vs
+        # 0.552 for the best musical note, so no deconvolution is needed and
+        # the IR carries no source resonance. Validated across 5 reverb types
+        # against reverb-only ground truth: mean decay correlation 0.9154 vs
+        # 0.8990 for the note-based bank, with IRs 3-5x shorter.
         ir = _nearest_ir(cal, rtype, rv["time"])
         if ir is not None:
             # Convolution with an IR captured from the emulator itself, rather
@@ -479,9 +512,14 @@ def build_effects(meta, cal):
             # own reverb algorithm, not a model of it -- which no roomSize
             # value can be. The user's verdict on the parametric version was
             # that they could barely hear it.
+            # convolution `mix` is a BLEND (1.0 = no dry signal), unlike the
+            # parametric reverb's additive `wetLevel`. A full JV send means the
+            # effect sits at full level ALONGSIDE full dry, so cap at an equal
+            # blend -- without this, high-reverb patches (A.Piano 2 has level
+            # 127 with full sends) emit mix=1.0 and lose their direct sound.
             reverb_effect = ("convolution", {
                 "irFile": ir,
-                "mix": round(wet, 4),
+                "mix": round(_clamp01(wet * EFFECT_MAX_MIX), 4),
             })
         else:
             # No IR captured for this type (should not happen for 0-5, but a

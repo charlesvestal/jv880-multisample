@@ -1,0 +1,390 @@
+{
+  "proof": {
+    "impulse": [
+      {
+        "wavenumber": 50,
+        "key": 127,
+        "width_samples": 2,
+        "flatness_full_nyquist": 0.5001463779579959,
+        "flatness_20_20k": 0.9491733240336709,
+        "isolation_db": -227.44953323809082,
+        "onset_sample": 132
+      },
+      {
+        "wavenumber": 17,
+        "key": 127,
+        "width_samples": 4,
+        "flatness_full_nyquist": 0.5001465150163228,
+        "flatness_20_20k": 0.9490476876221521,
+        "isolation_db": -228.64359624852483,
+        "onset_sample": 134
+      }
+    ],
+    "sine": [
+      {
+        "target_hz": 300.0,
+        "measured_hz": 301.1042573310748,
+        "error_pct": 0.3680857770249304
+      },
+      {
+        "target_hz": 1000.0,
+        "measured_hz": 1003.6283119515416,
+        "error_pct": 0.36283119515416046
+      },
+      {
+        "target_hz": 2000.0,
+        "measured_hz": 2007.2574549628093,
+        "error_pct": 0.36287274814046666
+      }
+    ],
+    "passed": true,
+    "best_flatness_20_20k": 0.9491733240336709,
+    "excitation_latency_samples": 132
+  },
+  "ir_bank": {
+    "0": {
+      "0": {
+        "file": "ir_synth/reverb_t0_time_000.wav",
+        "raw_duration_s": 0.1979375,
+        "trimmed_duration_s": 0.01,
+        "rt60_s": null
+      },
+      "16": {
+        "file": "ir_synth/reverb_t0_time_016.wav",
+        "raw_duration_s": 0.6729375,
+        "trimmed_duration_s": 0.228,
+        "rt60_s": 0.5592661322013988
+      },
+      "32": {
+        "file": "ir_synth/reverb_t0_time_032.wav",
+        "raw_duration_s": 0.7699375,
+        "trimmed_duration_s": 0.229,
+        "rt60_s": 0.5399963296412427
+      },
+      "48": {
+        "file": "ir_synth/reverb_t0_time_048.wav",
+        "raw_duration_s": 0.8959375,
+        "trimmed_duration_s": 0.255,
+        "rt60_s": 0.5845738237319987
+      },
+      "64": {
+        "file": "ir_synth/reverb_t0_time_064.wav",
+        "raw_duration_s": 1.0639375,
+        "trimmed_duration_s": 0.26,
+        "rt60_s": 0.645695840764609
+      },
+      "80": {
+        "file": "ir_synth/reverb_t0_time_080.wav",
+        "raw_duration_s": 1.1429375,
+        "trimmed_duration_s": 0.284,
+        "rt60_s": 0.6861134961547144
+      },
+      "96": {
+        "file": "ir_synth/reverb_t0_time_096.wav",
+        "raw_duration_s": 1.2869375,
+        "trimmed_duration_s": 0.296,
+        "rt60_s": 0.7583686187184481
+      },
+      "112": {
+        "file": "ir_synth/reverb_t0_time_112.wav",
+        "raw_duration_s": 1.4829375,
+        "trimmed_duration_s": 0.358,
+        "rt60_s": 0.8751729950325094
+      },
+      "127": {
+        "file": "ir_synth/reverb_t0_time_127.wav",
+        "raw_duration_s": 1.6549375,
+        "trimmed_duration_s": 0.375,
+        "rt60_s": 0.9869832815597652
+      }
+    },
+    "1": {
+      "0": {
+        "file": "ir_synth/reverb_t1_time_000.wav",
+        "raw_duration_s": 0.1979375,
+        "trimmed_duration_s": 0.01,
+        "rt60_s": null
+      },
+      "16": {
+        "file": "ir_synth/reverb_t1_time_016.wav",
+        "raw_duration_s": 0.5709375,
+        "trimmed_duration_s": 0.181,
+        "rt60_s": 0.48702414465011
+      },
+      "32": {
+        "file": "ir_synth/reverb_t1_time_032.wav",
+        "raw_duration_s": 0.7009375,
+        "trimmed_duration_s": 0.223,
+        "rt60_s": 0.5913375529975018
+      },
+      "48": {
+        "file": "ir_synth/reverb_t1_time_048.wav",
+        "raw_duration_s": 0.8479375,
+        "trimmed_duration_s": 0.255,
+        "rt60_s": 0.6710343250845008
+      },
+      "64": {
+        "file": "ir_synth/reverb_t1_time_064.wav",
+        "raw_duration_s": 1.0539375,
+        "trimmed_duration_s": 0.279,
+        "rt60_s": 0.7292364991549687
+      },
+      "80": {
+        "file": "ir_synth/reverb_t1_time_080.wav",
+        "raw_duration_s": 1.1569375,
+        "trimmed_duration_s": 0.298,
+        "rt60_s": 0.8305821916734515
+      },
+      "96": {
+        "file": "ir_synth/reverb_t1_time_096.wav",
+        "raw_duration_s": 1.3629375,
+        "trimmed_duration_s": 0.354,
+        "rt60_s": 0.9220835248817302
+      },
+      "112": {
+        "file": "ir_synth/reverb_t1_time_112.wav",
+        "raw_duration_s": 1.6449375,
+        "trimmed_duration_s": 0.415,
+        "rt60_s": 1.0698842911227344
+      },
+      "127": {
+        "file": "ir_synth/reverb_t1_time_127.wav",
+        "raw_duration_s": 1.9289375,
+        "trimmed_duration_s": 0.471,
+        "rt60_s": 1.2491602212313178
+      }
+    },
+    "2": {
+      "0": {
+        "file": "ir_synth/reverb_t2_time_000.wav",
+        "raw_duration_s": 0.1979375,
+        "trimmed_duration_s": 0.01,
+        "rt60_s": null
+      },
+      "16": {
+        "file": "ir_synth/reverb_t2_time_016.wav",
+        "raw_duration_s": 0.6239375,
+        "trimmed_duration_s": 0.224,
+        "rt60_s": 0.5822783525802017
+      },
+      "32": {
+        "file": "ir_synth/reverb_t2_time_032.wav",
+        "raw_duration_s": 0.7549375,
+        "trimmed_duration_s": 0.256,
+        "rt60_s": 0.6175084085296222
+      },
+      "48": {
+        "file": "ir_synth/reverb_t2_time_048.wav",
+        "raw_duration_s": 0.8759375,
+        "trimmed_duration_s": 0.288,
+        "rt60_s": 0.6730073217488667
+      },
+      "64": {
+        "file": "ir_synth/reverb_t2_time_064.wav",
+        "raw_duration_s": 0.9799375,
+        "trimmed_duration_s": 0.299,
+        "rt60_s": 0.7427810846066273
+      },
+      "80": {
+        "file": "ir_synth/reverb_t2_time_080.wav",
+        "raw_duration_s": 1.1119375,
+        "trimmed_duration_s": 0.336,
+        "rt60_s": 0.8168052171929957
+      },
+      "96": {
+        "file": "ir_synth/reverb_t2_time_096.wav",
+        "raw_duration_s": 1.4529375,
+        "trimmed_duration_s": 0.363,
+        "rt60_s": 0.9055631177253025
+      },
+      "112": {
+        "file": "ir_synth/reverb_t2_time_112.wav",
+        "raw_duration_s": 1.5959375,
+        "trimmed_duration_s": 0.389,
+        "rt60_s": 1.0280689208160654
+      },
+      "127": {
+        "file": "ir_synth/reverb_t2_time_127.wav",
+        "raw_duration_s": 1.9219375,
+        "trimmed_duration_s": 0.443,
+        "rt60_s": 1.208847769861646
+      }
+    },
+    "3": {
+      "0": {
+        "file": "ir_synth/reverb_t3_time_000.wav",
+        "raw_duration_s": 0.1979375,
+        "trimmed_duration_s": 0.01,
+        "rt60_s": null
+      },
+      "16": {
+        "file": "ir_synth/reverb_t3_time_016.wav",
+        "raw_duration_s": 1.0589375,
+        "trimmed_duration_s": 0.37,
+        "rt60_s": 1.0434466735650887
+      },
+      "32": {
+        "file": "ir_synth/reverb_t3_time_032.wav",
+        "raw_duration_s": 1.3049375,
+        "trimmed_duration_s": 0.429,
+        "rt60_s": 1.1918598307838997
+      },
+      "48": {
+        "file": "ir_synth/reverb_t3_time_048.wav",
+        "raw_duration_s": 1.7159375,
+        "trimmed_duration_s": 0.506,
+        "rt60_s": 1.3058043598488411
+      },
+      "64": {
+        "file": "ir_synth/reverb_t3_time_064.wav",
+        "raw_duration_s": 1.9359375,
+        "trimmed_duration_s": 0.544,
+        "rt60_s": 1.4655299391563297
+      },
+      "80": {
+        "file": "ir_synth/reverb_t3_time_080.wav",
+        "raw_duration_s": 2.5809375,
+        "trimmed_duration_s": 0.617,
+        "rt60_s": 1.6984877787110235
+      },
+      "96": {
+        "file": "ir_synth/reverb_t3_time_096.wav",
+        "raw_duration_s": 3.1579375,
+        "trimmed_duration_s": 0.712,
+        "rt60_s": 2.1794580300298727
+      },
+      "112": {
+        "file": "ir_synth/reverb_t3_time_112.wav",
+        "raw_duration_s": 8.0979375,
+        "trimmed_duration_s": 0.799,
+        "rt60_s": 2.97655259715029
+      },
+      "127": {
+        "file": "ir_synth/reverb_t3_time_127.wav",
+        "raw_duration_s": 8.0979375,
+        "trimmed_duration_s": 0.835,
+        "rt60_s": 4.731209094268167
+      }
+    },
+    "4": {
+      "0": {
+        "file": "ir_synth/reverb_t4_time_000.wav",
+        "raw_duration_s": 0.1979375,
+        "trimmed_duration_s": 0.01,
+        "rt60_s": null
+      },
+      "16": {
+        "file": "ir_synth/reverb_t4_time_016.wav",
+        "raw_duration_s": 0.9519375,
+        "trimmed_duration_s": 0.455,
+        "rt60_s": 1.2941906206072054
+      },
+      "32": {
+        "file": "ir_synth/reverb_t4_time_032.wav",
+        "raw_duration_s": 1.1789375,
+        "trimmed_duration_s": 0.466,
+        "rt60_s": 1.1617656725872751
+      },
+      "48": {
+        "file": "ir_synth/reverb_t4_time_048.wav",
+        "raw_duration_s": 1.3219375,
+        "trimmed_duration_s": 0.488,
+        "rt60_s": 1.2110390514070986
+      },
+      "64": {
+        "file": "ir_synth/reverb_t4_time_064.wav",
+        "raw_duration_s": 1.5079375,
+        "trimmed_duration_s": 0.512,
+        "rt60_s": 1.3286724281867206
+      },
+      "80": {
+        "file": "ir_synth/reverb_t4_time_080.wav",
+        "raw_duration_s": 1.8579375,
+        "trimmed_duration_s": 0.58,
+        "rt60_s": 1.4697836168370348
+      },
+      "96": {
+        "file": "ir_synth/reverb_t4_time_096.wav",
+        "raw_duration_s": 2.2509375,
+        "trimmed_duration_s": 0.631,
+        "rt60_s": 1.7217497418382057
+      },
+      "112": {
+        "file": "ir_synth/reverb_t4_time_112.wav",
+        "raw_duration_s": 2.7719375,
+        "trimmed_duration_s": 0.709,
+        "rt60_s": 2.0739783024124847
+      },
+      "127": {
+        "file": "ir_synth/reverb_t4_time_127.wav",
+        "raw_duration_s": 4.0579375,
+        "trimmed_duration_s": 0.85,
+        "rt60_s": 2.7977431834239055
+      }
+    },
+    "5": {
+      "0": {
+        "file": "ir_synth/reverb_t5_time_000.wav",
+        "raw_duration_s": 0.1979375,
+        "trimmed_duration_s": 0.01,
+        "rt60_s": null
+      },
+      "16": {
+        "file": "ir_synth/reverb_t5_time_016.wav",
+        "raw_duration_s": 0.9509375,
+        "trimmed_duration_s": 0.315,
+        "rt60_s": 0.8615664344661568
+      },
+      "32": {
+        "file": "ir_synth/reverb_t5_time_032.wav",
+        "raw_duration_s": 1.1389375,
+        "trimmed_duration_s": 0.321,
+        "rt60_s": 0.8526585978875593
+      },
+      "48": {
+        "file": "ir_synth/reverb_t5_time_048.wav",
+        "raw_duration_s": 1.3769375,
+        "trimmed_duration_s": 0.374,
+        "rt60_s": 0.9711210808392561
+      },
+      "64": {
+        "file": "ir_synth/reverb_t5_time_064.wav",
+        "raw_duration_s": 1.6849375,
+        "trimmed_duration_s": 0.392,
+        "rt60_s": 1.1026496988822125
+      },
+      "80": {
+        "file": "ir_synth/reverb_t5_time_080.wav",
+        "raw_duration_s": 2.0329375,
+        "trimmed_duration_s": 0.443,
+        "rt60_s": 1.2435372999868886
+      },
+      "96": {
+        "file": "ir_synth/reverb_t5_time_096.wav",
+        "raw_duration_s": 2.7559375,
+        "trimmed_duration_s": 0.513,
+        "rt60_s": 1.4766159830704415
+      },
+      "112": {
+        "file": "ir_synth/reverb_t5_time_112.wav",
+        "raw_duration_s": 3.9849375,
+        "trimmed_duration_s": 0.541,
+        "rt60_s": 1.8991540821795116
+      },
+      "127": {
+        "file": "ir_synth/reverb_t5_time_127.wav",
+        "raw_duration_s": 6.7119375,
+        "trimmed_duration_s": 0.642,
+        "rt60_s": 2.6331020132854768
+      }
+    }
+  },
+  "groundtruth": {
+    "correlation": 0.966592843926543,
+    "band_ratios": {
+      "low (80-250Hz)": 1.1084777585928116,
+      "mid (250-2000Hz)": 5.46914092276442,
+      "high (2000-8000Hz)": 1.1891913938944025
+    }
+  }
+}

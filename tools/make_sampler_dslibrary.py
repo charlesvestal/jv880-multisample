@@ -32,17 +32,26 @@ def collect(lib: Path, stem: str):
         sys.exit(f"preset not found: {preset}")
     root = ET.parse(preset).getroot()
     seen, out = set(), []
-    for s in root.findall(".//sample"):
-        rel = s.get("path")
+
+    # A preset references audio from two places, not one: <sample path> for the
+    # zones, and <effect type="convolution" irFile> for a captured reverb IR.
+    # Collecting only the former silently produced archives whose convolution
+    # effect pointed at a file that wasn't there -- DecentSampler then renders
+    # no reverb at all, which is indistinguishable from "the reverb is too
+    # quiet" and was reported as exactly that.
+    refs = [s.get("path") for s in root.findall(".//sample")]
+    refs += [e.get("irFile") for e in root.findall('.//effect[@type="convolution"]')]
+
+    for rel in refs:
         if not rel or rel in seen:
             continue
         seen.add(rel)
         src = (lib / rel).resolve()
         if not src.exists():
-            sys.exit(f"{preset.name}: references missing sample {rel}")
+            sys.exit(f"{preset.name}: references missing file {rel}")
         out.append((src, rel))
     if not out:
-        sys.exit(f"{preset.name}: no samples referenced")
+        sys.exit(f"{preset.name}: no audio referenced")
     return preset, out
 
 

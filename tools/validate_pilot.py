@@ -15,7 +15,13 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-EXPECTED_ZONES = 75
+# Zones = 25 key steps x N velocity layers. N is no longer fixed at 3: layers
+# are derived per patch from its real tone velocity-switch points, so a patch
+# with 4 distinct velocity regions legitimately has 100 zones. Validate the
+# STRUCTURE (a whole number of layers, within the renderer's own 3-5 bounds)
+# rather than a hardcoded count.
+EXPECTED_KEYS = 25
+MIN_LAYERS, MAX_LAYERS = 3, 5
 MIN_LOOP_FRACTION = 0.25
 # Minimum normalized cross-correlation between the two windows DecentSampler
 # blends at the loop seam. Replaces a raw endpoint-sample threshold, which a
@@ -193,9 +199,15 @@ def main() -> None:
             patches += 1
             meta = json.loads((pdir / "patch.json").read_text())
             zones = meta.get("zones", [])
-            if len(zones) != EXPECTED_ZONES:
+            n = len(zones)
+            if n % EXPECTED_KEYS != 0:
                 errors.append(
-                    f"{pdir.name}: {len(zones)} zones, expected {EXPECTED_ZONES}")
+                    f"{pdir.name}: {n} zones is not a whole number of "
+                    f"{EXPECTED_KEYS}-key layers")
+            elif not (MIN_LAYERS <= n // EXPECTED_KEYS <= MAX_LAYERS):
+                errors.append(
+                    f"{pdir.name}: {n // EXPECTED_KEYS} velocity layers, "
+                    f"expected {MIN_LAYERS}-{MAX_LAYERS}")
             l, t, s = check_audio(pdir, meta)
             looped += l
             total += t
