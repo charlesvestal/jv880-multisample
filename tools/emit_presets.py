@@ -254,6 +254,36 @@ def _clamp01(x):
     return max(0.0, min(1.0, x))
 
 
+# --- Effect AMOUNT mapping: proportional, not measured -----------------------
+#
+# chorus_depth_norm / chorus_mix / reverb_wet were originally read from the
+# measured calibration. They are not trustworthy and are no longer used:
+#
+#   chorus_depth_norm  raw 0 -> 1.0, raw 127 -> 0.69   (inverted, ~flat at 0.7)
+#   chorus_mix         0,0,0,0, 0.42, 0.38, 0.67, 0.51, 1.0   (non-monotonic)
+#   reverb_wet         0, 0.52, 0.80, 1.0, 0.0, 0.0, ...      (mid -> NO reverb)
+#
+# Every preset therefore received ~0.73 chorus modDepth regardless of its real
+# setting, which is heavy pitch modulation -- audible as a warble on material
+# with no chorus at all (A.Piano 1 has pitch LFO depth 0 on all four tones).
+#
+# The measurement was misapplied rather than merely noisy. Rate (Hz) and decay
+# time (seconds) are genuinely device-specific and DO need measuring -- those
+# tables are validated by tests and remain in use. But an AMOUNT is just an
+# amount: a 0-127 level maps proportionally onto a 0-1 level. Measuring it
+# added noise to a quantity whose mapping is known by construction.
+#
+# CHORUS_MAX_MOD_DEPTH is a deliberate, uncalibrated ceiling: DecentSampler's
+# chorus modDepth defaults to 0.2, and the JV's chorus is a gentle stereo
+# thickener rather than a vibrato, so full JV depth maps to a moderate value.
+CHORUS_MAX_MOD_DEPTH = 0.35
+
+
+def amount(raw, ceiling=1.0):
+    """Map a JV 0-127 amount onto a 0-1 amount, proportionally."""
+    return _clamp01(max(0.0, min(127, float(raw))) / 127.0 * ceiling)
+
+
 def build_effects(meta, cal):
     """Return [(type, {attr: value}), ...] in signal-chain order.
 
@@ -280,7 +310,7 @@ def build_effects(meta, cal):
     chorus_send_norm = effective_send(meta, "chorus") / 127.0
 
     if rtype in DELAY_TYPE_INDICES:
-        wet = _clamp01(interp_table(cal["reverb_wet"], rv["level"]) * reverb_send_norm)
+        wet = _clamp01(amount(rv["level"]) * reverb_send_norm)
         delay_time = DELAY_TIME_MIN_S + (rv["time"] / 127.0) * (DELAY_TIME_MAX_S - DELAY_TIME_MIN_S)
         reverb_effect = ("delay", {
             "delayTime": round(delay_time, 4),
@@ -291,7 +321,7 @@ def build_effects(meta, cal):
     else:
         rt60 = interp_table(cal["reverb_rt60"][str(rtype)], rv["time"])
         room_size = round(min(1.0, max(ROOMSIZE_FLOOR, rt60 / ROOMSIZE_RT60_REF)), 4)
-        wet = _clamp01(interp_table(cal["reverb_wet"], rv["level"]) * reverb_send_norm)
+        wet = _clamp01(amount(rv["level"]) * reverb_send_norm)
         reverb_effect = ("reverb", {
             "roomSize": room_size,
             "damping": REVERB_DAMPING[rtype],
@@ -299,8 +329,8 @@ def build_effects(meta, cal):
         })
 
     mod_rate = min(LFO_RATE_HZ_MAX, max(0.0, interp_table(cal["chorus_rate_hz"], ch["rate"])))
-    mod_depth = _clamp01(interp_table(cal["chorus_depth_norm"], ch["depth"]))
-    mix = _clamp01(interp_table(cal["chorus_mix"], ch["level"]) * chorus_send_norm)
+    mod_depth = amount(ch["depth"], CHORUS_MAX_MOD_DEPTH)
+    mix = _clamp01(amount(ch["level"]) * chorus_send_norm)
     chorus_effect = ("chorus", {
         "mix": round(mix, 4),
         "modDepth": round(mod_depth, 4),
