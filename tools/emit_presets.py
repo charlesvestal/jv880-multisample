@@ -433,7 +433,27 @@ def _clamp01(x):
 # so the model cannot be used to calibrate DS's response either. This keeps
 # audible movement while staying far away from vibrato; only listening in
 # DecentSampler can confirm the value.
-CHORUS_MAX_MOD_DEPTH = 0.03
+# DecentSampler's chorus is juce::dsp::Chorus -- confirmed from JUCE's own
+# source, whose constants make the mapping exact rather than guessed:
+#
+#     delay(t) = centreDelay + maximumDelayModulation * oscVolumeMultiplier
+#                              * depth * sin(2*pi*rate*t)
+#     with maximumDelayModulation = 20 ms, oscVolumeMultiplier = 0.5
+#
+# so the delay swings +/- 10*modDepth ms, and differentiating gives the pitch
+# swing a listener actually hears:
+#
+#     cents = 1200 * log2(1 + 0.0628 * modDepth * modRate)
+#
+# That is why the earlier values were cartoonish: modDepth 0.089 at 1.6 Hz is
+# +/- 15.4 cents of vibrato, and 0.30 is +/- 51 cents. It also shows the old
+# flat ceiling was the wrong shape entirely -- pitch swing scales with RATE as
+# well as depth, so a fixed modDepth gave patches with fast chorus several
+# times the vibrato of slow ones, for no reason related to the JV.
+#
+# Solving for a target pitch swing instead makes it rate-independent.
+CHORUS_MAX_CENTS = 4.0
+CHORUS_DELAY_MOD_MS = 10.0      # juce maximumDelayModulation * oscVolumeMultiplier
 
 
 def amount(raw, ceiling=1.0):
@@ -441,23 +461,42 @@ def amount(raw, ceiling=1.0):
     return _clamp01(max(0.0, min(127, float(raw))) / 127.0 * ceiling)
 
 
-def _chorus_mod_depth(cal, raw_depth):
-    """DecentSampler modDepth for a given raw chorusdepth (0-127): the
-    MEASURED chorus_depth_norm curve (see this module's CHORUS_MAX_MOD_DEPTH
-    comment for how it was measured -- stereo decorrelation of a pure-wet
-    chorused sine, cleanly monotonic, cross-validated at two carrier
-    frequencies) scaled by the CHORUS_MAX_MOD_DEPTH ceiling. Falls back to
-    the old flat proportional mapping only when no measured table is
-    available (e.g. tests/test_emit_presets.py's synthetic CAL fixture,
-    which predates this table) -- consistent with every other
-    calibration-table lookup in this module."""
+def _chorus_mod_depth(cal, raw_depth, mod_rate_hz):
+    """DecentSampler modDepth giving a target PITCH swing, not a fixed depth.
+
+    DS's chorus is juce::dsp::Chorus, whose delay swings +/- 10*modDepth ms at
+    modRate, so the audible vibrato is
+
+        cents = 1200 * log2(1 + 0.0628 * modDepth * modRate)
+
+    (see the CHORUS_MAX_CENTS block). Inverting that for a target swing makes
+    the result rate-independent: a fast-chorus patch and a slow one get the
+    same amount of pitch movement, which a fixed modDepth did not -- it gave
+    them vibrato in proportion to their rate.
+
+    The target is scaled by the measured chorus_depth_norm curve so deeper JV
+    settings still move more, and the ceiling is small because the JV's chorus
+    barely modulates pitch at all: on MIDI EPiano, at chorus depth 116/127,
+    pitch modulation AT the chorus LFO rate measures 6.14 cents on the dry
+    render and 4.07 cents with the JV's chorus engaged -- it adds none. What
+    the JV's chorus produces is doubling and stereo width, which `mix` carries.
+    """
+    depth_norm = 1.0
     table = cal.get("chorus_depth_norm")
     if table:
         try:
-            return _clamp01(interp_table(table, raw_depth) * CHORUS_MAX_MOD_DEPTH)
+            depth_norm = _clamp01(interp_table(table, raw_depth))
         except ValueError:
-            pass
-    return amount(raw_depth, CHORUS_MAX_MOD_DEPTH)
+            depth_norm = _clamp01(raw_depth / 127.0)
+    else:
+        depth_norm = _clamp01(raw_depth / 127.0)
+
+    cents = CHORUS_MAX_CENTS * depth_norm
+    rate = max(0.05, float(mod_rate_hz))
+    # Invert cents = 1200*log2(1 + k*modDepth*rate), k = 2*pi*CHORUS_DELAY_MOD_MS/1000
+    k = 2.0 * math.pi * CHORUS_DELAY_MOD_MS / 1000.0
+    ratio = 2.0 ** (cents / 1200.0) - 1.0
+    return _clamp01(ratio / (k * rate))
 
 
 def _delay_time_s(cal, rtype, raw_time):
@@ -791,7 +830,7 @@ def build_effects(meta, cal):
             })
 
     mod_rate = min(LFO_RATE_HZ_MAX, max(0.0, interp_table(cal["chorus_rate_hz"], ch["rate"])))
-    mod_depth = _chorus_mod_depth(cal, ch["depth"])
+    mod_depth = _chorus_mod_depth(cal, ch["depth"], mod_rate)
     mix = _clamp01(amount(ch["level"]) * chorus_send_norm * EFFECT_MAX_MIX)
     chorus_effect = ("chorus", {
         "mix": round(mix, 4),

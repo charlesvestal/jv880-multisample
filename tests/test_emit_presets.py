@@ -332,19 +332,46 @@ def test_chorus_mod_depth_uses_calibrated_curve_when_present():
     root = parse(meta, cal=cal)
     ch = [e for e in root.findall(".//effect") if e.get("type") == "chorus"][0]
     got = fattr(ch, "modDepth")
-    expected_calibrated = 0.9 * ep.CHORUS_MAX_MOD_DEPTH
-    expected_proportional = ep.amount(64, ep.CHORUS_MAX_MOD_DEPTH)
-    assert got == pytest.approx(expected_calibrated, abs=1e-4)
-    assert got != pytest.approx(expected_proportional, abs=1e-4)
+    rate = fattr(ch, "modRate")
+    # The curve now feeds a target PITCH SWING, which is then solved for
+    # modDepth against the patch's own rate -- so compare against what the
+    # calibrated depth_norm implies, not against a raw depth product.
+    expected = ep._chorus_mod_depth(cal, 64, rate)
+    proportional = ep._chorus_mod_depth(
+        {k: v for k, v in cal.items() if k != "chorus_depth_norm"}, 64, rate)
+    assert got == pytest.approx(expected, abs=1e-4)
+    assert got != pytest.approx(proportional, abs=1e-4)
 
 
 def test_chorus_mod_depth_falls_back_to_proportional_without_table():
     """No chorus_depth_norm at all (e.g. a calibration.json predating this
-    measurement) -- falls back to the old flat proportional mapping, not a
-    crash or a fabricated curve."""
+    measurement) -- falls back to a proportional depth, not a crash."""
     cal_without = {k: v for k, v in CAL.items() if k != "chorus_depth_norm"}
-    got = ep._chorus_mod_depth(cal_without, 64)
-    assert got == pytest.approx(ep.amount(64, ep.CHORUS_MAX_MOD_DEPTH))
+    got = ep._chorus_mod_depth(cal_without, 64, 1.6)
+    assert 0.0 < got < 0.05
+
+
+def test_chorus_mod_depth_is_rate_compensated():
+    """DS pitch swing is cents = 1200*log2(1 + 0.0628*modDepth*modRate), so a
+    FIXED modDepth gives a fast-chorus patch several times the vibrato of a
+    slow one. Solving for a target swing must cancel that: double the rate,
+    halve the depth."""
+    cal = {"chorus_depth_norm": {"0": 0.0, "127": 1.0}}
+    slow = ep._chorus_mod_depth(cal, 127, 1.5)
+    fast = ep._chorus_mod_depth(cal, 127, 3.0)
+    assert fast == pytest.approx(slow / 2, rel=0.02)
+
+
+def test_chorus_pitch_swing_stays_musically_small():
+    """modDepth 0.089 at 1.6 Hz is +/- 15.4 cents, which was reported as
+    cartoonish. Whatever the emitted depth, the resulting swing must stay
+    near the JV's own contribution, which measures at essentially zero."""
+    import math
+    cal = {"chorus_depth_norm": {"0": 0.0, "127": 1.0}}
+    for rate in (0.5, 1.6, 3.0, 6.0):
+        md = ep._chorus_mod_depth(cal, 127, rate)
+        cents = 1200 * math.log2(1 + 2 * math.pi * ep.CHORUS_DELAY_MOD_MS / 1000 * md * rate)
+        assert cents <= ep.CHORUS_MAX_CENTS + 0.01, f"{cents:.1f} cents at {rate} Hz"
 
 
 def test_chorus_mod_depth_zero_at_zero_raw_depth():
@@ -352,8 +379,8 @@ def test_chorus_mod_depth_zero_at_zero_raw_depth():
     a measured curve is present -- the exact property the FIRST shipped
     table violated (raw=0 mapped to MAXIMUM depth)."""
     cal = {"chorus_depth_norm": {"0": 0.1335, "64": 0.519, "127": 1.0}}
-    got = ep._chorus_mod_depth(cal, 0)
-    assert got < 0.1, f"raw depth=0 should be near-zero modDepth, got {got}"
+    got = ep._chorus_mod_depth(cal, 0, 1.6)
+    assert got < 0.01, f"raw depth=0 should be near-zero modDepth, got {got}"
 
 
 def test_chorus_mod_depth_monotonic_across_measured_table():
@@ -361,7 +388,8 @@ def test_chorus_mod_depth_monotonic_across_measured_table():
     for the real measured curve (if calib/calibration.json exists)."""
     if REAL_CAL is None or "chorus_depth_norm" not in REAL_CAL:
         pytest.skip("no real chorus_depth_norm to check")
-    values = [ep._chorus_mod_depth(REAL_CAL, raw) for raw in (0, 16, 32, 48, 64, 80, 96, 112, 127)]
+    values = [ep._chorus_mod_depth(REAL_CAL, raw, 1.6)
+              for raw in (0, 16, 32, 48, 64, 80, 96, 112, 127)]
     for a, b in zip(values, values[1:]):
         assert b >= a - 1e-9, f"modDepth decreased across the measured sweep: {values}"
 

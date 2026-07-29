@@ -36,11 +36,14 @@ def main():
     from pedalboard import load_plugin
     plugin = load_plugin(args.plugin)
 
-    print(f"\nA DecentSampler window will open.\n"
-          f"  1. Load this preset in it:\n       {args.preset}\n"
-          f"  2. Play a note to confirm you hear it\n"
-          f"  3. Close the window\n")
-    input("Press Enter to open the editor... ")
+    # No input() prompt: this is run through a harness whose stdin is not
+    # guaranteed to be a terminal, and a blocked read there looks like a hang.
+    print("\n" + "=" * 68)
+    print("A DecentSampler window is opening now.")
+    print(f"  1. In it, load:  {args.preset}")
+    print("  2. Play a note to confirm you hear the sine")
+    print("  3. CLOSE THE WINDOW -- that is what saves the state")
+    print("=" * 68 + "\n", flush=True)
     plugin.show_editor()
 
     state = bytes(plugin.raw_state)
@@ -48,8 +51,11 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(state)
     print(f"\ncaptured {len(state)} bytes -> {out}")
-    print("If this is the same size as an empty state (~1044 bytes), the preset "
-          "probably did not load -- rerun and check step 2.")
+    if len(state) <= 1100:
+        print("WARNING: that is the size of an EMPTY state. The preset probably "
+              "did not load -- rerun and make sure you hear the sine before closing.")
+    else:
+        print("Looks like a preset is loaded. Nothing further needed from you.")
 
 
 if __name__ == "__main__":
