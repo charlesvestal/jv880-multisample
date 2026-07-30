@@ -107,6 +107,7 @@ void usage(const char *prog) {
 int main(int argc, char **argv) {
     std::string roms_dir, board, out_dir;
     int only_patch = -1;
+    bool dump_voice = false;
     bool do_list = false;
 
     for (int i = 1; i < argc; i++) {
@@ -118,6 +119,8 @@ int main(int argc, char **argv) {
             out_dir = argv[++i];
         } else if (!strcmp(argv[i], "--patch") && i + 1 < argc) {
             only_patch = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--dump-voice")) {
+            dump_voice = true;
         } else if (!strcmp(argv[i], "--list")) {
             do_list = true;
         } else {
@@ -153,7 +156,12 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 1;
     }
-    if (out_dir.empty()) {
+    // --dump-voice reports each patch's voice mode as JSON on stdout and
+    // renders nothing. The already-rendered library needs these fields, but
+    // rewriting patch.json wholesale would destroy the zone metadata
+    // postprocess added (kind, loop points, release) -- so this dumps and a
+    // separate merge step folds it in.
+    if (out_dir.empty() && !dump_voice) {
         fprintf(stderr, "--out is required\n");
         usage(argv[0]);
         return 1;
@@ -184,6 +192,24 @@ int main(int argc, char **argv) {
         fprintf(stderr, "patch index %d out of range (0..%zu)\n",
                 only_patch, patches.size() - 1);
         return 1;
+    }
+
+    if (dump_voice) {
+        for (size_t pi = 0; pi < patches.size(); pi++) {
+            const PatchRef &pr = patches[pi];
+            Effects fx = read_effects(pr.data);
+            printf("{\"index\":%d,\"bank\":\"%s\",\"name\":\"%s\","
+                   "\"voice\":{\"key_assign\":\"%s\",\"solo_legato\":%s,"
+                   "\"portamento\":%s,\"portamento_time\":%d,"
+                   "\"portamento_mode\":\"%s\"}}\n",
+                   pr.index, json_escape(pr.bank).c_str(), json_escape(pr.name).c_str(),
+                   fx.key_assign ? "Solo" : "Poly",
+                   fx.solo_legato ? "true" : "false",
+                   fx.portamento ? "true" : "false",
+                   fx.portamento_time,
+                   fx.portamento_mode ? "Legato" : "Normal");
+        }
+        return 0;
     }
 
     GridSpec grid;
@@ -279,6 +305,8 @@ int main(int argc, char **argv) {
             "    \"reverb_send\": [%d,%d,%d,%d], \"chorus_send\": [%d,%d,%d,%d], \"tone_level\": [%d,%d,%d,%d],\n"
             "    \"bend_up\": %d, \"bend_down\": %d\n"
             "  },\n"
+            "  \"voice\": {\"key_assign\":\"%s\",\"solo_legato\":%s,\"portamento\":%s,"
+            "\"portamento_time\":%d,\"portamento_mode\":\"%s\"},\n"
             "  \"lfo1\": {\"stripped\":%s,\"reason\":\"%s\",\"form\":\"%s\",\"rate\":%d,\"delay\":%d,\"sync\":%d,\"pitch\":%d,\"tvf\":%d,\"tva\":%d},\n"
             "  \"lfo2\": {\"stripped\":%s,\"reason\":\"%s\",\"form\":\"%s\",\"rate\":%d,\"delay\":%d,\"sync\":%d,\"pitch\":%d,\"tvf\":%d,\"tva\":%d},\n"
             "  \"zones\": [%s]\n"
@@ -291,6 +319,11 @@ int main(int argc, char **argv) {
             fx.chorus_send[0], fx.chorus_send[1], fx.chorus_send[2], fx.chorus_send[3],
             fx.tone_level[0], fx.tone_level[1], fx.tone_level[2], fx.tone_level[3],
             fx.bend_up, fx.bend_down,
+            fx.key_assign ? "Solo" : "Poly",
+            fx.solo_legato ? "true" : "false",
+            fx.portamento ? "true" : "false",
+            fx.portamento_time,
+            fx.portamento_mode ? "Legato" : "Normal",
             d1.strip ? "true" : "false", json_escape(d1.reason).c_str(), lfo_form_name(d1.lfo.form),
             d1.lfo.rate, d1.lfo.delay, d1.lfo.sync, d1.lfo.pitch_depth, d1.lfo.tvf_depth, d1.lfo.tva_depth,
             d2.strip ? "true" : "false", json_escape(d2.reason).c_str(), lfo_form_name(d2.lfo.form),

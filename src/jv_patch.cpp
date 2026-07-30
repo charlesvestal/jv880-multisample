@@ -53,6 +53,13 @@ Effects read_effects(const uint8_t *p) {
     e.bend_down       = bits(p, 23, 0, 7);
     e.bend_up         = bits(p, 24, 0, 4);
     e.portamento      = bits(p, 24, 6, 1);
+    // Patch-common voice bits, offsets confirmed against the reference
+    // implementation's own PATCH_COMMON_PARAMS table.
+    e.key_assign      = bits(p, 24, 7, 1);   // 0 = Poly, 1 = Solo
+    e.solo_legato     = bits(p, 24, 5, 1);
+    e.portamento_mode = bits(p, 24, 4, 1);
+    e.portamento_time = bits(p, 25, 0, 7);
+    e.portamento_type = bits(p, 25, 7, 1);
     for (int t = 0; t < TONE_COUNT; t++) {
         const uint8_t *tp = tone_ptr(p, t);
         e.tone_level[t]  = tp[67];

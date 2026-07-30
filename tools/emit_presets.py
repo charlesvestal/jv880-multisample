@@ -756,6 +756,45 @@ def zone_vel_range(zones):
     return vel_ranges(len(zones))
 
 
+# The JV's portamento time byte is 0-127; DecentSampler's glideTime is in
+# SECONDS. No sweep of the hardware was made for this, so the range is taken
+# from what a JV portamento plausibly spans -- effectively instant at 0, and
+# a slow but still musical glide at maximum. Documented as an assumption
+# rather than a measurement.
+GLIDE_TIME_MAX_S = 1.5
+MONO_TAG = "jv_solo"
+
+
+def voice_attrs(meta):
+    """Group attributes for the patch's voice mode: monophony and glide.
+
+    Sampling renders every note in isolation, which is right regardless of
+    key assign -- monophony only matters when notes overlap, and that is the
+    player's job, not the sample's. So this is carried purely as preset
+    metadata.
+
+    Returns (attrs, needs_mono_tag).
+    """
+    voice = meta.get("voice") or {}
+    attrs = {}
+    solo = str(voice.get("key_assign", "Poly")) == "Solo"
+
+    # glideTime only when the patch actually enables portamento: the JV
+    # stores a portamento TIME regardless (93 is a common stored default on
+    # patches with portamento switched off), so keying off the time alone
+    # would put a glide on most of the library.
+    if voice.get("portamento"):
+        raw = max(0, min(127, int(voice.get("portamento_time", 0))))
+        attrs["glideTime"] = f"{raw / 127.0 * GLIDE_TIME_MAX_S:.4f}"
+        # The JV's solo-legato plays the glide only when the previous note is
+        # still held, which is exactly DecentSampler's "legato" mode.
+        attrs["glideMode"] = "legato" if voice.get("solo_legato") else "always"
+
+    if solo:
+        attrs["tags"] = MONO_TAG
+    return attrs, solo
+
+
 def _bus_effects(meta, cal):
     """Effects that belong on the parallel reverb SEND bus.
 
@@ -1034,6 +1073,17 @@ def build_dspreset(meta, cal, sample_prefix):
     # output2Target="BUS_1" on them -- 683 presets pointing a send at a bus
     # that was never declared. Harmless in practice, since the send level was
     # 0, but malformed.
+    # Voice mode: monophony and glide, from the patch's own key-assign and
+    # portamento bytes.
+    vattrs, needs_mono_tag = voice_attrs(meta)
+    for k, v in vattrs.items():
+        group_el.set(k, v)
+    if needs_mono_tag:
+        tags_el = ET.SubElement(root, "tags")
+        # polyphony="1" is how DecentSampler expresses monophony; there is no
+        # direct attribute for it on <group>.
+        ET.SubElement(tags_el, "tag", {"name": MONO_TAG, "polyphony": "1"})
+
     if _bus_effects(meta, cal):
         group_el.set("output1Target", "MAIN_OUTPUT")
         group_el.set("output2Target", "BUS_1")

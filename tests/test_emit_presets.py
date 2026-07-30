@@ -1106,3 +1106,54 @@ def test_no_dangling_bus_route_when_there_is_no_bus():
     assert root.find("./buses/bus") is None
     assert group.get("output2Target") is None, "send routed at a nonexistent bus"
     assert group.get("output2Volume") is None
+
+
+# --- voice mode: monophony and glide ---------------------------------------
+
+def _meta_voice(**voice):
+    m = make_meta()
+    m["voice"] = {"key_assign": "Poly", "solo_legato": False,
+                  "portamento": False, "portamento_time": 0,
+                  "portamento_mode": "Normal", **voice}
+    return m
+
+
+def test_solo_patch_emits_a_monophonic_tag():
+    root = parse(_meta_voice(key_assign="Solo"), _cal_with_ir())
+    tag = find1(root, "./tags/tag")
+    assert tag.get("polyphony") == "1"
+    assert find1(root, ".//group").get("tags") == tag.get("name")
+
+
+def test_poly_patch_emits_no_tag():
+    root = parse(_meta_voice(key_assign="Poly"), _cal_with_ir())
+    assert root.find("./tags") is None
+    assert find1(root, ".//group").get("tags") is None
+
+
+def test_glide_only_when_portamento_is_actually_on():
+    """The JV stores a portamento TIME even when portamento is switched off
+    (93 is a common stored default), so keying off the time alone would put a
+    glide on most of the library."""
+    off = parse(_meta_voice(portamento=False, portamento_time=93), _cal_with_ir())
+    assert find1(off, ".//group").get("glideTime") is None
+
+    on = parse(_meta_voice(portamento=True, portamento_time=127), _cal_with_ir())
+    g = find1(on, ".//group")
+    assert float(g.get("glideTime")) == pytest.approx(ep.GLIDE_TIME_MAX_S, rel=0.01)
+    assert g.get("glideMode") == "always"
+
+
+def test_solo_legato_maps_to_legato_glide_mode():
+    root = parse(_meta_voice(portamento=True, portamento_time=64, solo_legato=True),
+                 _cal_with_ir())
+    assert find1(root, ".//group").get("glideMode") == "legato"
+
+
+def test_missing_voice_block_is_harmless():
+    """patch.json files predating the voice block must still emit."""
+    meta = make_meta()
+    meta.pop("voice", None)
+    root = parse(meta, _cal_with_ir())
+    assert root.find("./tags") is None
+    assert find1(root, ".//group").get("glideTime") is None

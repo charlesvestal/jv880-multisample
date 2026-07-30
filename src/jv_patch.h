@@ -16,6 +16,16 @@ struct Effects {
     int chorus_feedback = 0, chorus_output = 0;  // output: 0 = Mix, 1 = Reverb
     int bend_up = 0, bend_down = 0;
     int portamento = 0;
+    // Voice mode. The JV plays a patch either polyphonically or as a solo
+    // (monophonic) voice, optionally gliding between notes. Sampling renders
+    // every note in isolation, which is correct either way -- monophony only
+    // matters when notes overlap -- so these are carried through to the
+    // preset rather than baked into the audio.
+    //   key_assign      0 = Poly, 1 = Solo
+    //   solo_legato     glide only when the previous note is still held
+    //   portamento_time 0-127, mapped to DecentSampler's glideTime in seconds
+    int key_assign = 0, solo_legato = 0;
+    int portamento_mode = 0, portamento_time = 0, portamento_type = 0;
     int reverb_send[TONE_COUNT] = {0, 0, 0, 0};
     int chorus_send[TONE_COUNT] = {0, 0, 0, 0};
     int tone_level[TONE_COUNT]  = {0, 0, 0, 0};

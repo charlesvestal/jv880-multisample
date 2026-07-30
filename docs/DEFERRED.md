@@ -3,44 +3,27 @@
 Agreed with the user, not yet done. Recorded here so it survives a session
 ending.
 
-## 1. Monophonic patches
-The JV's key-assign mode (poly/solo) is never read. `src/jv_patch.cpp` reads
-the portamento bit (byte 24, bit 6) and `preprocess()` deliberately turns
-portamento OFF for sampling -- correct for capturing individual notes, but the
-emitted preset then plays every patch polyphonically, including ones the JV
-plays solo with glide.
+## 1. Monophonic patches -- DONE (2026-07-30)
 
-Both halves are now researched; only the wiring is left.
+Implemented. `src/jv_patch.cpp` reads the six patch-common voice bits,
+`jv_sampler` writes a "voice" block into patch.json, and `emit_presets`
+turns it into a `polyphony="1"` tag plus glideTime/glideMode.
 
-JV side -- patch-common bits, confirmed against the reference implementation's
-own parameter table (`schwung-jv880/src/dsp/jv880_plugin.cpp`, PATCH_COMMON_PARAMS):
+267 of 4,197 presets (6.4%) are monophonic and 336 (8.0%) glide -- mostly
+basses and solo leads, which is what the JV's Solo mode is for.
 
-    keyassign          byte 24, bit 7      0 = Poly, 1 = Solo
-    sololegato         byte 24, bit 5      0 = Off,  1 = On
-    portamentoswitch   byte 24, bit 6
-    portamentomode     byte 24, bit 4
-    portamentotime     byte 25, bits 0-6   0-127
-    portamentotype     byte 25, bit 7
+Two things worth remembering:
+  - `tools/backfill_voice.py` merges the voice block into ALREADY-rendered
+    patch.json files via `jv_sampler --dump-voice`. Re-running the sampler
+    normally would regenerate patch.json and destroy what postprocess wrote
+    into the zones (kind, loop points, release).
+  - glideTime is emitted only when the portamento SWITCH is on. The JV stores
+    a portamento time regardless -- 93 is a common stored default on patches
+    with portamento off -- so keying off the time alone would have put a
+    glide on most of the library.
 
-DecentSampler side -- confirmed in the developer guide:
-
-    glideTime   seconds; 0.0 = no portamento
-    glideMode   "always" | "legato" (default) | "off"
-    polyphony="1" via the TAG system gives monophonic behaviour; there is no
-                  direct monophony attribute on <group>
-
-Work needed:
-  1. `src/jv_patch.cpp` -- read the six bits above into the patch struct.
-  2. `src/jv_sampler.cpp` -- write them into patch.json.
-  3. `tools/emit_presets.py` -- for keyassign=Solo emit a mono tag with
-     polyphony="1", and map portamentotime to glideTime with
-     glideMode="legato" when sololegato is on, "always" otherwise.
-
-NOTE: step 2 changes jv_sampler, so the already-rendered patch.json files will
-lack the fields. Either re-run a metadata-only pass, or add a small dump tool
-and merge the values into existing patch.json files -- the samples themselves
-do not need re-rendering, since each note is sampled in isolation and mono
-behaviour is purely a playback-time property.
+GLIDE_TIME_MAX_S = 1.5 is an assumption, not a measurement: the JV's 0-127
+portamento time was never swept against real glide durations.
 
 ## 2. Loop / phrase patches
 Patches where holding ONE key plays a musical or rhythmic loop rather than a
