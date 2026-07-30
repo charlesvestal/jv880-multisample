@@ -108,6 +108,9 @@ int main(int argc, char **argv) {
     std::string roms_dir, board, out_dir;
     int only_patch = -1;
     bool dump_voice = false;
+    // Phrase patches need a longer hold than the default grid: a 2-bar loop
+    // at 61 BPM runs almost 8 s, and the standard 3.5 s cuts it mid-bar.
+    double hold_seconds = -1.0;
     bool do_list = false;
 
     for (int i = 1; i < argc; i++) {
@@ -119,6 +122,8 @@ int main(int argc, char **argv) {
             out_dir = argv[++i];
         } else if (!strcmp(argv[i], "--patch") && i + 1 < argc) {
             only_patch = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--hold") && i + 1 < argc) {
+            hold_seconds = atof(argv[++i]);
         } else if (!strcmp(argv[i], "--dump-voice")) {
             dump_voice = true;
         } else if (!strcmp(argv[i], "--list")) {
@@ -201,18 +206,23 @@ int main(int argc, char **argv) {
             printf("{\"index\":%d,\"bank\":\"%s\",\"name\":\"%s\","
                    "\"voice\":{\"key_assign\":\"%s\",\"solo_legato\":%s,"
                    "\"portamento\":%s,\"portamento_time\":%d,"
-                   "\"portamento_mode\":\"%s\"}}\n",
+                   "\"portamento_mode\":\"%s\"},\"pitch_keyfollow\":[%d,%d,%d,%d],\"tone_level\":[%d,%d,%d,%d]}\n",
                    pr.index, json_escape(pr.bank).c_str(), json_escape(pr.name).c_str(),
                    fx.key_assign ? "Solo" : "Poly",
                    fx.solo_legato ? "true" : "false",
                    fx.portamento ? "true" : "false",
                    fx.portamento_time,
-                   fx.portamento_mode ? "Legato" : "Normal");
+                   fx.portamento_mode ? "Legato" : "Normal",
+                   fx.pitch_keyfollow[0], fx.pitch_keyfollow[1],
+                   fx.pitch_keyfollow[2], fx.pitch_keyfollow[3],
+                   fx.tone_level[0], fx.tone_level[1],
+                   fx.tone_level[2], fx.tone_level[3]);
         }
         return 0;
     }
 
     GridSpec grid;
+    if (hold_seconds > 0.0) grid.hold_seconds = hold_seconds;
     Renderer r;
     if (!r.init(roms)) {
         fprintf(stderr, "emulator init failed\n");

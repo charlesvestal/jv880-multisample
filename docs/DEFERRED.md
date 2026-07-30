@@ -38,24 +38,30 @@ selects Rate vs Time behaviour, and under Rate the duration scales with the
 interval. DecentSampler's glideTime is a fixed time, so Rate-type patches
 cannot be exact at every interval -- a fifth is used as representative.
 
-## 2. Loop / phrase patches
-Patches where holding ONE key plays a musical or rhythmic loop rather than a
-sustained tone. "House Hunter" is likely one of these (user's read, and it
-matches its behaviour: percussive, non-sustaining, reverbtime 0).
+## 2. Loop / phrase patches -- DONE (2026-07-30)
 
-These break assumptions the pipeline makes everywhere:
-  - the fixed 3.5 s hold cuts the phrase at an arbitrary point
-  - loop-point detection looks for a steady sustain that does not exist
-  - one sample every 3 semitones transposes the whole phrase's TEMPO, since
-    pitch and playback rate are the same thing in a sampler
+Handled, not excluded. Roland names these patches with their tempo
+("125:BtMenu 1", "83:Kick It"), so all 190 are identified exactly rather than
+guessed from audio -- three separate envelope-based detectors were tried
+first and all found tremolo and chorus instead.
 
-The user's guidance: handle them properly OR exclude them from the library.
-Excluding is legitimate and much cheaper -- a phrase patch transposed across
-25 root keys is 25 different tempos, which is not what the JV does.
+The real defect was truncation, not transposition. The standard grid holds
+each note 3.5 s while a two-bar phrase at 61 BPM runs nearly 8 s, so anything
+under ~137 BPM was cut mid-bar. `jv_sampler --hold` plus
+`tools/rerender_phrases.py` re-render each one at a hold computed from its own
+labelled tempo (4.0-11.6 s).
 
-Needs first: a detector. Candidate signal is a strongly periodic amplitude
-envelope (rhythmic re-triggering) inside a single held note, which a
-sustained or decaying patch does not have.
+NOT excluded, for two reasons:
+  - many are hybrids whose tones carry different key-follow values
+    (125:ElevatMe reads [0,0,0,6]), so dropping the patch would discard
+    playable material along with the loop;
+  - the JV is itself a PCM sampler, so a higher key plays the wave faster.
+    Multisampling reproduces the hardware rather than fighting it. An earlier
+    claim in this file that "the JV never does this" was wrong.
+
+Still open: loop POINTS are chosen by the generic sustain-loop finder and have
+no reason to land on a bar boundary. Snapping them to a multiple of the
+measured phrase period would make held notes repeat musically.
 
 ## 3. Drum kits / Rhythm Sets -- SKIPPED for now
 Explicitly deferred by the user. Note these are NOT missing from the render by
