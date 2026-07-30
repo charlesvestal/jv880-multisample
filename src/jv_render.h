@@ -73,6 +73,22 @@ public:
     // for a sustained run), then All Notes Off plus a short discarded flush
     // so this cell's decay never bleeds into the next one (design note B).
     // Requires a prior successful init().
+    // Load an expansion board's WAVE data into the PCM chip.
+    //
+    // MUST be called before rendering any expansion patch. An expansion patch
+    // addresses its waves through PCM banks 3-6, which map to the emulator's
+    // waverom_exp -- a region startSC55() does not populate. Without this the
+    // wave numbers still resolve, but against the INTERNAL wave ROM, so every
+    // expansion patch plays the wrong sound entirely: strings come out as
+    // acoustic piano. The whole first render of the 20 expansion boards was
+    // wrong this way, and it is invisible to structural validation because
+    // each patch still produces distinct, plausible audio.
+    void load_expansion_waves(const uint8_t *data, size_t len);
+
+    // Clear the expansion wave area, for rendering internal patches after an
+    // expansion (stale waves would otherwise persist in the PCM chip).
+    void clear_expansion_waves();
+
     std::vector<int16_t> render_note(int key, int velocity, const GridSpec &g);
 
     // Two overlapping notes, for measuring portamento. The JV only glides

@@ -177,6 +177,7 @@ int main(int argc, char **argv) {
     // whole render loop below, not just this lookup.
     std::vector<Expansion> expansions;
     std::vector<PatchRef> patches;
+    const Expansion *selected_expansion = nullptr;
     if (board == BOARD_INTERNAL) {
         patches = enumerate_internal(roms);
     } else {
@@ -184,6 +185,7 @@ int main(int argc, char **argv) {
         for (const auto &e : expansions) {
             if (e.usable && e.name == board) {
                 patches = enumerate_expansion(e);
+                selected_expansion = &e;
                 break;
             }
         }
@@ -227,6 +229,20 @@ int main(int argc, char **argv) {
     if (!r.init(roms)) {
         fprintf(stderr, "emulator init failed\n");
         return 1;
+    }
+    // An expansion patch addresses its waves through PCM banks 3-6, which map
+    // to waverom_exp -- a region startSC55() does not fill. Without this the
+    // wave numbers resolve against the INTERNAL wave ROM instead, and every
+    // expansion patch renders the wrong instrument while still sounding like
+    // a plausible, distinct patch. That is exactly how the first full render
+    // of all 20 expansion boards came out silently wrong.
+    if (selected_expansion) {
+        r.load_expansion_waves(selected_expansion->unscrambled.data(),
+                               selected_expansion->unscrambled.size());
+        fprintf(stderr, "loaded %zu bytes of expansion wave data for %s\n",
+                selected_expansion->unscrambled.size(), board.c_str());
+    } else {
+        r.clear_expansion_waves();
     }
 
     for (size_t pi = 0; pi < patches.size(); pi++) {

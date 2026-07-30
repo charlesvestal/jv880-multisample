@@ -181,6 +181,20 @@ std::vector<int16_t> Renderer::render_glide(int key_from, int key_to, int veloci
 }
 
 
+void Renderer::load_expansion_waves(const uint8_t *data, size_t len) {
+    assert(mcu_ != nullptr && "load_expansion_waves called before init()");
+    MCU *m = (MCU *)mcu_;
+    const size_t cap = sizeof(m->pcm.waverom_exp);
+    std::memset(m->pcm.waverom_exp, 0, cap);
+    std::memcpy(m->pcm.waverom_exp, data, std::min(len, cap));
+}
+
+void Renderer::clear_expansion_waves() {
+    assert(mcu_ != nullptr && "clear_expansion_waves called before init()");
+    MCU *m = (MCU *)mcu_;
+    std::memset(m->pcm.waverom_exp, 0, sizeof(m->pcm.waverom_exp));
+}
+
 std::vector<int16_t> Renderer::render_note(int key, int velocity, const GridSpec &g) {
     assert(mcu_ != nullptr && "Renderer::render_note called before a successful init()");
     MCU *m = (MCU *)mcu_;

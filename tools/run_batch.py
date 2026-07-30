@@ -307,6 +307,7 @@ def check_disk_space(out_root: Path, n_patches: int) -> tuple[bool, str | None]:
 # --------------------------------------------------------------------------
 
 def main() -> int:
+    global ROMS
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--board", help='board name (exact, as printed by --list), or "all"')
@@ -316,11 +317,21 @@ def main() -> int:
                      help="print board names and patch counts, then exit")
     ap.add_argument("--limit", type=int, default=None,
                      help="render at most N patches per board (testing)")
+    ap.add_argument("--roms", type=Path, default=ROMS,
+                     help="directory holding the JV-880 ROM images "
+                          "(default: $JV880_ROMS)")
     ap.add_argument("--out", type=Path, default=OUT_ROOT,
                      help=f"output root (default: {OUT_ROOT}). "
                           f"NEVER point this at the internal drive -- a full "
                           f"run is 250-315 GB.")
     args = ap.parse_args()
+    # --roms overrides the module-level default. Setting the environment too,
+    # not just the global: workers run in separate processes that re-import
+    # this module and would otherwise read the ORIGINAL env value, which is
+    # how a run with --roms failed with "cannot open ./jv880_rom1.bin".
+    ROMS = args.roms
+    os.environ["JV880_ROMS"] = str(args.roms)
+    os.environ["JV880_OUT"] = str(args.out)
 
     if args.list:
         try:
