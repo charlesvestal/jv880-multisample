@@ -241,9 +241,12 @@ int main(int argc, char **argv) {
                                selected_expansion->unscrambled.size());
         fprintf(stderr, "loaded %zu bytes of expansion wave data for %s\n",
                 selected_expansion->unscrambled.size(), board.c_str());
-    } else {
-        r.clear_expansion_waves();
     }
+    // No clear_expansion_waves() for internal boards. Each invocation gets a
+    // fresh MCU whose waverom_exp is already zero, and clearing would trigger
+    // the reset+re-warm that swap requires -- changing internal renders for no
+    // reason. The 192 internal patches were correct all along and must stay
+    // byte-identical.
 
     for (size_t pi = 0; pi < patches.size(); pi++) {
         if (only_patch >= 0 && (int)pi != only_patch) continue;

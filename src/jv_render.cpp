@@ -187,12 +187,28 @@ void Renderer::load_expansion_waves(const uint8_t *data, size_t len) {
     const size_t cap = sizeof(m->pcm.waverom_exp);
     std::memset(m->pcm.waverom_exp, 0, cap);
     std::memcpy(m->pcm.waverom_exp, data, std::min(len, cap));
+
+    // RESET AND RE-WARM. This is not optional and it is the whole reason an
+    // earlier attempt failed: init() boots the firmware and warms it for ~3 s
+    // with waverom_exp still empty, so the firmware has already decided what
+    // waves exist. Filling the array afterwards changes nothing it will look
+    // at, and every expansion patch keeps playing internal waves -- a Rhodes
+    // comes out as an acoustic piano. The reference implementation says it
+    // plainly: "The emulator can't handle waveform ROM swaps with active
+    // voices", and resets after every expansion swap.
+    m->SC55_Reset();
+    for (int i = 0; i < WARMUP_STEPS; i++) m->updateSC55(1);
 }
 
 void Renderer::clear_expansion_waves() {
     assert(mcu_ != nullptr && "clear_expansion_waves called before init()");
     MCU *m = (MCU *)mcu_;
+    if (!std::memchr(m->pcm.waverom_exp, 1, 0)) { /* no-op guard for clarity */ }
     std::memset(m->pcm.waverom_exp, 0, sizeof(m->pcm.waverom_exp));
+    // Same reasoning as load_expansion_waves: the firmware must re-boot to
+    // notice the change.
+    m->SC55_Reset();
+    for (int i = 0; i < WARMUP_STEPS; i++) m->updateSC55(1);
 }
 
 std::vector<int16_t> Renderer::render_note(int key, int velocity, const GridSpec &g) {

@@ -770,7 +770,7 @@ def test_release_measured():
     t = np.arange(int(6.0 * SR)) / SR
     mono = 0.5 * np.sin(2 * np.pi * 220.0 * t)
     mono[HOLD:] *= np.exp(-10.0 * (t[HOLD:] - t[HOLD]))
-    r = pp.measure_release(make_stereo(mono), SR, HOLD)
+    r, _ = pp.measure_release(make_stereo(mono), SR, HOLD)
     assert 0.1 < r < 2.0
 
 
@@ -917,7 +917,8 @@ def test_release_lets_a_sound_that_ended_before_noteoff_play_out():
     as a measurement, so DecentSampler faded a 2.2 s decay out in 100 ms on
     any short note -- percussion sounded cut off."""
     x = _decayed_before_noteoff()
-    r = pp.measure_release(x, SR, HOLD)
+    r, measured = pp.measure_release(x, SR, HOLD)
+    assert measured is False
     assert r > 2.0, f"a decay that ended before note-off must not be truncated (got {r})"
     assert r <= len(x) / SR + 1e-6, "release should not exceed the sample itself"
 
@@ -928,7 +929,8 @@ def test_near_silent_tail_also_counts_as_unmeasurable():
     x = _decayed_before_noteoff()
     rng = np.random.default_rng(0)
     x[HOLD:] += rng.normal(0, 10 ** (-80 / 20), size=x[HOLD:].shape)
-    assert pp.measure_release(x, SR, HOLD) > 2.0
+    r, measured = pp.measure_release(x, SR, HOLD)
+    assert measured is False and r > 2.0
 
 
 def test_release_is_still_measured_when_there_is_a_real_tail():
@@ -939,7 +941,8 @@ def test_release_is_still_measured_when_there_is_a_real_tail():
     x = np.sin(2 * np.pi * 220 * t)
     tail = np.arange(n - HOLD) / SR
     x[HOLD:] *= np.exp(-tail * (60 / 20) * np.log(10) / 0.5)   # ~0.5 s to -60 dB
-    r = pp.measure_release(make_stereo(x), SR, HOLD)
+    r, measured = pp.measure_release(make_stereo(x), SR, HOLD)
+    assert measured is True
     assert 0.3 < r < 0.9, f"expected a measured ~0.5 s release, got {r}"
 
 
@@ -954,7 +957,7 @@ def test_silent_zone_is_safe():
     loop = pp.find_loop(x, SR, HOLD)
     assert loop is None
 
-    release = pp.measure_release(x, SR, HOLD)
+    release, _ = pp.measure_release(x, SR, HOLD)
     assert np.isfinite(release)
     assert release >= 0.0
 
@@ -1015,7 +1018,7 @@ def test_empty_array_does_not_crash_classify_find_loop_or_release():
 
     assert pp.find_loop(empty, SR, HOLD) is None
 
-    r = pp.measure_release(empty, SR, HOLD)
+    r, _ = pp.measure_release(empty, SR, HOLD)
     assert np.isfinite(r)
 
 
@@ -1373,3 +1376,40 @@ def test_main_reloop_flag_invokes_reloop_not_process(tmp_path, monkeypatch):
     assert (tmp_path / flac_name).read_bytes() == original_bytes
     on_disk = json.loads((tmp_path / "patch.json").read_text())
     assert on_disk["zones"][0]["file"] == flac_name
+
+
+def test_unify_release_removes_the_per_key_cliff():
+    """Tr.Rhodes shipped with C6 at 3.711 s and C7 at 3.631 s while their
+    neighbours sat near 0.11 s -- heard as the top of the keyboard suddenly
+    releasing far more slowly. The JV's TVA release is a patch parameter, so
+    every zone must end up with the same value."""
+    zones = [
+        {"release": 0.19, "_release_measured": True},
+        {"release": 0.14, "_release_measured": True},
+        {"release": 0.11, "_release_measured": True},
+        {"release": 3.71, "_release_measured": False},   # decayed before note-off
+        {"release": 3.63, "_release_measured": False},
+    ]
+    pp.unify_release(zones)
+    vals = {z["release"] for z in zones}
+    assert len(vals) == 1, f"release still varies across the patch: {vals}"
+    assert 0.10 < vals.pop() < 0.20, "unified value should come from the measured zones"
+    assert all("_release_measured" not in z for z in zones), "scratch key leaked into patch.json"
+
+
+def test_unify_release_leaves_a_fully_percussive_patch_ringing_out():
+    """If NOTHING was measurable the patch decays before note-off throughout,
+    and each zone should keep its own play-out duration rather than inherit a
+    short release that would truncate it."""
+    zones = [{"release": 3.6, "_release_measured": False},
+             {"release": 2.9, "_release_measured": False}]
+    pp.unify_release(zones)
+    assert [z["release"] for z in zones] == [3.6, 2.9]
+
+
+def test_unify_release_ignores_zones_with_no_audio():
+    zones = [{"release": 0.2, "_release_measured": True},
+             {"release": None, "_release_measured": False}]
+    pp.unify_release(zones)
+    assert zones[0]["release"] == 0.2
+    assert zones[1]["release"] is None

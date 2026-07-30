@@ -46,7 +46,9 @@ def main():
     chunks = [presets[i:i + args.size] for i in range(0, len(presets), args.size)]
     width = len(str(len(chunks)))
     for n, chunk in enumerate(chunks, 1):
-        name = f"{lib.name} [{n:0{width}d} of {len(chunks)}]"
+        # No square brackets in the filename. Some SMB clients and iOS hide
+        # or fail on them, which made a set of these invisible over a share.
+        name = f"{lib.name} part{n:0{width}d}of{len(chunks)}"
         dest = out / f"{name}.dslibrary"
         tmp = dest.with_suffix(dest.suffix + ".partial")
         total = 0

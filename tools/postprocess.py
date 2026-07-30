@@ -352,7 +352,15 @@ def find_loop(x, sr, hold_frames):
 
 
 def measure_release(x, sr, hold_frames):
-    """Seconds for the post-note-off tail to fall 60 dB.
+    """(seconds, measured) for the post-note-off tail to fall 60 dB.
+
+    `measured` is False when there was no audible tail to measure. Callers
+    must not use an unmeasured value directly: on a Rhodes the high keys decay
+    before note-off while the low ones still ring, so per-zone values jumped
+    between 0.11 s and 3.7 s on ADJACENT keys, audible as the top of the
+    keyboard suddenly releasing far more slowly. The JV's TVA release is a
+    patch parameter anyway, not something that varies note to note, so
+    process_patch derives ONE release per patch from the measured zones.
 
     When there is no measurable tail -- the sound decayed to silence BEFORE
     note-off, which is the norm for percussive patches held for 3.5 s -- this
@@ -371,20 +379,20 @@ def measure_release(x, sr, hold_frames):
     measurement below, so sounds with a real release are unaffected.
     """
     if len(x) == 0:
-        return 0.1
+        return 0.1, False
     full_duration = float(len(x) / sr)
     tail = x[hold_frames:]
     if len(tail) < sr // 20:
-        return full_duration
+        return full_duration, False
     mono = np.abs(tail.mean(axis=1) if tail.ndim > 1 else tail)
     hop = 64
     n = (len(mono) // hop) * hop
     if n == 0:
-        return full_duration
+        return full_duration, False
     env = mono[:n].reshape(-1, hop).max(axis=1) + 1e-12
     peak = env.max()
     if peak <= 1e-12:
-        return full_duration
+        return full_duration, False
     # Not-quite-zero counts as nothing to measure too. A tail sitting 60 dB
     # under the sample's own peak is a decay that already finished, and
     # measuring its -60 dB crossing just measures the noise floor -- which
@@ -392,12 +400,40 @@ def measure_release(x, sr, hold_frames):
     # as the old 0.1 fallback did.
     whole = np.abs(x.mean(axis=1) if x.ndim > 1 else x).max()
     if whole > 0 and peak < whole * 10 ** (-60 / 20):
-        return full_duration
+        return full_duration, False
     db = 20 * np.log10(env / peak)
     below = np.where(db < -60)[0]
     if len(below):
-        return float(max(0.05, below[0] * hop / sr))
-    return float(len(mono) / sr)
+        return float(max(0.05, below[0] * hop / sr)), True
+    return float(len(mono) / sr), True
+
+
+def unify_release(zones):
+    """Give every zone in a patch ONE release, from the zones that had a
+    measurable tail.
+
+    The JV's TVA release is a patch parameter -- it does not change note to
+    note. Measuring per zone made it do exactly that, and at the point where
+    a note decays before note-off the measurement falls off a cliff: on
+    Tr.Rhodes, C6 and C7 came out at 3.7 s while their immediate neighbours
+    sat at 0.11 s, heard as the top of the keyboard suddenly releasing far
+    more slowly than the rest.
+
+    Zones whose tail was too quiet to measure contribute nothing to the
+    median; they inherit it like everyone else. If NOTHING was measurable the
+    patch is percussive throughout, and letting each zone ring out for its own
+    full duration is the right answer -- that is the case the play-out
+    fallback exists for.
+    """
+    measured = [z["release"] for z in zones
+                if z.get("_release_measured") and z.get("release") is not None]
+    if measured:
+        unified = round(float(np.median(measured)), 4)
+        for z in zones:
+            if z.get("release") is not None:
+                z["release"] = unified
+    for z in zones:
+        z.pop("_release_measured", None)
 
 
 def _mark_zone_unprocessable(z, kind):
@@ -505,7 +541,8 @@ def process_patch(pdir: Path, hold_seconds=3.5):
             # never got corrected. See requirement #5 in the review.
             kind, ratio = classify(y, hold_out)
             loop = find_loop(y, SR_OUT, hold_out) if kind == "sustaining" else None
-            release_val = round(measure_release(y, SR_OUT, hold_out), 4)
+            release_val, release_measured = measure_release(y, SR_OUT, hold_out)
+            release_val = round(release_val, 4)
 
             # Point of no return: write the deliverable, then commit the
             # zone's metadata, and only then remove the original. Any
@@ -520,6 +557,7 @@ def process_patch(pdir: Path, hold_seconds=3.5):
             z["sustain_ratio"] = round(ratio, 4)
             z["loop"] = loop or {"enabled": False}
             z["release"] = release_val
+            z["_release_measured"] = bool(release_measured)
 
             try:
                 src.unlink()
@@ -545,6 +583,9 @@ def process_patch(pdir: Path, hold_seconds=3.5):
                 file=sys.stderr,
             )
             _mark_zone_unprocessable(z, "error")
+
+    # One release for the whole patch -- see unify_release.
+    unify_release(meta["zones"])
 
     meta["sample_rate"] = SR_OUT
     (pdir / "patch.json").write_text(json.dumps(meta, indent=2))
@@ -591,12 +632,14 @@ def reloop_patch(pdir: Path, hold_seconds=3.5):
 
             kind, ratio = classify(y, hold_out)
             loop = find_loop(y, SR_OUT, hold_out) if kind == "sustaining" else None
-            release_val = round(measure_release(y, SR_OUT, hold_out), 4)
+            release_val, release_measured = measure_release(y, SR_OUT, hold_out)
+            release_val = round(release_val, 4)
 
             z["kind"] = kind
             z["sustain_ratio"] = round(ratio, 4)
             z["loop"] = loop or {"enabled": False}
             z["release"] = release_val
+            z["_release_measured"] = bool(release_measured)
         except Exception as exc:
             # Unlike process_patch, we deliberately do NOT downgrade the
             # zone to _mark_zone_unprocessable here: the .flac is valid
@@ -610,6 +653,9 @@ def reloop_patch(pdir: Path, hold_seconds=3.5):
                 "leaving previous metadata, continuing with next zone",
                 file=sys.stderr,
             )
+
+    # One release for the whole patch -- see unify_release.
+    unify_release(meta["zones"])
 
     meta["sample_rate"] = SR_OUT
     (pdir / "patch.json").write_text(json.dumps(meta, indent=2))
