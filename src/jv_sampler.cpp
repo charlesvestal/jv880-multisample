@@ -111,6 +111,7 @@ int main(int argc, char **argv) {
     // Phrase patches need a longer hold than the default grid: a 2-bar loop
     // at 61 BPM runs almost 8 s, and the standard 3.5 s cuts it mid-bar.
     double hold_seconds = -1.0;
+    bool no_expansion_waves = false;
     bool do_list = false;
 
     for (int i = 1; i < argc; i++) {
@@ -122,6 +123,12 @@ int main(int argc, char **argv) {
             out_dir = argv[++i];
         } else if (!strcmp(argv[i], "--patch") && i + 1 < argc) {
             only_patch = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--no-expansion-waves")) {
+            // Deliberately render an expansion board WITHOUT its own waves,
+            // reproducing the bug where they play internal waves instead.
+            // tools/verify_expansion_waves.py renders both ways and requires
+            // the results to differ.
+            no_expansion_waves = true;
         } else if (!strcmp(argv[i], "--hold") && i + 1 < argc) {
             hold_seconds = atof(argv[++i]);
         } else if (!strcmp(argv[i], "--dump-voice")) {
@@ -236,7 +243,7 @@ int main(int argc, char **argv) {
     // expansion patch renders the wrong instrument while still sounding like
     // a plausible, distinct patch. That is exactly how the first full render
     // of all 20 expansion boards came out silently wrong.
-    if (selected_expansion) {
+    if (selected_expansion && !no_expansion_waves) {
         r.load_expansion_waves(selected_expansion->unscrambled.data(),
                                selected_expansion->unscrambled.size());
         fprintf(stderr, "loaded %zu bytes of expansion wave data for %s\n",

@@ -133,6 +133,31 @@ def check_audio(pdir: Path, meta: dict) -> tuple[int, int, int]:
     return looped, total, skipped, sustaining
 
 
+def check_release_consistency(pdir: Path, meta: dict) -> None:
+    """Every zone in a patch must share one release value.
+
+    The JV's TVA release is a PATCH parameter -- it does not vary note to
+    note. Measuring it per zone made it do exactly that, and where a note
+    decays before note-off the measurement falls off a cliff: Tr.Rhodes had
+    C6 at 3.711 s beside neighbours at 0.11 s, heard as the top of the
+    keyboard releasing far more slowly. 34 of 192 internal patches were
+    affected, one spanning 0.050-5.040 s.
+
+    Nothing caught it because each value was individually plausible -- 0.05 s
+    is a fine release and so is 3.6 s. Only comparing them WITHIN a patch
+    exposes it, which is what this does.
+    """
+    values = {round(z["release"], 4) for z in meta.get("zones", [])
+              if z.get("kind") not in ("missing", "error")
+              and z.get("release") is not None}
+    if len(values) > 1:
+        lo, hi = min(values), max(values)
+        errors.append(
+            f"{pdir.name}: {len(values)} different release values "
+            f"({lo:.3f}-{hi:.3f}s) -- release is a patch parameter and must "
+            f"be uniform across the keyboard")
+
+
 def check_presets(lib: Path) -> tuple[bool, bool]:
     """Validate every .dspreset in a library. Returns (saw_reverb, saw_delay)."""
     presets = sorted(lib.glob("*.dspreset"))
@@ -235,6 +260,7 @@ def main() -> None:
                 errors.append(
                     f"{pdir.name}: {n // EXPECTED_KEYS} velocity layers, "
                     f"expected {MIN_LAYERS}-{MAX_LAYERS}")
+            check_release_consistency(pdir, meta)
             l, t, s, sus = check_audio(pdir, meta)
             looped += l
             total += t
