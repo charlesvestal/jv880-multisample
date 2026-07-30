@@ -365,5 +365,29 @@
       "112": "ir_synth_raw/reverb_t5_time_112.wav",
       "127": "ir_synth_raw/reverb_t5_time_127.wav"
     }
+  },
+  "portamento_time_s": {
+    "0": 0.0,
+    "8": 0.0,
+    "16": 0.0,
+    "24": 0.0,
+    "32": 0.04,
+    "40": 0.08,
+    "48": 0.16,
+    "56": 0.3,
+    "64": 0.44,
+    "72": 0.68,
+    "80": 1.12,
+    "88": 1.62,
+    "96": 2.5,
+    "104": 3.96,
+    "112": 6.12,
+    "120": 9.32,
+    "127": 13.68
+  },
+  "portamento_measurement": {
+    "interval_semitones": 7,
+    "patch": "Pipe Organ 1",
+    "note": "5-95% glide duration across a fifth"
   }
 }

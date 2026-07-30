@@ -1237,6 +1237,52 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (cmd == "portamento") {
+        // Sweep the portamento TIME byte and render a glide at each setting,
+        // so the JV's 0-127 can be mapped to real seconds. The manual gives
+        // no absolute times, so this is the only way to know what the byte
+        // means -- DecentSampler's glideTime is in seconds and was, until
+        // this measurement, filled from an assumed 1.5 s maximum.
+        auto internal = enumerate_internal(roms);
+        if ((size_t)a.patch_index >= internal.size()) {
+            fprintf(stderr, "patch index out of range\n");
+            return 1;
+        }
+        const PatchRef &pr = internal[a.patch_index];
+        LfoDecision d1 = decide_lfo_strip(pr.data, 1);
+        LfoDecision d2 = decide_lfo_strip(pr.data, 2);
+        std::vector<uint8_t> base = preprocess(pr.data, d1, d2);
+
+        Renderer r;
+        if (!r.init(roms)) { fprintf(stderr, "emulator init failed\n"); return 1; }
+        mkdirs(a.out_dir);
+
+        const int steps[] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 127};
+        for (int t : steps) {
+            std::vector<uint8_t> patch = base;
+            patch[24] |= (1 << 7);              // key assign  = Solo
+            patch[24] |= (1 << 6);              // portamento  = On
+            patch[24] &= (uint8_t)~(1 << 4);    // portamento mode = Normal
+            patch[25] = (uint8_t)((patch[25] & 0x80) | (t & 0x7f));   // time
+            r.load_patch_bytes(patch, GridSpec{});
+            // A FIFTH, not an octave. Under Rate-type portamento the glide
+            // duration scales with interval, so the interval is recorded
+            // alongside -- but the reason it is not an octave is measurement:
+            // these patches have a strong second harmonic, so a pitch tracker
+            // octave-errors freely, and an octave-wide glide is exactly the
+            // confusion case. A fifth cannot be mistaken for an octave error.
+            // 25 s: the slowest settings glide for many seconds, and a
+            // window that truncates the glide silently reports it as fast.
+            std::vector<int16_t> pcm = r.render_glide(48, 55, 100, 1.0, 25.0);
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%s/porta_%03d.wav", a.out_dir.c_str(), t);
+            wav_write_s16(buf, pcm.data(), (int)(pcm.size() / 2), 2, SAMPLE_RATE);
+            printf("{\"time\":%d,\"file\":\"%s\",\"from\":48,\"to\":55}\n", t, buf);
+            fflush(stdout);
+        }
+        return 0;
+    }
+
     fprintf(stderr, "unknown subcommand: %s\n", cmd.c_str());
     return 1;
 }

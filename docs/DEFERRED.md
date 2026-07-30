@@ -22,8 +22,21 @@ Two things worth remembering:
     with portamento off -- so keying off the time alone would have put a
     glide on most of the library.
 
-GLIDE_TIME_MAX_S = 1.5 is an assumption, not a measurement: the JV's 0-127
-portamento time was never swept against real glide durations.
+Portamento time is now MEASURED, not assumed. `wave_inject portamento` renders
+a real two-note glide at each setting -- the JV only glides BETWEEN notes, so
+a single-note render cannot show it, which is why `Renderer::render_glide` was
+added -- and the 5-95% duration comes off an autocorrelation pitch track:
+
+    raw   32     48     64     80     96     112     127
+    s     0.04   0.16   0.44   1.12   2.50   6.12    13.68
+
+Settings up to ~24 are instant. The previous assumed 1.5 s maximum was about
+9x too fast. Stored in calibration.json as "portamento_time_s".
+
+Measured across a FIFTH. Still open: the portamento TYPE byte (25 bit 7)
+selects Rate vs Time behaviour, and under Rate the duration scales with the
+interval. DecentSampler's glideTime is a fixed time, so Rate-type patches
+cannot be exact at every interval -- a fifth is used as representative.
 
 ## 2. Loop / phrase patches
 Patches where holding ONE key plays a musical or rhythmic loop rather than a

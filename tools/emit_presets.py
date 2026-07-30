@@ -757,15 +757,30 @@ def zone_vel_range(zones):
 
 
 # The JV's portamento time byte is 0-127; DecentSampler's glideTime is in
-# SECONDS. No sweep of the hardware was made for this, so the range is taken
-# from what a JV portamento plausibly spans -- effectively instant at 0, and
-# a slow but still musical glide at maximum. Documented as an assumption
-# rather than a measurement.
-GLIDE_TIME_MAX_S = 1.5
+# SECONDS. Measured rather than assumed: tools/wave_inject's `portamento`
+# subcommand renders a real two-note glide at each setting (the JV only
+# glides BETWEEN notes, so a single-note render cannot show it), and the
+# 5-95% duration is read off an autocorrelation pitch track. The curve is
+# steeply exponential and lands in calibration.json's "portamento_time_s":
+#
+#     raw   32     48     64     80     96     112     127
+#     s     0.04   0.16   0.44   1.12   2.50   6.12    13.68
+#
+# Settings up to ~24 are instant. The previous value here was an assumed
+# 1.5 s maximum, which was too fast by about 9x -- a patch at raw 127 glides
+# for over thirteen seconds, and no amount of reasoning would have guessed
+# that.
+#
+# Measured across a FIFTH (keys 48->55). The interval matters: the JV has a
+# portamento TYPE byte selecting Rate or Time behaviour, and under Rate the
+# duration scales with how far the pitch travels. DecentSampler's glideTime
+# is a fixed time, so Rate-type patches cannot be exact at every interval;
+# a fifth is used as the representative one.
+GLIDE_TIME_FALLBACK_MAX_S = 1.5
 MONO_TAG = "jv_solo"
 
 
-def voice_attrs(meta):
+def voice_attrs(meta, cal=None):
     """Group attributes for the patch's voice mode: monophony and glide.
 
     Sampling renders every note in isolation, which is right regardless of
@@ -785,7 +800,12 @@ def voice_attrs(meta):
     # would put a glide on most of the library.
     if voice.get("portamento"):
         raw = max(0, min(127, int(voice.get("portamento_time", 0))))
-        attrs["glideTime"] = f"{raw / 127.0 * GLIDE_TIME_MAX_S:.4f}"
+        table = (cal or {}).get("portamento_time_s")
+        if table:
+            secs = interp_table(table, raw)
+        else:
+            secs = raw / 127.0 * GLIDE_TIME_FALLBACK_MAX_S
+        attrs["glideTime"] = f"{secs:.4f}"
         # The JV's solo-legato plays the glide only when the previous note is
         # still held, which is exactly DecentSampler's "legato" mode.
         attrs["glideMode"] = "legato" if voice.get("solo_legato") else "always"
@@ -1075,7 +1095,7 @@ def build_dspreset(meta, cal, sample_prefix):
     # 0, but malformed.
     # Voice mode: monophony and glide, from the patch's own key-assign and
     # portamento bytes.
-    vattrs, needs_mono_tag = voice_attrs(meta)
+    vattrs, needs_mono_tag = voice_attrs(meta, cal)
     for k, v in vattrs.items():
         group_el.set(k, v)
     if needs_mono_tag:

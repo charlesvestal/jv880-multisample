@@ -140,6 +140,47 @@ void Renderer::load_patch_bytes(const std::vector<uint8_t> &bytes, const GridSpe
     }
 }
 
+std::vector<int16_t> Renderer::render_glide(int key_from, int key_to, int velocity,
+                                            double first_hold_s, double total_s) {
+    assert(mcu_ != nullptr && "Renderer::render_glide called before a successful init()");
+    MCU *m = (MCU *)mcu_;
+
+    int first_samples = (int)(first_hold_s * SAMPLE_RATE);
+    int total_samples = (int)(total_s * SAMPLE_RATE);
+    if (total_samples < first_samples) total_samples = first_samples;
+
+    std::vector<int16_t> out;
+    out.reserve((size_t)total_samples * 2);
+
+    uint8_t on_from[3] = {0x90, (uint8_t)key_from, (uint8_t)velocity};
+    m->postMidiSC55(on_from, 3);
+    for (int pos = 0; pos < first_samples; pos += CHUNK) {
+        int n = std::min(CHUNK, first_samples - pos);
+        run_frames(m, n);
+        drain(m, out, n);
+    }
+
+    // Second note ON while the first is still held -- this is the transition
+    // the glide happens across.
+    uint8_t on_to[3] = {0x90, (uint8_t)key_to, (uint8_t)velocity};
+    m->postMidiSC55(on_to, 3);
+    int rest = total_samples - first_samples;
+    for (int pos = 0; pos < rest; pos += CHUNK) {
+        int n = std::min(CHUNK, rest - pos);
+        run_frames(m, n);
+        drain(m, out, n);
+    }
+
+    uint8_t off_to[3]   = {0x80, (uint8_t)key_to, 0};
+    uint8_t off_from[3] = {0x80, (uint8_t)key_from, 0};
+    m->postMidiSC55(off_to, 3);
+    m->postMidiSC55(off_from, 3);
+    uint8_t all_off[3] = {0xB0, 0x7B, 0x00};
+    m->postMidiSC55(all_off, 3);
+    return out;
+}
+
+
 std::vector<int16_t> Renderer::render_note(int key, int velocity, const GridSpec &g) {
     assert(mcu_ != nullptr && "Renderer::render_note called before a successful init()");
     MCU *m = (MCU *)mcu_;

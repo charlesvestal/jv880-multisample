@@ -1140,8 +1140,23 @@ def test_glide_only_when_portamento_is_actually_on():
 
     on = parse(_meta_voice(portamento=True, portamento_time=127), _cal_with_ir())
     g = find1(on, ".//group")
-    assert float(g.get("glideTime")) == pytest.approx(ep.GLIDE_TIME_MAX_S, rel=0.01)
+    # No measured table in the synthetic fixture, so the fallback applies.
+    assert float(g.get("glideTime")) == pytest.approx(ep.GLIDE_TIME_FALLBACK_MAX_S, rel=0.01)
     assert g.get("glideMode") == "always"
+
+
+@pytest.mark.skipif(REAL_CAL is None or "portamento_time_s" not in (REAL_CAL or {}),
+                    reason="no measured portamento table")
+def test_measured_portamento_table_beats_the_fallback():
+    """The measured curve is steeply exponential and reaches ~13.7 s, roughly
+    9x the 1.5 s that was previously assumed. A preset must use it."""
+    cal = dict(_cal_with_ir())
+    cal["portamento_time_s"] = REAL_CAL["portamento_time_s"]
+    g = find1(parse(_meta_voice(portamento=True, portamento_time=127), cal), ".//group")
+    assert float(g.get("glideTime")) > 10.0
+    fast = find1(parse(_meta_voice(portamento=True, portamento_time=32), cal), ".//group")
+    assert float(fast.get("glideTime")) < 0.1
+    assert float(g.get("glideTime")) > float(fast.get("glideTime"))
 
 
 def test_solo_legato_maps_to_legato_glide_mode():

@@ -75,6 +75,16 @@ public:
     // Requires a prior successful init().
     std::vector<int16_t> render_note(int key, int velocity, const GridSpec &g);
 
+    // Two overlapping notes, for measuring portamento. The JV only glides
+    // BETWEEN notes, so a single-note render cannot show it at all: the
+    // second note-on has to arrive while the first is still held, which is
+    // also what triggers glide in Solo mode and in Legato portamento mode.
+    // Both notes are released at the end. Renders a fixed length (no
+    // silence-truncation) so the glide is never clipped by the tail
+    // heuristic.
+    std::vector<int16_t> render_glide(int key_from, int key_to, int velocity,
+                                      double first_hold_s, double total_s);
+
 private:
     void *mcu_ = nullptr;   // opaque MCU*
     // Trimmed 12-char ROM name of the currently-loaded patch (cheap to pull
