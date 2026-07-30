@@ -29,6 +29,11 @@ struct Effects {
     int reverb_send[TONE_COUNT] = {0, 0, 0, 0};
     int chorus_send[TONE_COUNT] = {0, 0, 0, 0};
     int tone_level[TONE_COUNT]  = {0, 0, 0, 0};
+    // Per-tone pitch key-follow (tone byte 59, bits 4-7). A tone at 0%
+    // ignores the key entirely -- which is how a patch can hold an unpitched
+    // rhythmic loop that never transposes while its other tones play
+    // normally.
+    int pitch_keyfollow[TONE_COUNT] = {0, 0, 0, 0};
 };
 
 struct ToneLfo {

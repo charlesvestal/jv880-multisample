@@ -17,8 +17,24 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   set(JV_WARN_FLAGS -Wall -Wextra)
 endif()
 
-set(JV_DSP "/Volumes/ExtFS/charlesvestal/github/schwung-parent/schwung-jv880/src/dsp"
-    CACHE PATH "Path to schwung-jv880 emulator sources")
+# The cycle-accurate JV-880 emulator core (mcu/pcm) comes from schwung-jv880
+# and is NOT vendored here: it is third-party code with its own history, and
+# this project deliberately ships no Roland-derived material of any kind.
+# Point JV_DSP at a checkout of it:
+#
+#   cmake -S . -B build -DJV_DSP=/path/to/schwung-jv880/src/dsp
+#
+# or set JV880_DSP in the environment.
+if(NOT JV_DSP AND DEFINED ENV{JV880_DSP})
+  set(JV_DSP "$ENV{JV880_DSP}")
+endif()
+set(JV_DSP "${JV_DSP}" CACHE PATH "Path to schwung-jv880 emulator sources (src/dsp)")
+if(NOT JV_DSP OR NOT EXISTS "${JV_DSP}/mcu.cpp")
+  message(FATAL_ERROR
+    "JV_DSP must point at schwung-jv880's src/dsp directory (containing "
+    "mcu.cpp, mcu_opcodes.cpp, pcm.cpp).\n"
+    "  cmake -S . -B build -DJV_DSP=/path/to/schwung-jv880/src/dsp")
+endif()
 
 add_library(jv_core STATIC src/jv_rom.cpp)
 target_include_directories(jv_core PUBLIC src)

@@ -9,3 +9,13 @@ out/
 # + tools/analyze_calibration.py) -- but calib/calibration.json itself is
 # small (~2 KB) and IS committed, via an explicit `git add -f`.
 calib/
+
+# Nothing Roland-derived is committed. The impulse responses are recordings of
+# the JV's own reverb algorithm, captured from the user's ROMs by
+# tools/ir_capture.py -- they are generated per machine, not shipped.
+calib/ir/
+calib/ir_synth/
+calib/ir_synth_raw/
+calib/ds_probe/
+calib/ds_state.bin
+docs/superpowers/

@@ -65,6 +65,7 @@ Effects read_effects(const uint8_t *p) {
         e.tone_level[t]  = tp[67];
         e.reverb_send[t] = tp[82];
         e.chorus_send[t] = tp[83];
+        e.pitch_keyfollow[t] = (tp[59] >> 4) & 0x0F;
     }
     return e;
 }

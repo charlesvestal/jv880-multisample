@@ -30,8 +30,8 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROMS = Path("/Users/charlesvestal/Documents/_Songs/Move ROMs/Roland JV880")
-OUT_ROOT = Path("/Volumes/ExtFS/charlesvestal/JV-880 Multisamples")
+ROMS = Path(os.environ.get("JV880_ROMS", ""))
+OUT_ROOT = Path(os.environ.get("JV880_OUT", ""))
 SAMPLER = Path("build/jv_sampler")
 
 # Conservative raw-WAV footprint per patch before post-processing: 75 zones
@@ -349,10 +349,10 @@ def main() -> int:
         return 1
 
     out_root: Path = args.out
-    if not str(out_root.resolve()).startswith("/Volumes/ExtFS"):
-        print(f"warning: output root {out_root} is not under /Volumes/ExtFS -- "
-              f"make sure this is intentional and has enough free space.",
-              file=sys.stderr)
+    free_gb = shutil.disk_usage(out_root.parent if out_root.exists() else Path.cwd()).free / 2**30
+    if free_gb < 200:
+        print(f"warning: only {free_gb:.0f} GB free at {out_root}. A full "
+              f"21-board render needs roughly 250-315 GB.", file=sys.stderr)
 
     try:
         boards = list_boards()
