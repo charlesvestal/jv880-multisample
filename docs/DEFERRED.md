@@ -72,3 +72,42 @@ present in the 4,197-patch count at all.
 If picked up later it is genuinely new scope: new ROM parsing, plus a
 different sampling strategy (one sample per key, no pitch-tiling, no
 key-follow, no loop detection).
+
+## 4. Loop points ignore baked-in amplitude modulation
+
+Reported on listening: "tremolo is really broken up" on the bank B strings,
+worst on TremoloStrng.
+
+Most JV patches carry an LFO in the SAMPLES -- it is only stripped when
+decide_lfo_strip judges it strippable, so a great deal of periodic amplitude
+modulation survives into the audio. find_loop scores candidates purely on
+crossfade-region correlation and knows nothing about that modulation, so a
+loop can land mid-tremolo and the modulation jumps phase on every pass.
+
+Measured over one looped zone in each of 93 internal patches:
+
+    strong periodic AM present          87  (94%)
+    loop NOT a whole multiple of it     53  (61% of those)
+
+    TremoloStrng   4.86 periods   <- worst, and the one reported
+    Warm Strings  35.53 periods
+    Slow Strings  22.04 periods   <- aligned, and sounds fine
+
+Two caveats before acting on those numbers:
+
+  - The worst offenders cluster at almost exactly 0.50 periods off, which is
+    too systematic to be chance. The detector is probably locking onto the
+    SECOND HARMONIC of the modulation (an amplitude envelope peaks twice per
+    LFO cycle), so the true misalignment may differ. Verify the period
+    detection before trusting the 61%.
+  - Misalignment is not automatically audible. The crossfade runs up to 0.5 s
+    and smears roughly nine cycles at 18 Hz, which can mask it. The reported
+    case has the shortest loop (0.26 s) and therefore the least smearing.
+
+Fix: constrain loop length to a whole multiple of any detected AM period,
+alongside the existing crossfade-correlation score. This is the same
+machinery item 2 needs for bar-aligned phrase loops -- do them together.
+
+Cost is low: `postprocess --reloop` recomputes loop points from the encoded
+FLACs with no re-render, the same route used to apply the release fix.
+
