@@ -79,6 +79,14 @@ Known gaps are listed in `docs/DEFERRED.md`.
 
 ## Licence
 
-The tooling is yours to use. The ROMs are not distributed here and are not
-mine to license; the sounds they contain are Roland's, and Roland currently
-sells them as software instruments.
+This tooling is MIT licensed — see [LICENSE](LICENSE).
+
+Two things it does not cover:
+
+- **The emulator core** in `external/schwung-jv880` is a submodule under the
+  MAME licence, inherited from Nuked-SC55 and juce-jv880. Its terms apply to
+  that code, not this one.
+- **The ROMs and the sounds in them are Roland's.** None are distributed here
+  and none are mine to license. Roland currently sells these sounds as
+  software instruments. Supply your own ROMs; what you render from them is
+  between you and Roland.
