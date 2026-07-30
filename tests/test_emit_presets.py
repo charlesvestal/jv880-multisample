@@ -1095,3 +1095,14 @@ def test_makeup_gain_no_longer_compensates_the_reverb():
     chorus = find1(root, "./effects/effect[@type='chorus']")
     expected = ep.blend_makeup_gain([("chorus", chorus.attrib)])
     assert vol == pytest.approx(expected, abs=1e-3)
+
+
+def test_no_dangling_bus_route_when_there_is_no_bus():
+    """A Delay/Pan-Dly patch has no convolution and therefore no bus. Routing
+    it to BUS_1 anyway points a send at a bus that was never declared -- 683
+    presets shipped that way before the validator caught it."""
+    root = parse(make_meta(reverb_type="Pan-Dly"), _cal_with_ir())
+    group = find1(root, ".//group")
+    assert root.find("./buses/bus") is None
+    assert group.get("output2Target") is None, "send routed at a nonexistent bus"
+    assert group.get("output2Volume") is None

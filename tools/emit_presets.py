@@ -1022,14 +1022,22 @@ def build_dspreset(meta, cal, sample_prefix):
         # SEND bus, which does not touch the dry path at all. See
         # blend_makeup_gain and build_dspreset's bus block.
         "volume": f"{blend_makeup_gain(_insert_effects(meta, cal)):.4f}",
-        # A true send, matching the JV: the dry goes to the main output at
-        # full level and a COPY goes to the reverb bus. DecentSampler
-        # duplicates rather than steals the signal, so unlike `mix` this
-        # cannot thin out the direct sound.
-        "output1Target": "MAIN_OUTPUT",
-        "output2Target": "BUS_1",
-        "output2Volume": f"{_reverb_send_level(meta, cal)[0]:.4f}",
     })
+
+    # A true send, matching the JV: the dry goes to the main output at full
+    # level and a COPY goes to the reverb bus. DecentSampler duplicates rather
+    # than steals the signal, so unlike `mix` this cannot thin out the direct
+    # sound.
+    #
+    # Only routed when a bus actually exists. Delay/Pan-Dly patches have no
+    # convolution and so no bus, and an earlier version still stamped
+    # output2Target="BUS_1" on them -- 683 presets pointing a send at a bus
+    # that was never declared. Harmless in practice, since the send level was
+    # 0, but malformed.
+    if _bus_effects(meta, cal):
+        group_el.set("output1Target", "MAIN_OUTPUT")
+        group_el.set("output2Target", "BUS_1")
+        group_el.set("output2Volume", f"{_reverb_send_level(meta, cal)[0]:.4f}")
 
     by_key = _group_zones_by_key(zones)
     for key, lo, hi in key_ranges(by_key.keys()):

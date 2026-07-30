@@ -22,7 +22,16 @@ import soundfile as sf
 # rather than a hardcoded count.
 EXPECTED_KEYS = 25
 MIN_LAYERS, MAX_LAYERS = 3, 5
-MIN_LOOP_FRACTION = 0.25
+# Fraction of SUSTAINING zones that must carry a loop. Not a fraction of all
+# zones: whether a zone loops is decided by whether it sustains, and that is
+# pure content. Measured across the finished 21-board library the two track
+# each other at correlation 1.000 -- the Piano board is 1.7% sustaining
+# (piano notes decay, and correctly do not loop) while Vocal is 49.5%. A
+# threshold on ALL zones therefore just measures how percussive a board is:
+# the full library sits at 22.1% and would fail a 25% bar while being
+# entirely correct. The real defect is a zone that sustains and does NOT
+# loop, which is what the user heard as a whistle or choir cutting off.
+MIN_SUSTAINING_LOOP_FRACTION = 0.90
 # Minimum normalized cross-correlation between the two windows DecentSampler
 # blends at the loop seam. Replaces a raw endpoint-sample threshold, which a
 # listening test showed does not predict audibility at all (40.9% raw sounded
@@ -58,8 +67,8 @@ def iattr(el: ET.Element, name: str, where: str) -> int | None:
 
 
 def check_audio(pdir: Path, meta: dict) -> tuple[int, int, int]:
-    """Return (looped, total, skipped) zone counts for one patch."""
-    looped = total = skipped = 0
+    """Return (looped, total, skipped, sustaining) zone counts for one patch."""
+    looped = total = skipped = sustaining = 0
     for z in meta.get("zones", []):
         # Zones that never rendered or failed post-processing are excluded from
         # the presets by design; don't hold their missing audio against us.
@@ -67,6 +76,8 @@ def check_audio(pdir: Path, meta: dict) -> tuple[int, int, int]:
             skipped += 1
             continue
         total += 1
+        if z.get("kind") == "sustaining":
+            sustaining += 1
         f = pdir / z["file"]
         if not f.exists():
             errors.append(f"{pdir.name}/{z['file']}: missing")
@@ -119,7 +130,7 @@ def check_audio(pdir: Path, meta: dict) -> tuple[int, int, int]:
             errors.append(
                 f"{f.name}: crossfade region correlates {worst:.2f} "
                 f"(min {MIN_CROSSFADE_CORRELATION})")
-    return looped, total, skipped
+    return looped, total, skipped, sustaining
 
 
 def check_presets(lib: Path) -> tuple[bool, bool]:
@@ -138,8 +149,24 @@ def check_presets(lib: Path) -> tuple[bool, bool]:
             continue
 
         types = {e.get("type") for e in root.findall(".//effect")}
-        saw_reverb |= "reverb" in types
+        # Reverb lives on the BUS now, not the instrument chain, and is a
+        # convolution rather than DecentSampler's parametric `reverb`. This
+        # check looked only for type="reverb" among instrument effects, so
+        # after the bus change it reported "no preset emitted a reverb
+        # effect" on a library where every one of them had it -- a validator
+        # that cannot see the reverb also cannot notice it going missing,
+        # which is exactly how the silent-IR bug survived once already.
+        saw_reverb |= bool(root.findall(
+            "./buses/bus/effects/effect[@type='convolution']")) or "reverb" in types
         saw_delay |= "delay" in types
+
+        # A group routed to a bus must actually have a bus to arrive at, or
+        # the send goes nowhere and the reverb is silently absent.
+        group = root.find(".//group")
+        if group is not None and group.get("output2Target"):
+            target = group.get("output2Target")
+            if target.startswith("BUS_") and root.find("./buses/bus") is None:
+                errors.append(f"{f.name}: routes to {target} but declares no <buses>")
 
         samples = root.findall(".//sample")
         if not samples:
@@ -185,7 +212,7 @@ def main() -> None:
     if not libs:
         sys.exit(f"no libraries found under {root}")
 
-    looped = total = skipped = patches = 0
+    looped = total = skipped = sustaining = patches = 0
     any_reverb = any_delay = False
 
     for lib in libs:
@@ -208,23 +235,28 @@ def main() -> None:
                 errors.append(
                     f"{pdir.name}: {n // EXPECTED_KEYS} velocity layers, "
                     f"expected {MIN_LAYERS}-{MAX_LAYERS}")
-            l, t, s = check_audio(pdir, meta)
+            l, t, s, sus = check_audio(pdir, meta)
             looped += l
             total += t
             skipped += s
+            sustaining += sus
 
         r, d = check_presets(lib)
         any_reverb |= r
         any_delay |= d
 
     frac = looped / total if total else 0.0
+    sus_frac = looped / sustaining if sustaining else 1.0
     print(f"\npatches: {patches}")
     print(f"zones:   {total} playable, {skipped} skipped (missing/error)")
-    print(f"looped:  {looped} ({frac:.1%})")
+    print(f"looped:  {looped} ({frac:.1%} of all zones, "
+          f"{sus_frac:.1%} of the {sustaining} sustaining ones)")
 
-    if total and frac < MIN_LOOP_FRACTION:
+    if sustaining and sus_frac < MIN_SUSTAINING_LOOP_FRACTION:
         errors.append(
-            f"only {frac:.1%} of zones looped, expected >= {MIN_LOOP_FRACTION:.0%}")
+            f"only {sus_frac:.1%} of SUSTAINING zones looped, expected >= "
+            f"{MIN_SUSTAINING_LOOP_FRACTION:.0%} -- a sustaining zone without a "
+            f"loop cuts off abruptly when held")
     if not any_reverb:
         warnings.append("no preset emitted a reverb effect")
     if not any_delay:
