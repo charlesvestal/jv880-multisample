@@ -23,3 +23,6 @@ calib/ir/
 calib/ds_probe/
 calib/ds_state.bin
 docs/superpowers/
+
+__pycache__/
+*.pyc

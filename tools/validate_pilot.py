@@ -5,7 +5,7 @@ Checks structure, audio format, loop quality, and preset validity across every
 library under the given root. Exits non-zero if any check fails, so this can
 gate the full render.
 
-Usage:  python3 tools/validate_pilot.py "/Volumes/ExtFS/charlesvestal/JV-880 Multisamples"
+Usage:  python3 tools/validate_pilot.py <library root>
 """
 import json
 import sys

@@ -21,7 +21,7 @@ via the standard header fields. This script:
   5. Prints a CONCLUSION line per board.
 
 Usage: python3 tools/probe_expansion.py [roms_dir]
-  roms_dir defaults to "/Users/charlesvestal/Documents/_Songs/Move ROMs/Roland JV880"
+  roms_dir defaults to $JV880_ROMS
   (same default + override convention as tests/test_jv_rom.cpp), and expansion
   files are read from <roms_dir>/expansions/.
 """
@@ -44,7 +44,7 @@ PATCH_SIZE = 0x16A  # 362 bytes; jv::PATCH_SIZE in src/jv_rom.h
 AA = [2, 0, 3, 4, 1, 9, 13, 10, 18, 17, 6, 15, 11, 16, 8, 5, 12, 7, 14, 19]
 DD = [2, 0, 4, 5, 7, 6, 3, 1]
 
-DEFAULT_ROMS_DIR = "/Users/charlesvestal/Documents/_Songs/Move ROMs/Roland JV880"
+DEFAULT_ROMS_DIR = os.environ.get("JV880_ROMS", "")
 
 BOARDS = [
     (97, "SR-JV80-97"),

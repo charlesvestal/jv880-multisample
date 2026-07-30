@@ -39,7 +39,7 @@ static void set_tone_vel_range(uint8_t *patch, int tone, int lo, int hi, int lev
 int main(int argc, char **argv) {
     const std::string roms_dir = (argc > 1)
         ? argv[1]
-        : "/Users/charlesvestal/Documents/_Songs/Move ROMs/Roland JV880";
+        : "";   // no default: set JV880_ROMS (see README)
     std::string err;
     jv::RomSet roms;
     if (!roms.load(roms_dir, &err)) {

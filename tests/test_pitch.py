@@ -41,12 +41,16 @@ import soundfile as sf
 REPO_ROOT = Path(__file__).resolve().parents[1]
 JV_SAMPLER = REPO_ROOT / "build" / "jv_sampler"
 
-# Matches tests/test_jv_rom.cpp / tests/test_jv_patch.cpp's default so all
-# three test suites point at the same ROM set with no extra configuration;
-# JV880_ROMS overrides it for environments where that personal path doesn't
-# exist.
-DEFAULT_ROMS = "/Users/charlesvestal/Documents/_Songs/Move ROMs/Roland JV880"
-ROMS_DIR = Path(os.environ.get("JV880_ROMS", DEFAULT_ROMS))
+# ROMs are supplied by the user and are not in this repository, so every
+# test that needs them SKIPS when JV880_ROMS is unset or does not exist --
+# a contributor without ROMs should get a clean run, not a wall of errors.
+# Test the RAW env var, not the Path: Path("") resolves to "." which exists
+# and is a directory, so an unset JV880_ROMS silently looks valid.
+_ROMS_ENV = os.environ.get("JV880_ROMS", "")
+ROMS_DIR = Path(_ROMS_ENV) if _ROMS_ENV else None
+requires_roms = pytest.mark.skipif(
+    not (_ROMS_ENV and Path(_ROMS_ENV).is_dir()),
+    reason="set JV880_ROMS to a directory of JV-880 ROM images to run this")
 
 # "Square Lead" (internal patch 117): a clean, single-oscillator-ish tone
 # whose fundamental is unambiguously the strongest spectral component
@@ -106,8 +110,11 @@ def _dominant_frequency(path: Path, sr_expected: int = 64000) -> float:
 
 @pytest.fixture(scope="module")
 def rendered_patch_dir(tmp_path_factory):
-    if not ROMS_DIR.exists():
-        pytest.skip(f"ROMs not found at {ROMS_DIR} (set JV880_ROMS to override)")
+    # Guard the EMPTY case explicitly: Path("") resolves to "." which exists,
+    # so an unset JV880_ROMS would sail past a plain .exists() check and fail
+    # in the renderer instead of skipping.
+    if ROMS_DIR is None or not ROMS_DIR.is_dir():
+        pytest.skip("set JV880_ROMS to a directory of JV-880 ROM images")
     if not JV_SAMPLER.exists():
         pytest.skip(f"{JV_SAMPLER} not built -- run: cmake --build build --target jv_sampler")
 
@@ -125,6 +132,7 @@ def rendered_patch_dir(tmp_path_factory):
     return pdir
 
 
+@requires_roms
 @pytest.mark.parametrize("midi", TEST_NOTES)
 def test_fundamental_matches_equal_temperament(rendered_patch_dir, midi):
     fn = rendered_patch_dir / f"{_note_name(midi)}_v2.wav"

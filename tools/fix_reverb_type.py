@@ -13,6 +13,7 @@ each patch's ROM bytes and rewrite just the reverb type in place.
 Usage:  python3 tools/fix_reverb_type.py "<library root>" [<roms dir>]
 """
 import json
+import os
 import sys
 from glob import glob
 from pathlib import Path
@@ -72,7 +73,7 @@ def build_patch_index(roms: Path) -> dict:
 def main() -> None:
     root = Path(sys.argv[1])
     roms = Path(sys.argv[2] if len(sys.argv) > 2
-                else "/Users/charlesvestal/Documents/_Songs/Move ROMs/Roland JV880")
+                else os.environ.get("JV880_ROMS", ""))
 
     index = build_patch_index(roms)
     fixed = unchanged = missing = 0
