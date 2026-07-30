@@ -12,24 +12,39 @@ python3 tools/build_library.py --roms /path/to/roms --out /path/to/output
 The full run is 4,197 patches across 21 boards, about 5 hours of rendering
 and ~150 GB. `--board "SR-JV80-04 Vintage Synth"` does one board.
 
-## No Roland material is in this repository
+The effect calibration ships with the repo, so the default run goes straight
+to rendering. Pass `--stop-after calibrate` to re-measure it from your own
+ROMs instead.
 
-No samples, no patch data, no impulse responses. Everything is generated on
-your machine from ROMs you supply. The impulse responses in particular are
-recordings of the JV's own reverb, captured by `tools/ir_capture.py` during
-the calibrate stage — which is why they are gitignored rather than committed.
+## What is and is not in this repository
+
+**Not here:** any Roland PCM. No samples, no patch data. Those come from your
+own ROMs, on your own machine.
+
+**Here:** the measured effect calibration, including the reverb impulse
+responses. These are the JV reverb's response to a synthetic impulse that this
+project generates and injects into a copy of the wave ROM — no Roland waveform
+is present in the signal, the same way an IR pack of a hardware reverb
+contains none of the recordings ever played through it. Shipping them means
+you get working presets without running the calibrate stage at all.
 
 ## Requirements
 
 - **JV-880 ROM images**: `jv880_rom1.bin`, `jv880_rom2.bin`,
   `jv880_waverom1.bin`, `jv880_waverom2.bin`, `jv880_nvram.bin`, and optionally
   SR-JV80 expansion ROMs in an `expansions/` subdirectory.
-- **The emulator core** from [schwung-jv880](https://github.com/) — pass its
-  `src/dsp` directory as `JV_DSP`:
-  ```bash
-  cmake -S . -B build -DJV_DSP=/path/to/schwung-jv880/src/dsp
-  ```
 - cmake, a C++17 compiler, Python 3 with `numpy scipy soundfile`.
+
+The emulator core ([schwung-jv880](https://github.com/charlesvestal/schwung-jv880),
+MAME licence, inherited from Nuked-SC55 and juce-jv880) is a submodule:
+
+```bash
+git clone --recursive https://github.com/charlesvestal/jv880-multisample.git
+# or, in an existing clone:
+git submodule update --init
+```
+
+Already have a checkout? `cmake -S . -B build -DJV_DSP=/path/to/src/dsp`.
 
 ## What it does
 

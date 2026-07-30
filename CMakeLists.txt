@@ -17,23 +17,26 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   set(JV_WARN_FLAGS -Wall -Wextra)
 endif()
 
-# The cycle-accurate JV-880 emulator core (mcu/pcm) comes from schwung-jv880
-# and is NOT vendored here: it is third-party code with its own history, and
-# this project deliberately ships no Roland-derived material of any kind.
-# Point JV_DSP at a checkout of it:
+# The cycle-accurate JV-880 emulator core (mcu/pcm), from schwung-jv880. It is
+# a SUBMODULE rather than vendored: it is third-party in origin (MAME licence,
+# inherited from Nuked-SC55 and juce-jv880) and has its own history worth
+# keeping separate. `git clone --recursive` gets it, and so does
+# `git submodule update --init`.
 #
+# Override only if you already have a checkout elsewhere:
 #   cmake -S . -B build -DJV_DSP=/path/to/schwung-jv880/src/dsp
-#
-# or set JV880_DSP in the environment.
 if(NOT JV_DSP AND DEFINED ENV{JV880_DSP})
   set(JV_DSP "$ENV{JV880_DSP}")
 endif()
+if(NOT JV_DSP)
+  set(JV_DSP "${CMAKE_CURRENT_SOURCE_DIR}/external/schwung-jv880/src/dsp")
+endif()
 set(JV_DSP "${JV_DSP}" CACHE PATH "Path to schwung-jv880 emulator sources (src/dsp)")
-if(NOT JV_DSP OR NOT EXISTS "${JV_DSP}/mcu.cpp")
+if(NOT EXISTS "${JV_DSP}/mcu.cpp")
   message(FATAL_ERROR
-    "JV_DSP must point at schwung-jv880's src/dsp directory (containing "
-    "mcu.cpp, mcu_opcodes.cpp, pcm.cpp).\n"
-    "  cmake -S . -B build -DJV_DSP=/path/to/schwung-jv880/src/dsp")
+    "Emulator sources not found at ${JV_DSP}.\n"
+    "Fetch the submodule:  git submodule update --init\n"
+    "Or point at your own checkout:  -DJV_DSP=/path/to/schwung-jv880/src/dsp")
 endif()
 
 add_library(jv_core STATIC src/jv_rom.cpp)

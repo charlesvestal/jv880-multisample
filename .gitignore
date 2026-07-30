@@ -10,12 +10,16 @@ out/
 # small (~2 KB) and IS committed, via an explicit `git add -f`.
 calib/
 
-# Nothing Roland-derived is committed. The impulse responses are recordings of
-# the JV's own reverb algorithm, captured from the user's ROMs by
-# tools/ir_capture.py -- they are generated per machine, not shipped.
+# No Roland PCM ships here -- no samples, no patch data.
+#
+# The impulse responses DO ship. They are the JV reverb's response to a
+# synthetic impulse WE generate and inject into a copy of the wave ROM, so no
+# Roland waveform is present in the signal: the same thing as an IR pack of a
+# hardware reverb. Shipping them means a user gets working presets without
+# running the calibrate stage at all.
+#
+# calib/ir/ is the superseded deconvolution bank, kept out as dead weight.
 calib/ir/
-calib/ir_synth/
-calib/ir_synth_raw/
 calib/ds_probe/
 calib/ds_state.bin
 docs/superpowers/

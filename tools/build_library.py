@@ -18,15 +18,16 @@ so an interrupted build resumes rather than restarting:
     6. validate      check every zone, key range and effect reference
     7. package       zip each board into a .dslibrary
 
-NOTHING ROLAND-DERIVED SHIPS IN THIS REPOSITORY. No samples, no impulse
-responses, no patch data. Stage 1 generates the impulse responses from YOUR
-ROMs on YOUR machine, which is also why they are gitignored rather than
-committed -- they are recordings of the JV's own reverb algorithm.
+No Roland PCM ships in this repository -- no samples, no patch data. The
+effect calibration DOES ship, impulse responses included: those are the JV
+reverb's response to a synthetic impulse this project injects into a copy of
+the wave ROM, so no Roland waveform is in the signal. Stage 1 is therefore
+skipped by default; pass --stop-after calibrate to re-measure from your ROMs.
 
 You need:
   * JV-880 ROM images (rom1, rom2, waverom1, waverom2, nvram) and, optionally,
     SR-JV80 expansion ROMs in an `expansions/` subdirectory
-  * the schwung-jv880 emulator sources, passed to cmake as JV_DSP
+  * the schwung-jv880 emulator sources (a submodule: git submodule update --init)
   * cmake, a C++17 compiler, Python 3 with numpy/scipy/soundfile
 """
 import argparse
@@ -57,8 +58,9 @@ def main():
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--board", default="all", help="restrict to one board (see --list-boards)")
     ap.add_argument("--list-boards", action="store_true")
-    ap.add_argument("--skip-calibration", action="store_true",
-                    help="reuse an existing calib/calibration.json and IR bank")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="re-measure the effects from your ROMs instead of using "
+                         "the calibration that ships with the repo")
     ap.add_argument("--stop-after", choices=["calibrate", "render", "phrases",
                                              "postprocess", "emit", "validate"],
                     help="stop once this stage completes")
@@ -80,7 +82,7 @@ def main():
                              "--roms", str(roms)])
         return
 
-    if not args.skip_calibration:
+    if args.calibrate:
         run(py + [str(REPO / "tools" / "ir_capture.py"), "--roms", str(roms)],
             "1/7 calibrate effects (impulse responses, chorus, delay)")
     if args.stop_after == "calibrate":

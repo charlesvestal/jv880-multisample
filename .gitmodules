@@ -1,0 +1,3 @@
+[submodule "external/schwung-jv880"]
+	path = external/schwung-jv880
+	url = https://github.com/charlesvestal/schwung-jv880.git
