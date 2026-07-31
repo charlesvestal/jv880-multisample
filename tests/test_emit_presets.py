@@ -1268,3 +1268,78 @@ def test_rhythm_preset_keeps_per_zone_release():
     root = ET.fromstring(ep.build_dspreset(meta, cal, "000_Kit"))
     releases = {s.get("release") for s in root.findall(".//sample")}
     assert len(releases) == 3
+
+
+# ---------------------------------------------------------------------------
+# Silent zones
+#
+# A zone that rendered to digital silence is a valid file with valid metadata,
+# so nothing upstream rejects it -- but mapping it means a key that answers a
+# keystroke with nothing. 418 of the 12,688 drum zones are silent this way.
+# ---------------------------------------------------------------------------
+
+def test_fill_velocity_gaps_covers_the_whole_range():
+    # Softest layer dropped: the survivor must reach down to 1.
+    assert ep.fill_velocity_gaps([(33, 64), (65, 96), (97, 127)]) == \
+        [(1, 64), (65, 96), (97, 127)]
+
+
+def test_fill_velocity_gaps_closes_an_interior_hole():
+    # Middle layer dropped: the lower survivor takes the vacated band.
+    assert ep.fill_velocity_gaps([(1, 32), (97, 127)]) == [(1, 96), (97, 127)]
+
+
+def test_fill_velocity_gaps_preserves_real_switch_points():
+    """It must only close holes, never move a boundary between survivors."""
+    assert ep.fill_velocity_gaps([(1, 42), (43, 100), (101, 127)]) == \
+        [(1, 42), (43, 100), (101, 127)]
+
+
+def test_fill_velocity_gaps_handles_a_single_survivor():
+    assert ep.fill_velocity_gaps([(65, 96)]) == [(1, 127)]
+    assert ep.fill_velocity_gaps([]) == []
+
+
+def test_silent_zones_are_not_mapped_and_leave_no_velocity_hole():
+    meta = _rhythm_meta(keys=(36,), layers=4)
+    # Match how postprocess records a silent render.
+    meta["zones"][0]["kind"] = "silent"
+    cal = json.loads(CALIB_PATH.read_text())
+    root = ET.fromstring(ep.build_dspreset(meta, cal, "000_Kit"))
+    samples = root.findall(".//sample")
+    assert len(samples) == 3, "the silent zone should not be mapped"
+    covered = sorted((int(s.get("loVel")), int(s.get("hiVel"))) for s in samples)
+    assert covered[0][0] == 1, "softest surviving layer must reach velocity 1"
+    assert covered[-1][1] == 127
+    # No gaps and no overlaps anywhere in 1..127.
+    for (a_lo, a_hi), (b_lo, b_hi) in zip(covered, covered[1:]):
+        assert b_lo == a_hi + 1, f"velocity hole/overlap between {a_hi} and {b_lo}"
+
+
+def test_a_key_whose_layers_are_all_silent_is_dropped_entirely():
+    meta = _rhythm_meta(keys=(36, 38), layers=2)
+    for z in meta["zones"]:
+        if z["key"] == 36:
+            z["kind"] = "silent"
+    cal = json.loads(CALIB_PATH.read_text())
+    root = ET.fromstring(ep.build_dspreset(meta, cal, "000_Kit"))
+    keys = {int(s.get("rootNote")) for s in root.findall(".//sample")}
+    assert keys == {38}
+
+
+def test_a_PATCH_keeps_its_silent_zones():
+    """The asymmetry that protects the patch library.
+
+    A kit maps one sample per key, so dropping a silent key removes it. A
+    patch tiles spans BETWEEN sampled keys, so dropping silent ones makes the
+    survivors stretch across the gap -- which would take a percussion patch
+    that correctly sounds on three keys (SR-JV80-10 CR-78 Hi-Hat: 72 of 75
+    zones silent) and smear it, transposed, across the whole keyboard.
+    """
+    meta = _rhythm_meta(keys=(36, 48, 60), layers=1)
+    del meta["kind"]                              # emit it as a patch
+    meta["zones"][1]["kind"] = "silent"           # the middle key goes quiet
+    cal = json.loads(CALIB_PATH.read_text())
+    root = ET.fromstring(ep.build_dspreset(meta, cal, "000_Patch"))
+    keys = sorted(int(s.get("rootNote")) for s in root.findall(".//sample"))
+    assert keys == [36, 48, 60], "a patch must keep its silent zones mapped"

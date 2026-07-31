@@ -58,6 +58,11 @@ from pathlib import Path
 # this constant (see module docstring). Importing would couple this file's
 # behavior to whatever postprocess.py happens to look like mid-edit.
 FAILURE_KINDS = frozenset({"missing", "error"})
+# Kinds the emitters refuse to map. "silent" is not a FAILURE -- the file
+# exists and post-processing succeeded -- but a zone of digital silence is
+# still a key that answers with nothing, so it is excluded from presets and
+# its velocity band handed to a neighbour (see _valid_zones).
+SKIP_KINDS = FAILURE_KINDS | frozenset({"silent"})
 
 REVERB_NAMES = ["Room1", "Room2", "Stage1", "Stage2",
                 "Hall1", "Hall2", "Delay", "Pan-Dly"]
@@ -346,8 +351,49 @@ def effective_send(meta, which):
 
 def _valid_zones(meta):
     """Zones safe to reference on disk -- see module docstring's CRITICAL
-    CONTRACT. Order is preserved from meta["zones"]."""
-    return [z for z in meta.get("zones", []) if z.get("kind") not in FAILURE_KINDS]
+    CONTRACT. Order is preserved from meta["zones"].
+
+    In a RHYTHM SET, zones that rendered to DIGITAL SILENCE are dropped too.
+    They are real files with valid metadata, so nothing else rejects them, but
+    mapping one means a key that answers a keystroke with nothing. 418 of the
+    12,688 drum zones are silent this way -- almost all velocity layer 1, in
+    17 of the 52 kits -- because a JV rhythm tone can sit below its own
+    velocity threshold at velocity 16. Dropping them alone would leave
+    velocity 1-32 unmapped, so fill_velocity_gaps() stretches the surviving
+    layers over it.
+
+    A PATCH keeps its silent zones, and this asymmetry is deliberate. A kit
+    maps one sample to one key, so dropping a key simply removes it. A patch
+    TILES spans between its sampled keys, so dropping the silent ones makes
+    the survivors stretch across the gap. 319 patches contain silent zones,
+    and in the worst cases nearly all of them are: SR-JV80-10's CR-78 Hi-Hat
+    has 72 of 75 zones silent because it is a percussion patch that only
+    sounds over a few keys. Dropping those would smear three samples across
+    the whole keyboard, transposed -- turning faithful silence into a wrong
+    note. Silence is the correct answer there.
+    """
+    skip = SKIP_KINDS if meta.get("kind") == "rhythm" else FAILURE_KINDS
+    return [z for z in meta.get("zones", []) if z.get("kind") not in skip]
+
+
+def fill_velocity_gaps(ranges):
+    """Stretch (lovel, hivel) pairs so they tile 1..127 with no holes.
+
+    Only closes gaps; it never moves a boundary between two surviving layers.
+    That keeps a patch's real velocity-switch points intact while making sure
+    a key always answers, however softly it is struck. Input must be sorted
+    ascending by lovel.
+    """
+    if not ranges:
+        return []
+    out = [list(r) for r in ranges]
+    out[0][0] = 1            # softest surviving layer reaches down to 1
+    out[-1][1] = 127         # loudest reaches up to 127
+    for i in range(len(out) - 1):
+        # Close any hole left by a dropped layer between these two.
+        if out[i][1] < out[i + 1][0] - 1:
+            out[i][1] = out[i + 1][0] - 1
+    return [tuple(r) for r in out]
 
 
 def _clamp01(x):
@@ -1140,7 +1186,8 @@ def build_dspreset(meta, cal, sample_prefix):
     by_key = _group_zones_by_key(zones)
     for key, lo, hi in spans_for(meta, by_key.keys()):
         layer_zones = sorted(by_key[key], key=lambda z: z["velocity"])
-        for z, (vlo, vhi) in zip(layer_zones, zone_vel_range(layer_zones)):
+        for z, (vlo, vhi) in zip(layer_zones,
+                                 fill_velocity_gaps(zone_vel_range(layer_zones))):
             attrs = {
                 "path": f"{sample_prefix}/{z['file']}",
                 "rootNote": str(key),
@@ -1271,7 +1318,8 @@ def build_sfz(meta, sample_prefix):
     by_key = _group_zones_by_key(zones)
     for key, lo, hi in spans_for(meta, by_key.keys()):
         layer_zones = sorted(by_key[key], key=lambda z: z["velocity"])
-        for z, (vlo, vhi) in zip(layer_zones, zone_vel_range(layer_zones)):
+        for z, (vlo, vhi) in zip(layer_zones,
+                                 fill_velocity_gaps(zone_vel_range(layer_zones))):
             lines.append("<region>")
             lines.append(f"sample={z['file']}")
             lines.append(f"lokey={lo} hikey={hi} pitch_keycenter={key}")
