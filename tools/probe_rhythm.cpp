@@ -249,12 +249,189 @@ int sweep(const RomSet &roms, int key) {
     return 0;
 }
 
+// Autocorrelation fundamental. A spectral centroid was tried first and is
+// NOT adequate here: it measures brightness, which a tuning change moves only
+// incidentally, so a genuine octave shift can leave it almost still. This
+// searches lag directly and reports the actual repeat period.
+double f0_hz(const std::vector<int16_t> &s) {
+    int frames = (int)s.size() / 2;
+    // Skip the attack transient: percussion is at its most inharmonic there.
+    int start = std::min(frames / 8, SR / 20), N = std::min(frames - start, SR / 4);
+    if (N < 512) return 0.0;
+    std::vector<double> x(N);
+    for (int i = 0; i < N; i++)
+        x[i] = ((double)s[(start + i) * 2] + s[(start + i) * 2 + 1]) / 2.0;
+    double mean = 0; for (double v : x) mean += v; mean /= N;
+    for (double &v : x) v -= mean;
+    double e0 = 0; for (double v : x) e0 += v * v;
+    if (e0 < 1e-6) return 0.0;
+    // 50 Hz .. 4 kHz
+    int lag_lo = SR / 4000, lag_hi = std::min(N / 2, SR / 50);
+    double best = 0; int best_lag = 0;
+    for (int lag = lag_lo; lag < lag_hi; lag++) {
+        double acc = 0, e = 0;
+        for (int i = 0; i + lag < N; i++) { acc += x[i] * x[i + lag]; e += x[i + lag] * x[i + lag]; }
+        double norm = acc / (std::sqrt(e0 * e) + 1e-9);
+        if (norm > best) { best = norm; best_lag = lag; }
+    }
+    // Below this the signal has no periodicity worth calling a pitch.
+    if (best < 0.30 || best_lag == 0) return 0.0;
+    return (double)SR / best_lag;
+}
+
+// Amplitude-weighted mean frequency. Coarse but entirely sufficient for the
+// question asked below, which is "did this jump an octave", not "what note".
+double centroid_hz(const std::vector<int16_t> &s) {
+    const int N = 8192;
+    std::vector<double> mono(N, 0.0);
+    int frames = (int)s.size() / 2, take = std::min(frames, N);
+    for (int i = 0; i < take; i++) {
+        mono[i] = ((double)s[i * 2] + s[i * 2 + 1]) / 2.0 / 32768.0;
+        mono[i] *= 0.5 - 0.5 * std::cos(2 * M_PI * i / (N - 1));
+    }
+    double num = 0, den = 0;
+    for (int b = 1; b < 200; b++) {
+        double f0 = b * 25.0;
+        double re = 0, im = 0, w = 2 * M_PI * f0 / SR;
+        for (int i = 0; i < N; i++) { re += mono[i] * std::cos(w * i); im += mono[i] * std::sin(w * i); }
+        double mag = std::sqrt(re * re + im * im);
+        num += mag * f0; den += mag;
+    }
+    return den > 0 ? num / den : 0.0;
+}
+
+// What do rhythm-tone bytes 3 and 31 actually control?
+//
+// The 44-byte sweep showed both MOVE the output, which is not the same as
+// knowing what they are. Rendering a wave "neutral" means setting them, so
+// guessing is not good enough: byte 3 is only usable as coarse tune if
+// +12 really is an octave, and byte 31 is only pan if it really moves the
+// image between the channels.
+int params(const RomSet &roms) {
+    const uint8_t *kit = roms.rom2.data() + ROM_RHYTHM_INTERNAL;
+    const int key = 36, slot = (key - RHYTHM_LOW_KEY) * RHYTHM_TONE_SIZE;
+
+    auto render_with = [&](int idx, int val) {
+        std::vector<uint8_t> rom2 = roms.rom2;
+        memcpy(&rom2[ROM_RHYTHM_A], kit, RHYTHM_BYTES);
+        rom2[ROM_RHYTHM_A + slot + idx] = (uint8_t)val;
+        MCU *m = new MCU();
+        std::vector<uint8_t> nv = roms.nvram;
+        nv[NVRAM_MODE_OFFSET] = 0;
+        m->startSC55(roms.rom1.data(), rom2.data(), roms.waverom1.data(),
+                     roms.waverom2.data(), nv.data());
+        for (int i = 0; i < WARMUP; i++) m->updateSC55(1);
+        uint8_t bank[3] = {0xB0 | 0x0F, 0x00, 81}; m->postMidiSC55(bank, 3);
+        uint8_t pc[2] = {0xC0 | 0x0F, 0x00};       m->postMidiSC55(pc, 2);
+        for (int p = 0; p < SR / 2; p += CHUNK) run_frames(m, CHUNK);
+        auto s = render_note(m, 9, key, 110, 0.3, 1.0);
+        delete m;
+        return s;
+    };
+
+    printf("byte 3 -- is it COARSE TUNE in semitones?\n");
+    printf("   (stored value is %d; if semitones, +12 should roughly double the centroid)\n",
+           kit[slot + 3]);
+    double base = 0;
+    for (int v : {36, 48, 60, 72, 84}) {
+        auto s = render_with(3, v);
+        double c = centroid_hz(s);
+        if (v == 60) base = c;
+        printf("   byte3=%3d  centroid %8.1f Hz", v, c);
+        if (base > 0 && v != 60) printf("   ratio vs 60: %.3f  (an octave step = %.1f)",
+                                        c / base, std::pow(2.0, (v - 60) / 12.0));
+        printf("\n");
+    }
+
+    printf("\nbyte 31 -- is it PAN?\n");
+    printf("   (stored value is %d; 64 would be centre)\n", kit[slot + 31]);
+    for (int v : {0, 32, 64, 96, 127}) {
+        auto s = render_with(31, v);
+        double l = 0, r = 0;
+        for (size_t i = 0; i + 1 < s.size(); i += 2) {
+            l += (double)s[i] * s[i];
+            r += (double)s[i + 1] * s[i + 1];
+        }
+        double bal = 10.0 * std::log10((r + 1e-9) / (l + 1e-9));
+        printf("   byte31=%3d  R-L balance %+7.2f dB %s\n", v, bal,
+               bal < -3 ? "(left)" : bal > 3 ? "(right)" : "(centre)");
+    }
+    return 0;
+}
+
+// WHICH byte is coarse tune?
+//
+// Byte 3 was the obvious candidate -- it sits right after the wave number and
+// its stored values cluster around 60 -- but measuring it on a kick showed no
+// octave relationship at all (+12 gave a centroid ratio of 0.985 where an
+// octave is 2.0). That could mean byte 3 is not tuning, or simply that a kick
+// is too inharmonic for a spectral centroid to track. This settles it by
+// scanning EVERY byte on a deliberately TONAL key and looking for the one
+// where -12 and +12 land near half and double.
+//
+// Nothing here assumes a unit or an offset: it just looks for the byte that
+// behaves like semitones.
+int findtune(const RomSet &roms, int key) {
+    const uint8_t *kit = roms.rom2.data() + ROM_RHYTHM_INTERNAL;
+    const int slot = (key - RHYTHM_LOW_KEY) * RHYTHM_TONE_SIZE;
+
+    auto render_with = [&](int idx, int val) {
+        std::vector<uint8_t> rom2 = roms.rom2;
+        memcpy(&rom2[ROM_RHYTHM_A], kit, RHYTHM_BYTES);
+        if (idx >= 0) rom2[ROM_RHYTHM_A + slot + idx] = (uint8_t)val;
+        MCU *m = new MCU();
+        std::vector<uint8_t> nv = roms.nvram;
+        nv[NVRAM_MODE_OFFSET] = 0;
+        m->startSC55(roms.rom1.data(), rom2.data(), roms.waverom1.data(),
+                     roms.waverom2.data(), nv.data());
+        for (int i = 0; i < WARMUP; i++) m->updateSC55(1);
+        uint8_t bank[3] = {0xB0 | 0x0F, 0x00, 81}; m->postMidiSC55(bank, 3);
+        uint8_t pc[2] = {0xC0 | 0x0F, 0x00};       m->postMidiSC55(pc, 2);
+        for (int p = 0; p < SR / 2; p += CHUNK) run_frames(m, CHUNK);
+        auto s = render_note(m, 9, key, 110, 0.3, 0.8);
+        delete m;
+        return s;
+    };
+
+    double base = f0_hz(render_with(-1, 0));
+    printf("key %d baseline f0 %.1f Hz\n", key, base);
+    printf("looking for a byte where -12 -> ~%.0f Hz and +12 -> ~%.0f Hz\n\n",
+           base / 2, base * 2);
+    printf("byte orig   down12_Hz   up12_Hz   down_ratio  up_ratio  verdict\n");
+    if (base <= 0) { printf("  (baseline has no detectable pitch -- pick a more tonal key)\n"); return 1; }
+
+    for (int idx = 0; idx < RHYTHM_TONE_SIZE; idx++) {
+        int orig = kit[slot + idx];
+        int lo = orig - 12, hi = orig + 12;
+        if (lo < 0 || hi > 127) continue;      // cannot test a clean +/-12 here
+        double d = f0_hz(render_with(idx, lo));
+        double u = f0_hz(render_with(idx, hi));
+        double dr = base > 0 ? d / base : 0, ur = base > 0 ? u / base : 0;
+        // Semitone tuning means the two ratios straddle 1 in opposite
+        // directions AND the up-step is a large rise. Deliberately loose:
+        // a centroid is not a pitch tracker, so this only has to nominate a
+        // candidate, which is then confirmed by eye from the numbers.
+        bool cand = ur > 1.6 && dr < 0.7;
+        printf("%4d %4d  %9.1f %9.1f   %8.3f  %8.3f  %s\n",
+               idx, orig, d, u, dr, ur, cand ? "<== COARSE TUNE?" : "");
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: probe_rhythm <roms_dir> <out_dir> [--demo|--sweep]\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: probe_rhythm <roms_dir> <out_dir> [--demo|--sweep|--params|--findtune KEY]\n"); return 2; }
     std::string romdir = argv[1], outdir = argv[2];
 
     RomSet roms; std::string err;
     if (!roms.load(romdir, &err)) { fprintf(stderr, "rom load: %s\n", err.c_str()); return 1; }
+
+    if (argc > 3 && strcmp(argv[3], "--findtune") == 0) {
+        return findtune(roms, argc > 4 ? atoi(argv[4]) : 56);
+    }
+
+    if (argc > 3 && strcmp(argv[3], "--params") == 0) {
+        return params(roms);
+    }
 
     if (argc > 3 && strcmp(argv[3], "--sweep") == 0) {
         return sweep(roms, argc > 4 ? atoi(argv[4]) : 36);

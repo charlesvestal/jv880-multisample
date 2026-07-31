@@ -97,3 +97,9 @@ target_compile_options(wave_inject PRIVATE ${JV_WARN_FLAGS})
 add_executable(probe_rhythm tools/probe_rhythm.cpp)
 target_link_libraries(probe_rhythm jv_render)
 target_compile_options(probe_rhythm PRIVATE ${JV_WARN_FLAGS})
+
+# Renders each distinct WAVE a board's drum kits reference, once, at neutral
+# settings (tools/render_waves.cpp).
+add_executable(render_waves tools/render_waves.cpp)
+target_link_libraries(render_waves jv_render)
+target_compile_options(render_waves PRIVATE ${JV_WARN_FLAGS})
