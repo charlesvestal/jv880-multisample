@@ -63,15 +63,33 @@ Still open: loop POINTS are chosen by the generic sustain-loop finder and have
 no reason to land on a bar boundary. Snapping them to a multiple of the
 measured phrase period would make held notes repeat musically.
 
-## 3. Drum kits / Rhythm Sets -- SKIPPED for now
-Explicitly deferred by the user. Note these are NOT missing from the render by
-accident: on the JV, drum kits live in **Rhythm Sets**, a separate ROM area
-from Patches, and `src/jv_rom.cpp` enumerates Patches only. So no drum kit is
-present in the 4,197-patch count at all.
+## 3. Drum kits / Rhythm Sets -- DONE
 
-If picked up later it is genuinely new scope: new ROM parsing, plus a
-different sampling strategy (one sample per key, no pitch-tiling, no
-key-follow, no loop detection).
+Implemented. Rhythm Sets are a separate ROM region from Patches, which is why
+none appeared among the 4,197 rendered patches. 52 kits exist: 3 internal
+(Internal / Preset A / Preset B) and 49 across the 13 of 22 expansion boards
+that carry them. Nine boards have none, including -- surprisingly -- Pop and
+Vintage Synth, while Bass & Drum carries only 4.
+
+A set is 61 keys (MIDI 36-96) x 44 bytes. Expansions declare rhythm_count at
+header 0x68 and rhythm_offset at 0x90; the COUNT is authoritative, since Vocal
+stores a non-zero offset while declaring zero sets.
+
+Playback goes through the performance's rhythm part on MIDI channel 10, with
+the wanted kit injected into the PRESET A rhythm region of an in-memory rom2
+(never the file on disk). NVRAM 0x67f0 holds a copy of a kit but is NOT what
+the firmware sounds -- writing there changes nothing.
+
+Still open for kits:
+
+  - They have NO names anywhere in the data. Scanning an expansion's whole
+    tail region finds only the patch name table; the rhythm block sits in a
+    stretch with no text at all. Kits are therefore named by board and index
+    ("Rhythm 1".."Rhythm 4"), not by whatever Roland printed in the manual.
+    If a name list is ever transcribed from the manuals, only the emitted
+    preset names need to change -- no re-render.
+  - Velocity is sampled at 4 fixed bands. A rhythm key holds a single tone
+    with no velocity-switch points to derive layers from, unlike a patch.
 
 ## 4. Loop points ignore baked-in amplitude modulation
 

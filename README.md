@@ -12,6 +12,21 @@ python3 tools/build_library.py --roms /path/to/roms --out /path/to/output
 The full run is 4,197 patches across 21 boards, about 5 hours of rendering
 and ~150 GB. `--board "SR-JV80-04 Vintage Synth"` does one board.
 
+Drum kits are rendered separately, with `--rhythm`:
+
+```bash
+build/jv_sampler --roms /path/to/roms --board "SR-JV80-06 Dance" \
+    --out /path/to/output --rhythm
+```
+
+The JV keeps drum kits in **Rhythm Sets**, a different ROM region from
+Patches, so they are a separate pass rather than extra entries in the patch
+list. There are 52 across the library -- 3 internal and 49 spread over the 13
+of 22 expansion boards that carry any. A kit covers 61 keys (C2-C7), each key
+its own instrument, sampled at 4 velocity layers and mapped one sample per key
+with no transposition. Rhythm Sets carry no names in the ROM, so kits are
+named by board and index.
+
 The effect calibration ships with the repo, so the default run goes straight
 to rendering. Pass `--stop-after calibrate` to re-measure it from your own
 ROMs instead.
