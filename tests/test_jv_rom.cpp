@@ -1,6 +1,7 @@
 #include "jv_rom.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <string>
 
 static int failures = 0;
@@ -76,6 +77,57 @@ int main(int argc, char **argv) {
     }
     check(checked_expansion_data,
           "at least one usable expansion board's patches were checked for data pointers");
+
+    // ---- Rhythm sets (drum kits) -------------------------------------------
+    auto irhy = jv::enumerate_internal_rhythm(roms);
+    check(irhy.size() == 3, "three internal rhythm sets (Internal / Preset A / B)");
+    if (irhy.size() == 3) {
+        check(irhy[0].name == "Internal" && irhy[1].name == "Preset A" &&
+              irhy[2].name == "Preset B", "internal rhythm sets are named by bank");
+        bool all_data = true;
+        for (const auto &r : irhy) if (!r.data) all_data = false;
+        check(all_data, "every internal rhythm set has a data pointer");
+        // The three must be genuinely different kits, not one kit read three
+        // times from the same place -- the exact mistake that would make a
+        // wrong offset look like success.
+        check(memcmp(irhy[0].data, irhy[1].data, jv::RHYTHM_SET_BYTES) != 0 &&
+              memcmp(irhy[1].data, irhy[2].data, jv::RHYTHM_SET_BYTES) != 0,
+              "the three internal rhythm sets differ from each other");
+    }
+
+    // A rhythm set is 61 keys x 44 bytes. Its first record must have the
+    // tone-enable bit set; that is what distinguishes real key data from the
+    // 0xFF padding that follows key 61.
+    if (!irhy.empty())
+        check((irhy[0].data[0] & 0x80) != 0, "rhythm key 0 has its tone-enable bit set");
+
+    // Expansion rhythm sets: the COUNT is authoritative, not the offset.
+    // Vocal declares zero sets while still storing a non-zero rhythm offset,
+    // so an offset-driven enumerator would fabricate kits for it.
+    bool saw_rhythm_board = false, saw_rhythmless_board = false;
+    for (const auto &e : exps) {
+        auto rs = jv::enumerate_expansion_rhythm(e);
+        check((int)rs.size() == (e.usable ? e.rhythm_count : 0),
+              ("rhythm set count matches header for " + e.name).c_str());
+        if (e.name.find("SR-JV80-06") != std::string::npos) {
+            check(e.rhythm_count == 4, "board 06 Dance declares 4 rhythm sets");
+            // Independent confirmation of BOTH header fields and the 2684-byte
+            // set size: the gap between the rhythm block and the patch block
+            // must divide by the set size to exactly the declared count.
+            check(e.patches_offset > e.rhythm_offset &&
+                  (e.patches_offset - e.rhythm_offset) ==
+                      (uint32_t)e.rhythm_count * jv::RHYTHM_SET_BYTES,
+                  "board 06 rhythm block size == count x 2684 exactly");
+            saw_rhythm_board = true;
+        }
+        if (e.name.find("SR-JV80-13") != std::string::npos) {
+            check(e.rhythm_count == 0 && rs.empty(),
+                  "board 13 Vocal declares no rhythm sets despite a non-zero offset");
+            saw_rhythmless_board = true;
+        }
+    }
+    check(saw_rhythm_board, "a board with rhythm sets was checked");
+    check(saw_rhythmless_board, "a board without rhythm sets was checked");
 
     fprintf(stderr, failures ? "\n%d FAILURES\n" : "\nALL TESTS PASSED\n", failures);
     return failures ? 1 : 0;

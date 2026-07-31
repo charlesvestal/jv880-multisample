@@ -130,6 +130,14 @@ bool load_expansion(const std::string &path, Expansion *out, std::string *err) {
     out->patch_count    = (int)u[0x67] | ((int)u[0x66] << 8);
     out->patches_offset = ((uint32_t)u[0x8c] << 24) | ((uint32_t)u[0x8d] << 16) |
                           ((uint32_t)u[0x8e] << 8)  |  (uint32_t)u[0x8f];
+    // Rhythm sets, in the same style as the patch pair above. Verified by
+    // arithmetic rather than assumption: on every board that declares a
+    // non-zero count, (patches_offset - rhythm_offset) / 2684 comes out at
+    // EXACTLY the declared count (1.00 or 4.00, never 3.97), which both
+    // confirms these two header fields and confirms the 61 x 44 set size.
+    out->rhythm_count   = (int)u[0x69] | ((int)u[0x68] << 8);
+    out->rhythm_offset  = ((uint32_t)u[0x90] << 24) | ((uint32_t)u[0x91] << 16) |
+                          ((uint32_t)u[0x92] << 8)  |  (uint32_t)u[0x93];
 
     size_t need = (size_t)out->patches_offset +
                   (size_t)out->patch_count * PATCH_SIZE;
@@ -175,6 +183,52 @@ std::vector<Expansion> scan_expansions(const std::string &dir) {
             fprintf(stderr, "unusable: %s (patch_count=%d)\n",
                     e.name.c_str(), e.patch_count);
         out.push_back(std::move(e));
+    }
+    return out;
+}
+
+std::vector<RhythmRef> enumerate_internal_rhythm(const RomSet &roms) {
+    struct Bank { const char *name; uint32_t off; };
+    static const Bank banks[] = {
+        {"Internal", ROM_RHYTHM_INTERNAL},
+        {"Preset A", ROM_RHYTHM_PRESET_A},
+        {"Preset B", ROM_RHYTHM_PRESET_B},
+    };
+    for (const auto &b : banks) {
+        if (roms.rom2.size() < (size_t)b.off + RHYTHM_SET_BYTES) return {};
+    }
+    std::vector<RhythmRef> out;
+    int i = 0;
+    for (const auto &b : banks) {
+        RhythmRef r;
+        r.name  = b.name;
+        r.bank  = "Internal";
+        r.index = i++;
+        r.data  = roms.rom2.data() + b.off;
+        out.push_back(r);
+    }
+    return out;
+}
+
+std::vector<RhythmRef> enumerate_expansion_rhythm(const Expansion &exp) {
+    std::vector<RhythmRef> out;
+    // rhythm_count is the authority. Vocal declares 0 sets but still stores a
+    // non-zero rhythm_offset, so an offset-driven check would fabricate kits.
+    if (!exp.usable || exp.rhythm_count <= 0) return out;
+    if (exp.rhythm_count > MAX_EXPANSION_RHYTHM) return out;
+    size_t need = (size_t)exp.rhythm_offset +
+                  (size_t)exp.rhythm_count * RHYTHM_SET_BYTES;
+    if (exp.rhythm_offset == 0 || need > exp.unscrambled.size()) return out;
+
+    for (int i = 0; i < exp.rhythm_count; i++) {
+        RhythmRef r;
+        // No name exists in the data (see jv_rom.h), so build a stable one.
+        r.name  = "Rhythm " + std::to_string(i + 1);
+        r.bank  = exp.name;
+        r.index = i;
+        r.data  = exp.unscrambled.data() + exp.rhythm_offset +
+                  (size_t)i * RHYTHM_SET_BYTES;
+        out.push_back(r);
     }
     return out;
 }

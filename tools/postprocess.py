@@ -20,6 +20,11 @@ SR_OUT = 48000
 # too conservative). In practice loop_start // 4 (~250ms for the standard
 # 1.0s loop_start) is usually the binding relative bound, not this
 # absolute ceiling -- see find_loop's docstring.
+#
+# Drum-kit renders hold a note for only 0.5 s (jv_sampler's rhythm path)
+# rather than the 3.5 s a patch gets, and classify()/measure_release()
+# both need the real hold to find the note-off boundary.
+RHYTHM_HOLD_SECONDS = 0.5
 MAX_XFADE = 24000
 # A zone whose kind is one of these has no usable audio; see
 # _mark_zone_unprocessable's docstring for the Task 6 contract this implies.
@@ -469,6 +474,27 @@ def _mark_zone_unprocessable(z, kind):
 
 def process_patch(pdir: Path, hold_seconds=3.5):
     meta = json.loads((pdir / "patch.json").read_text())
+
+    # A rhythm set (drum kit) is post-processed differently from a patch, in
+    # two ways that matter:
+    #
+    #   1. Its zones are ONE-SHOTS. A kick is not a sustaining sound to be
+    #      looped, and a loop spliced into a drum hit is audible as a stutter.
+    #      So no zone gets a loop, regardless of what classify() thinks --
+    #      a long cymbal wash can easily read as "sustaining".
+    #   2. Its release must stay PER-ZONE. unify_release imposes one release
+    #      across a patch, which is right when every zone is the same
+    #      instrument at a different pitch, and wrong here: a closed hat and a
+    #      ride cymbal in the same kit have genuinely different tails, and the
+    #      median of the two fits neither.
+    #
+    # The renderer also holds a drum note for a much shorter time than a
+    # patch, so the hold used for classification comes from the kit render,
+    # not from this function's patch-shaped default.
+    is_rhythm = meta.get("kind") == "rhythm"
+    if is_rhythm:
+        hold_seconds = RHYTHM_HOLD_SECONDS
+
     hold_out = int(hold_seconds * SR_OUT)
 
     for z in meta["zones"]:
@@ -540,7 +566,12 @@ def process_patch(pdir: Path, hold_seconds=3.5):
             # stranding a zone with valid audio but "error" metadata that
             # never got corrected. See requirement #5 in the review.
             kind, ratio = classify(y, hold_out)
-            loop = find_loop(y, SR_OUT, hold_out) if kind == "sustaining" else None
+            # Never loop a drum hit -- see the note in process_patch. A long
+            # cymbal readily classifies as "sustaining", so this cannot be
+            # left to the classifier.
+            loop = (None if is_rhythm
+                    else find_loop(y, SR_OUT, hold_out) if kind == "sustaining"
+                    else None)
             release_val, release_measured = measure_release(y, SR_OUT, hold_out)
             release_val = round(release_val, 4)
 
@@ -584,8 +615,14 @@ def process_patch(pdir: Path, hold_seconds=3.5):
             )
             _mark_zone_unprocessable(z, "error")
 
-    # One release for the whole patch -- see unify_release.
-    unify_release(meta["zones"])
+    # One release for the whole patch -- see unify_release. Skipped for a
+    # rhythm set, whose zones are different instruments rather than one
+    # instrument across the keyboard.
+    if is_rhythm:
+        for z in meta["zones"]:
+            z.pop("_release_measured", None)
+    else:
+        unify_release(meta["zones"])
 
     meta["sample_rate"] = SR_OUT
     (pdir / "patch.json").write_text(json.dumps(meta, indent=2))

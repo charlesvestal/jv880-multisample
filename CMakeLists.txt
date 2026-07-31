@@ -91,3 +91,9 @@ target_compile_options(calibrate PRIVATE ${JV_WARN_FLAGS})
 add_executable(wave_inject tools/wave_inject.cpp)
 target_link_libraries(wave_inject jv_render)
 target_compile_options(wave_inject PRIVATE ${JV_WARN_FLAGS})
+
+# Rhythm Set (drum kit) probe (tools/probe_rhythm.cpp): determines which boot
+# mode actually sounds a rhythm key, by measurement rather than assumption.
+add_executable(probe_rhythm tools/probe_rhythm.cpp)
+target_link_libraries(probe_rhythm jv_render)
+target_compile_options(probe_rhythm PRIVATE ${JV_WARN_FLAGS})

@@ -98,7 +98,7 @@ bool mkdirs(const std::string &p) {
 
 void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s --roms <dir> [--board <name> --out <dir> [--patch N] | --list]\n",
+            "Usage: %s --roms <dir> [--board <name> --out <dir> [--patch N] [--rhythm] | --list]\n",
             prog);
 }
 
@@ -113,6 +113,10 @@ int main(int argc, char **argv) {
     double hold_seconds = -1.0;
     bool no_expansion_waves = false;
     bool do_list = false;
+    // Render this board's RHYTHM SETS (drum kits) instead of its
+    // patches. They are a separate ROM region, so they are a separate
+    // pass rather than extra entries in the patch list.
+    bool do_rhythm = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--roms") && i + 1 < argc) {
@@ -133,6 +137,8 @@ int main(int argc, char **argv) {
             hold_seconds = atof(argv[++i]);
         } else if (!strcmp(argv[i], "--dump-voice")) {
             dump_voice = true;
+        } else if (!strcmp(argv[i], "--rhythm")) {
+            do_rhythm = true;
         } else if (!strcmp(argv[i], "--list")) {
             do_list = true;
         } else {
@@ -230,9 +236,155 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    // One Renderer serves both paths. The rhythm path re-boots it via
+    // init_rhythm() (a kit can only be installed at boot), so its init()
+    // below is deliberately not called first for rhythm renders.
+    Renderer r;
+
+    // ---- Rhythm sets (drum kits) -------------------------------------------
+    // A drum kit is not a patch and is not sampled like one. Each of its 61
+    // keys is its OWN instrument -- a kick is not a transposed snare -- so
+    // there is no key grid to step across and no pitch tiling: every sounding
+    // key is rendered at its own pitch and mapped to itself.
+    if (do_rhythm) {
+        std::vector<RhythmRef> kits =
+            (board == BOARD_INTERNAL) ? enumerate_internal_rhythm(roms)
+                                      : (selected_expansion
+                                             ? enumerate_expansion_rhythm(*selected_expansion)
+                                             : std::vector<RhythmRef>());
+        if (kits.empty()) {
+            // Not an error: 9 of 22 boards genuinely carry no rhythm sets.
+            fprintf(stderr, "%s has no rhythm sets\n", board.c_str());
+            return 0;
+        }
+
+        GridSpec rg;
+        // Drums are one-shots. Hold only long enough to trigger, then leave a
+        // generous tail -- a ride or crash rings for seconds, and render_note
+        // truncates early once it goes quiet, so a long tail costs nothing on
+        // the short sounds.
+        rg.hold_seconds = 0.5;
+        rg.tail_seconds = 6.0;
+        if (hold_seconds > 0.0) rg.hold_seconds = hold_seconds;
+
+        // Four even velocity bands. Unlike a patch, a rhythm key holds a
+        // SINGLE tone, so there are no velocity-switch points to derive
+        // layers from -- but velocity still drives level and filter, which is
+        // most of what makes a kit playable.
+        const int band_lo[4] = {1, 33, 65, 97};
+        const int band_hi[4] = {32, 64, 96, 127};
+
+        for (size_t ki = 0; ki < kits.size(); ki++) {
+            if (only_patch >= 0 && (int)ki != only_patch) continue;
+            const RhythmRef &kit = kits[ki];
+
+            // Installing a kit means rebooting the emulator (the firmware
+            // reads the sounding kit from ROM at boot), so this costs a full
+            // warmup per kit rather than per note.
+            // Expansion waves are passed INTO the boot rather than applied
+            // after it: load_expansion_waves() resets the emulator, which
+            // would throw away the performance selection init_rhythm() makes.
+            const uint8_t *exp_data = nullptr;
+            size_t exp_len = 0;
+            if (selected_expansion && !no_expansion_waves) {
+                exp_data = selected_expansion->unscrambled.data();
+                exp_len  = selected_expansion->unscrambled.size();
+            }
+            if (!r.init_rhythm(roms, kit.data, rg, exp_data, exp_len)) {
+                fprintf(stderr, "emulator init failed for rhythm set %s\n", kit.name.c_str());
+                return 1;
+            }
+
+            char idx[16];
+            snprintf(idx, sizeof(idx), "%03d", (int)ki);
+            std::string pdir = out_dir + "/" + idx + "_" + sanitize(kit.name);
+            if (!mkdirs(pdir)) {
+                fprintf(stderr, "failed to prepare output directory for %s\n", pdir.c_str());
+                return 1;
+            }
+
+            std::string zones;
+            int zone_count = 0, silent_keys = 0;
+            for (int key = RHYTHM_LOW_KEY; key < RHYTHM_LOW_KEY + RHYTHM_KEYS; key++) {
+                // An unassigned key produces nothing. Probe it once at full
+                // velocity before spending four renders on silence.
+                std::vector<int16_t> probe = r.render_note(key, 127, rg);
+                bool sounds = false;
+                for (int16_t v : probe) {
+                    if (std::abs((int)v) > 64) { sounds = true; break; }
+                }
+                if (!sounds) { silent_keys++; continue; }
+
+                for (int v = 0; v < 4; v++) {
+                    int velocity = band_lo[v] + (band_hi[v] - band_lo[v]) / 2;
+                    // Always a fresh render. The silence probe above ran at
+                    // velocity 127, which is not any band's representative
+                    // velocity (band 4's is 112), so reusing it would file a
+                    // sample under a velocity it was not rendered at.
+                    std::vector<int16_t> pcm = r.render_note(key, velocity, rg);
+                    int frames = (int)(pcm.size() / 2);
+
+                    std::string fn = note_name(key) + "_v" + std::to_string(v + 1) + ".wav";
+                    if (!wav_write_s16(pdir + "/" + fn, pcm.data(), frames, 2, SAMPLE_RATE)) {
+                        fprintf(stderr, "failed to write %s\n", (pdir + "/" + fn).c_str());
+                        return 1;
+                    }
+                    char zbuf[512];
+                    snprintf(zbuf, sizeof(zbuf),
+                             "%s{\"key\":%d,\"velocity\":%d,\"layer\":%d,\"lovel\":%d,\"hivel\":%d,"
+                             "\"frames\":%d,\"file\":\"%s\"}",
+                             zones.empty() ? "" : ", ", key, velocity, v + 1,
+                             band_lo[v], band_hi[v], frames, json_escape(fn).c_str());
+                    zones += zbuf;
+                    zone_count++;
+                }
+            }
+
+            std::string json_path = pdir + "/patch.json";
+            FILE *jf = fopen(json_path.c_str(), "w");
+            if (!jf) {
+                fprintf(stderr, "failed to open %s: %s\n", json_path.c_str(), strerror(errno));
+                return 1;
+            }
+            // "kind":"rhythm" is the flag every downstream stage keys off:
+            // postprocess must not loop a drum hit, and the preset emitter
+            // must map each sample to its own single key with no pitch
+            // tracking. Effects are all zero because a rhythm render is
+            // already dry -- measured, not assumed: sweeping all 44 bytes of
+            // a rhythm tone never moved the late-tail energy ratio off 0.000.
+            int written = fprintf(jf,
+                "{\n"
+                "  \"name\": \"%s\", \"bank\": \"%s\", \"index\": %d, \"sample_rate\": %d,\n"
+                "  \"kind\": \"rhythm\",\n"
+                "  \"effects\": {\n"
+                "    \"reverb\": {\"type\":\"Off\",\"level\":0,\"time\":0,\"feedback\":0},\n"
+                "    \"chorus\": {\"type\":\"Off\",\"level\":0,\"depth\":0,\"rate\":0,\"feedback\":0,\"output\":\"Mix\"},\n"
+                "    \"reverb_send\": [0,0,0,0], \"chorus_send\": [0,0,0,0], \"tone_level\": [127,0,0,0],\n"
+                "    \"bend_up\": 0, \"bend_down\": 0\n"
+                "  },\n"
+                "  \"voice\": {\"key_assign\":\"Poly\",\"solo_legato\":false,\"portamento\":false,"
+                "\"portamento_time\":0,\"portamento_mode\":\"Normal\"},\n"
+                "  \"lfo1\": {\"stripped\":false,\"reason\":\"rhythm set\",\"form\":\"TRI\",\"rate\":0,\"delay\":0,\"sync\":0,\"pitch\":0,\"tvf\":0,\"tva\":0},\n"
+                "  \"lfo2\": {\"stripped\":false,\"reason\":\"rhythm set\",\"form\":\"TRI\",\"rate\":0,\"delay\":0,\"sync\":0,\"pitch\":0,\"tvf\":0,\"tva\":0},\n"
+                "  \"zones\": [%s]\n"
+                "}\n",
+                json_escape(kit.name).c_str(), json_escape(kit.bank).c_str(),
+                kit.index, SAMPLE_RATE, zones.c_str());
+            int close_rc = fclose(jf);
+            if (written < 0 || close_rc != 0) {
+                fprintf(stderr, "failed to write %s: fprintf=%d fclose=%d (%s)\n",
+                        json_path.c_str(), written, close_rc, strerror(errno));
+                return 1;
+            }
+            fprintf(stderr, "rendered rhythm %03d_%s (%d zones, %d keys, %d silent)\n",
+                    (int)ki, kit.name.c_str(), zone_count,
+                    RHYTHM_KEYS - silent_keys, silent_keys);
+        }
+        return 0;
+    }
+
     GridSpec grid;
     if (hold_seconds > 0.0) grid.hold_seconds = hold_seconds;
-    Renderer r;
     if (!r.init(roms)) {
         fprintf(stderr, "emulator init failed\n");
         return 1;

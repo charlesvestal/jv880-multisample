@@ -68,6 +68,32 @@ public:
     void load_patch_bytes(const std::vector<uint8_t> &patch_bytes,
                           const GridSpec &g);
 
+    // Boots the emulator with a RHYTHM SET (drum kit) in place, replacing any
+    // prior init(). Rhythm sets cannot be loaded the way patches are: the
+    // firmware sources the sounding kit from ROM, not from NVRAM, so a kit is
+    // installed by INJECTING it into an in-memory copy of rom2 and rebooting.
+    // (The ROM files on disk are never written -- same technique wave_inject
+    // uses for the wave ROM.)
+    //
+    // Established by intervention rather than assumption: writing a kit into
+    // NVRAM at 0x67f0 -- where the factory image demonstrably keeps a copy --
+    // changed the output by nothing at all, identical to two decimal places.
+    // Injecting a kit whose 61 keys all hold ONE tone collapsed every key to
+    // identical audio only when written to the PRESET A rhythm region, which
+    // is why that region is the injection target no matter which kit is
+    // wanted.
+    //
+    // `kit` must point to RHYTHM_SET_BYTES readable bytes. Because installing
+    // a kit means rebooting, this costs a full warmup (~3 s) per kit.
+    // Returns false if the emulator failed to start, leaving any previous
+    // MCU untouched.
+    // exp_waves/exp_len install an expansion board's wave data as part of
+    // the SAME boot. Do not call load_expansion_waves() after this instead:
+    // that routine resets the emulator, which would discard the performance
+    // selection init_rhythm() makes and leave the rhythm part unpointed.
+    bool init_rhythm(const RomSet &roms, const uint8_t *kit, const GridSpec &g,
+                     const uint8_t *exp_waves = nullptr, size_t exp_len = 0);
+
     // Renders one key/velocity cell: note-on, hold, note-off, tail (with
     // early truncation once the signal sits quietly below the noise floor
     // for a sustained run), then All Notes Off plus a short discarded flush
@@ -103,6 +129,11 @@ public:
 
 private:
     void *mcu_ = nullptr;   // opaque MCU*
+    // MIDI channel every note is sent on. Patches play on channel 1 (0);
+    // a rhythm set is reached through the performance's rhythm part, which
+    // is channel 10 (9). Set by load_patch_bytes / init_rhythm so
+    // render_note() needs no separate rhythm variant.
+    int   channel_ = 0;
     // Trimmed 12-char ROM name of the currently-loaded patch (cheap to pull
     // out of patch_bytes in load_patch_bytes), used only to identify which
     // patch a render_note() flush-cap diagnostic came from.

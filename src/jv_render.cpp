@@ -119,9 +119,62 @@ bool Renderer::init(const RomSet &roms) {
     return true;
 }
 
+bool Renderer::init_rhythm(const RomSet &roms, const uint8_t *kit, const GridSpec &g,
+                           const uint8_t *exp_waves, size_t exp_len) {
+    // In-memory copy of rom2 with the wanted kit dropped into the Preset A
+    // rhythm region. The file on disk is never touched.
+    std::vector<uint8_t> rom2 = roms.rom2;
+    if (rom2.size() < (size_t)ROM_RHYTHM_PRESET_A + RHYTHM_SET_BYTES) return false;
+    memcpy(&rom2[ROM_RHYTHM_PRESET_A], kit, (size_t)RHYTHM_SET_BYTES);
+
+    MCU *m = new MCU();
+    std::vector<uint8_t> nv = roms.nvram;
+    nv[NVRAM_MODE_OFFSET] = 0;   // performance mode: rhythm plays on part 10
+    if (m->startSC55(roms.rom1.data(), rom2.data(),
+                     roms.waverom1.data(), roms.waverom2.data(), nv.data()) != 0) {
+        delete m;
+        return false;
+    }
+    // Expansion waves must go in HERE -- after startSC55, before the warmup
+    // and before the performance is selected. Calling load_expansion_waves()
+    // afterwards instead would work for the waves but silently undo this
+    // function's work: that routine performs an SC55_Reset, which discards
+    // the performance selection made below and leaves the rhythm part
+    // pointing wherever the firmware defaults to. Doing it in this order
+    // means exactly one reset, with the performance chosen after it.
+    if (exp_waves && exp_len) {
+        const size_t cap = sizeof(m->pcm.waverom_exp);
+        std::memset(m->pcm.waverom_exp, 0, cap);
+        std::memcpy(m->pcm.waverom_exp, exp_waves, std::min(exp_len, cap));
+        m->SC55_Reset();
+    }
+
+    for (int i = 0; i < WARMUP_STEPS; i++) m->updateSC55(1);
+
+    // Preset A performance 0 -- the performance whose rhythm part reads the
+    // region we just injected into.
+    uint8_t bank[3] = {0xB0 | 0x0F, 0x00, 81};
+    m->postMidiSC55(bank, 3);
+    uint8_t pc[2] = {0xC0 | 0x0F, 0x00};
+    m->postMidiSC55(pc, 2);
+
+    delete (MCU *)mcu_;
+    mcu_ = m;
+    channel_ = 9;                // MIDI channel 10
+    current_patch_name_ = "rhythm";
+
+    int settle = (int)(g.settle_seconds * SAMPLE_RATE);
+    for (int pos = 0; pos < settle; pos += CHUNK) {
+        int n = std::min(CHUNK, settle - pos);
+        run_frames(m, n);
+    }
+    return true;
+}
+
 void Renderer::load_patch_bytes(const std::vector<uint8_t> &bytes, const GridSpec &g) {
     assert(mcu_ != nullptr && "Renderer::load_patch_bytes called before a successful init()");
     MCU *m = (MCU *)mcu_;
+    channel_ = 0;
     memcpy(&m->nvram[NVRAM_PATCH_OFFSET], bytes.data(), (size_t)PATCH_SIZE);
     m->nvram[NVRAM_MODE_OFFSET] = 1;
     uint8_t pc[2] = {0xC0, 0x00};
@@ -226,7 +279,7 @@ std::vector<int16_t> Renderer::render_note(int key, int velocity, const GridSpec
     std::vector<int16_t> out;
     out.reserve((size_t)(hold_samples + tail_samples) * 2);
 
-    uint8_t note_on[3] = {0x90, (uint8_t)key, (uint8_t)velocity};
+    uint8_t note_on[3] = {(uint8_t)(0x90 | channel_), (uint8_t)key, (uint8_t)velocity};
     m->postMidiSC55(note_on, 3);
 
     // Hold: always rendered in full (design note C truncates only the tail).
@@ -240,7 +293,7 @@ std::vector<int16_t> Renderer::render_note(int key, int velocity, const GridSpec
             peak = std::max(peak, std::abs((int)out[i]));
     }
 
-    uint8_t note_off[3] = {0x80, (uint8_t)key, 0};
+    uint8_t note_off[3] = {(uint8_t)(0x80 | channel_), (uint8_t)key, 0};
     m->postMidiSC55(note_off, 3);
 
     // Tail: track running peak, stop once a ~100ms run sits below
@@ -281,7 +334,7 @@ std::vector<int16_t> Renderer::render_note(int key, int velocity, const GridSpec
     // measured with headroom, and the loop below still exits early for the
     // vast majority of (fast-decaying) cells, so this mainly costs time on
     // the genuinely slow-release patches that need it.
-    uint8_t all_off[3] = {0xB0, 0x7B, 0x00};
+    uint8_t all_off[3] = {(uint8_t)(0xB0 | channel_), 0x7B, 0x00};
     m->postMidiSC55(all_off, 3);
 
     double floor = (double)peak * std::pow(10.0, g.silence_db / 20.0);

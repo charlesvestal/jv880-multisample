@@ -66,7 +66,7 @@ def iattr(el: ET.Element, name: str, where: str) -> int | None:
         return None
 
 
-def check_audio(pdir: Path, meta: dict) -> tuple[int, int, int]:
+def check_audio(pdir: Path, meta: dict) -> tuple[int, int, int, int]:
     """Return (looped, total, skipped, sustaining) zone counts for one patch."""
     looped = total = skipped = sustaining = 0
     for z in meta.get("zones", []):
@@ -146,7 +146,15 @@ def check_release_consistency(pdir: Path, meta: dict) -> None:
     Nothing caught it because each value was individually plausible -- 0.05 s
     is a fine release and so is 3.6 s. Only comparing them WITHIN a patch
     exposes it, which is what this does.
+
+    A RHYTHM SET is exempt, and not as a convenience: the premise above does
+    not hold for it. Its zones are different instruments, not one instrument
+    across a keyboard, so their releases SHOULD differ -- the internal kit
+    holds a crash at 3.12 s beside a kick at 0.60 s. Forcing them to agree is
+    the bug here, not the fix.
     """
+    if meta.get("kind") == "rhythm":
+        return
     values = {round(z["release"], 4) for z in meta.get("zones", [])
               if z.get("kind") not in ("missing", "error")
               and z.get("release") is not None}
@@ -252,7 +260,19 @@ def main() -> None:
             meta = json.loads((pdir / "patch.json").read_text())
             zones = meta.get("zones", [])
             n = len(zones)
-            if n % EXPECTED_KEYS != 0:
+            is_rhythm = meta.get("kind") == "rhythm"
+            # A rhythm set is sampled on a different grid: one zone per
+            # SOUNDING key out of 61, not EXPECTED_KEYS keys tiled across the
+            # keyboard, and a kit may legitimately leave keys unassigned. So
+            # the layer arithmetic below simply does not apply to it.
+            if is_rhythm:
+                keys = {z.get("key") for z in zones}
+                per_key = {len([z for z in zones if z.get("key") == k]) for k in keys}
+                if len(per_key) > 1:
+                    errors.append(
+                        f"{pdir.name}: rhythm keys have differing velocity "
+                        f"layer counts {sorted(per_key)}")
+            elif n % EXPECTED_KEYS != 0:
                 errors.append(
                     f"{pdir.name}: {n} zones is not a whole number of "
                     f"{EXPECTED_KEYS}-key layers")
@@ -265,7 +285,13 @@ def main() -> None:
             looped += l
             total += t
             skipped += s
-            sustaining += sus
+            # Rhythm zones are deliberately never looped (a spliced loop in a
+            # drum hit is audible as a stutter), so they must not enter the
+            # sustaining tally -- a long cymbal classifies as "sustaining" and
+            # would otherwise drag the library-wide loop fraction below its
+            # floor and fail a run that is behaving exactly as designed.
+            if not is_rhythm:
+                sustaining += sus
 
         r, d = check_presets(lib)
         any_reverb |= r

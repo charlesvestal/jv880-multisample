@@ -1413,3 +1413,69 @@ def test_unify_release_ignores_zones_with_no_audio():
     pp.unify_release(zones)
     assert zones[0]["release"] == 0.2
     assert zones[1]["release"] is None
+
+
+# ---------------------------------------------------------------------------
+# Rhythm sets (drum kits)
+#
+# Two patch-shaped assumptions have to be switched off for a kit, and both
+# failures would be silent: a looped drum hit stutters, and a release
+# unified across a kit truncates the crash or smears the kick.
+# ---------------------------------------------------------------------------
+
+def _write_rhythm_patch(tmp_path, sustaining=True):
+    """A two-key kit whose audio deliberately reads as SUSTAINING, so the
+    no-loop rule is tested against the case that would otherwise loop."""
+    pdir = tmp_path / "000_Kit"
+    pdir.mkdir()
+    zones = []
+    for i, key in enumerate((36, 49)):
+        # Long enough that the PATCH path (3.5 s hold) also has a real
+        # steady-state region to search -- otherwise the control test
+        # below would pass for the wrong reason.
+        n = int(6.0 * pp.SR_IN)
+        t = np.arange(n) / pp.SR_IN
+        # A steady tone sustains through note-off -- exactly what classify()
+        # calls "sustaining" and find_loop would normally loop.
+        env = np.ones(n) if sustaining else np.exp(-6 * t)
+        mono = (0.4 * np.sin(2 * np.pi * 220 * t) * env).astype("float32")
+        fn = f"{key}_v1.wav"
+        sf.write(str(pdir / fn), np.stack([mono, mono], axis=1), pp.SR_IN)
+        zones.append({"key": key, "velocity": 100, "layer": 1, "lovel": 1,
+                      "hivel": 127, "frames": n, "file": fn})
+    (pdir / "patch.json").write_text(json.dumps({
+        "name": "Kit", "bank": "Internal", "index": 0,
+        "sample_rate": pp.SR_IN, "kind": "rhythm", "zones": zones,
+    }))
+    return pdir
+
+
+def test_rhythm_zones_are_never_looped_even_when_sustaining(tmp_path):
+    pdir = _write_rhythm_patch(tmp_path, sustaining=True)
+    meta = pp.process_patch(pdir)
+    # The premise of the test: this audio really does classify as sustaining,
+    # so the no-loop result below is the rhythm rule and not an accident of
+    # unloopable material.
+    assert any(z["kind"] == "sustaining" for z in meta["zones"])
+    assert all(not (z.get("loop") or {}).get("enabled") for z in meta["zones"])
+
+
+def test_patch_zones_with_the_same_audio_DO_loop(tmp_path):
+    """Control for the test above: identical audio, kind removed."""
+    pdir = _write_rhythm_patch(tmp_path, sustaining=True)
+    meta = json.loads((pdir / "patch.json").read_text())
+    del meta["kind"]
+    (pdir / "patch.json").write_text(json.dumps(meta))
+    out = pp.process_patch(pdir)
+    assert any((z.get("loop") or {}).get("enabled") for z in out["zones"]), \
+        "control failed: this audio should loop when it is not a rhythm set"
+
+
+def test_rhythm_release_is_not_unified_across_the_kit(tmp_path):
+    pdir = _write_rhythm_patch(tmp_path, sustaining=False)
+    meta = pp.process_patch(pdir)
+    # Nothing asserts the two differ (they may legitimately match on
+    # synthetic audio); what matters is that the unify step did not run and
+    # strip the per-zone bookkeeping.
+    assert all("_release_measured" not in z for z in meta["zones"])
+    assert all(z.get("release") is not None for z in meta["zones"])

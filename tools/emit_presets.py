@@ -292,6 +292,26 @@ def key_ranges(zone_keys):
     return spans
 
 
+def rhythm_key_spans(zone_keys):
+    """One span per key, covering only that key -- the drum-kit mapping.
+
+    A rhythm set is not a multisample of one instrument, it is 61 unrelated
+    instruments side by side. Widening a span the way key_ranges() does would
+    make the kick sound for several semitones around C2, transposed, and would
+    silence whichever neighbour it displaced. Setting loNote == hiNote ==
+    rootNote also guarantees no pitch shift is ever applied: the played note
+    always equals the sample's root.
+    """
+    return [(k, k, k) for k in sorted(set(zone_keys))]
+
+
+def spans_for(meta, zone_keys):
+    """Key spans appropriate to what this preset is: a kit or a patch."""
+    if meta.get("kind") == "rhythm":
+        return rhythm_key_spans(zone_keys)
+    return key_ranges(zone_keys)
+
+
 def vel_ranges(n_layers):
     """Tile 1..127 across `n_layers` contiguous, non-overlapping bands.
 
@@ -896,6 +916,14 @@ def build_effects(meta, cal):
     fx = meta["effects"]
     rv, ch = fx["reverb"], fx["chorus"]
 
+    # A rhythm set has no effect block at all. Unlike a patch -- where an
+    # effect is deliberately kept even at level 0 so the UI knob still works
+    # -- a drum kit is rendered dry with nothing to expose, and it declares
+    # that with the type "Off", which is not one of the JV's eight reverb
+    # names. Emitting no effects here is the accurate answer, not a fallback.
+    if rv["type"] == "Off" and ch["type"] == "Off":
+        return []
+
     if rv["type"] not in REVERB_NAMES:
         raise ValueError(f"unknown reverb type {rv['type']!r}")
     rtype = REVERB_NAMES.index(rv["type"])
@@ -1110,7 +1138,7 @@ def build_dspreset(meta, cal, sample_prefix):
         group_el.set("output2Volume", f"{_reverb_send_level(meta, cal)[0]:.4f}")
 
     by_key = _group_zones_by_key(zones)
-    for key, lo, hi in key_ranges(by_key.keys()):
+    for key, lo, hi in spans_for(meta, by_key.keys()):
         layer_zones = sorted(by_key[key], key=lambda z: z["velocity"])
         for z, (vlo, vhi) in zip(layer_zones, zone_vel_range(layer_zones)):
             attrs = {
@@ -1241,7 +1269,7 @@ def build_sfz(meta, sample_prefix):
 
     zones = _valid_zones(meta)
     by_key = _group_zones_by_key(zones)
-    for key, lo, hi in key_ranges(by_key.keys()):
+    for key, lo, hi in spans_for(meta, by_key.keys()):
         layer_zones = sorted(by_key[key], key=lambda z: z["velocity"])
         for z, (vlo, vhi) in zip(layer_zones, zone_vel_range(layer_zones)):
             lines.append("<region>")

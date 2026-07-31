@@ -1172,3 +1172,99 @@ def test_missing_voice_block_is_harmless():
     root = parse(meta, _cal_with_ir())
     assert root.find("./tags") is None
     assert find1(root, ".//group").get("glideTime") is None
+
+
+# ---------------------------------------------------------------------------
+# Rhythm sets (drum kits)
+#
+# A kit is not a multisample of one instrument, so the mapping rules invert:
+# every sample owns exactly one key and is never transposed. These tests pin
+# that down, because the failure mode is silent -- a kit emitted with patch
+# rules still loads and still makes noise, it just plays a transposed kick
+# across several semitones and drops whichever neighbour it covered.
+# ---------------------------------------------------------------------------
+
+def _rhythm_meta(keys=(36, 38, 42), layers=2):
+    zones = []
+    for k in keys:
+        for i in range(layers):
+            lo = 1 + i * (127 // layers)
+            hi = (i + 1) * (127 // layers) if i < layers - 1 else 127
+            zones.append({
+                "key": k, "velocity": (lo + hi) // 2, "layer": i + 1,
+                "lovel": lo, "hivel": hi, "frames": 4800,
+                "file": f"{k}_v{i + 1}.flac", "kind": "decaying",
+                "loop": {"enabled": False}, "release": 0.1 * (k - 35),
+            })
+    return {
+        "name": "Kit", "bank": "Internal", "index": 0, "sample_rate": 48000,
+        "kind": "rhythm",
+        "effects": {
+            "reverb": {"type": "Off", "level": 0, "time": 0, "feedback": 0},
+            "chorus": {"type": "Off", "level": 0, "depth": 0, "rate": 0,
+                       "feedback": 0, "output": "Mix"},
+            "reverb_send": [0, 0, 0, 0], "chorus_send": [0, 0, 0, 0],
+            "tone_level": [127, 0, 0, 0], "bend_up": 0, "bend_down": 0,
+        },
+        "voice": {"key_assign": "Poly", "solo_legato": False,
+                  "portamento": False, "portamento_time": 0,
+                  "portamento_mode": "Normal"},
+        "lfo1": {"stripped": False, "reason": "rhythm set", "form": "TRI",
+                 "rate": 0, "delay": 0, "sync": 0, "pitch": 0, "tvf": 0, "tva": 0},
+        "lfo2": {"stripped": False, "reason": "rhythm set", "form": "TRI",
+                 "rate": 0, "delay": 0, "sync": 0, "pitch": 0, "tvf": 0, "tva": 0},
+        "zones": zones,
+    }
+
+
+def test_rhythm_key_spans_cover_only_their_own_key():
+    assert ep.rhythm_key_spans([36, 38, 42]) == [(36, 36, 36), (38, 38, 38), (42, 42, 42)]
+
+
+def test_spans_for_dispatches_on_kind():
+    keys = [36, 38, 42]
+    assert ep.spans_for({"kind": "rhythm"}, keys) == ep.rhythm_key_spans(keys)
+    assert ep.spans_for({}, keys) == ep.key_ranges(keys)
+
+
+def test_patch_spans_would_widen_but_rhythm_spans_do_not():
+    """The distinction this whole path exists for."""
+    patch_spans = ep.key_ranges([36, 38, 42])
+    # A patch tiles the whole keyboard from its sampled keys...
+    assert patch_spans[0][1] == 0 and patch_spans[-1][2] == 127
+    # ...a kit does not extend past the keys that actually have samples.
+    kit_spans = ep.rhythm_key_spans([36, 38, 42])
+    assert all(lo == hi == key for key, lo, hi in kit_spans)
+
+
+def test_rhythm_preset_maps_one_key_per_sample_and_never_transposes(tmp_path):
+    meta = _rhythm_meta()
+    cal = json.loads(CALIB_PATH.read_text())
+    root = ET.fromstring(ep.build_dspreset(meta, cal, "000_Kit"))
+    samples = root.findall(".//sample")
+    assert len(samples) == 6
+    for s in samples:
+        # Equal loNote/hiNote/rootNote is what guarantees no pitch shift: the
+        # played note is always the sample's own root.
+        assert s.get("loNote") == s.get("hiNote") == s.get("rootNote")
+    assert {int(s.get("rootNote")) for s in samples} == {36, 38, 42}
+
+
+def test_rhythm_preset_emits_no_effects():
+    """A kit is rendered dry -- measured, not assumed (sweeping all 44 bytes
+    of a rhythm tone never moved the late-tail energy ratio off 0.000)."""
+    meta = _rhythm_meta()
+    cal = json.loads(CALIB_PATH.read_text())
+    assert ep.build_effects(meta, cal) == []
+    root = ET.fromstring(ep.build_dspreset(meta, cal, "000_Kit"))
+    assert root.findall(".//effect") == []
+
+
+def test_rhythm_preset_keeps_per_zone_release():
+    """Releases must NOT be equalised across a kit: a crash and a kick have
+    genuinely different tails."""
+    meta = _rhythm_meta()
+    cal = json.loads(CALIB_PATH.read_text())
+    root = ET.fromstring(ep.build_dspreset(meta, cal, "000_Kit"))
+    releases = {s.get("release") for s in root.findall(".//sample")}
+    assert len(releases) == 3
