@@ -129,3 +129,39 @@ machinery item 2 needs for bar-aligned phrase loops -- do them together.
 Cost is low: `postprocess --reloop` recomputes loop points from the encoded
 FLACs with no re-render, the same route used to apply the release fix.
 
+## 5. DecentSampler lists presets in its own order -- NOT FIXABLE from here
+
+Reported: presets in a loaded .dslibrary appear in the File Browser in no
+useful order. They can be stepped through in order once the library is
+loaded; it is the browser listing that is scrambled.
+
+This is DecentSampler's behaviour, not ours. Measured on
+"JV-880 Internal part1of6":
+
+  - the archive stores presets in perfect order: A00, A01, A02, A03 ...
+  - the File Browser shows: A16, A28, A05, A31, A20, A12, A11, A06 ...
+
+Those names are already zero-padded and sort correctly, so this is neither a
+filename-sort problem nor an archive-order problem. DecentSampler is using
+neither.
+
+Nothing in the format offers a lever:
+
+  - no manifest. A commercial library (ASIMOV v1.0) contains only presets,
+    Samples/ and background.png -- the same shape as ours.
+  - no ordering attribute in the preset XML. ASIMOV's root element is a bare
+    <DecentSampler>.
+  - no naming convention that helps. ASIMOV uses UNPADDED names ("1 - Off
+    World", "10 - Moog Town", "2 - Foundation"), so a commercial vendor has
+    the same issue and has not solved it either.
+
+A three-digit preset index was tried and REVERTED. It would give the chunker
+tidier boundaries -- with two digits, chunk membership is lexicographic, which
+is why Pop's patch 23 sits in part 3 of 5 -- but it does nothing for the
+browser listing, and re-emitting into an already-rendered tree would leave
+stale two-digit presets beside new three-digit ones for the chunker to
+package twice.
+
+If this is ever worth pursuing, it is a request to the DecentSampler author,
+not a change to this repository.
+

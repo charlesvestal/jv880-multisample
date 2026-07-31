@@ -1448,6 +1448,16 @@ def main():
         # "SR-JV80-04 Vintage Synth00 Prologue" for all 255 presets, where the
         # index also runs straight into the board name. Drop the redundant
         # prefix in that case and lead with the index.
+        #
+        # Two digits, deliberately left alone. A three-digit index would make
+        # filename order match patch order (a two-digit index sorts as 0..9,
+        # 10, 100, 101, ..., 11, 110), which would give the CHUNKER tidier
+        # boundaries. It does NOT fix how DecentSampler lists presets: its
+        # File Browser shows them in an order of its own, ignoring both
+        # filename order and archive order -- measured, see docs/DEFERRED.md.
+        # Changing the padding now would also leave stale two-digit presets
+        # beside new three-digit ones in any already-rendered tree, and the
+        # chunker would package both.
         bank = str(meta["bank"])
         prefix = "" if bank == out_root.name else bank
         sep = "" if prefix else ""
