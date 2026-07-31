@@ -103,3 +103,10 @@ target_compile_options(probe_rhythm PRIVATE ${JV_WARN_FLAGS})
 add_executable(render_waves tools/render_waves.cpp)
 target_link_libraries(render_waves jv_render)
 target_compile_options(render_waves PRIVATE ${JV_WARN_FLAGS})
+
+# Single-patch diagnostic with byte overrides (tools/probe_patch.cpp): renders
+# one patch, optionally with individual patch/tone bytes changed, to identify
+# which parameter is responsible for an observed behaviour.
+add_executable(probe_patch tools/probe_patch.cpp)
+target_link_libraries(probe_patch jv_render)
+target_compile_options(probe_patch PRIVATE ${JV_WARN_FLAGS})

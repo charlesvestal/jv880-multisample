@@ -117,6 +117,9 @@ int main(int argc, char **argv) {
     // patches. They are a separate ROM region, so they are a separate
     // pass rather than extra entries in the patch list.
     bool do_rhythm = false;
+    // Diagnostic overrides for the sampling grid. The default C1-C7 window
+    // assumes every patch sounds there, which nothing in the ROM guarantees.
+    int lokey_override = -1, hikey_override = -1, velocity_override = -1;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--roms") && i + 1 < argc) {
@@ -137,6 +140,12 @@ int main(int argc, char **argv) {
             hold_seconds = atof(argv[++i]);
         } else if (!strcmp(argv[i], "--dump-voice")) {
             dump_voice = true;
+        } else if (!strcmp(argv[i], "--lokey") && i + 1 < argc) {
+            lokey_override = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--hikey") && i + 1 < argc) {
+            hikey_override = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--velocity") && i + 1 < argc) {
+            velocity_override = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--rhythm")) {
             do_rhythm = true;
         } else if (!strcmp(argv[i], "--list")) {
@@ -385,6 +394,8 @@ int main(int argc, char **argv) {
 
     GridSpec grid;
     if (hold_seconds > 0.0) grid.hold_seconds = hold_seconds;
+    if (lokey_override >= 0) grid.lokey = lokey_override;
+    if (hikey_override >= 0) grid.hikey = hikey_override;
     if (!r.init(roms)) {
         fprintf(stderr, "emulator init failed\n");
         return 1;
@@ -415,6 +426,45 @@ int main(int argc, char **argv) {
         LfoDecision d1 = decide_lfo_strip(pr.data, 1);
         LfoDecision d2 = decide_lfo_strip(pr.data, 2);
         std::vector<uint8_t> bytes = preprocess(pr.data, d1, d2);
+
+        // A patch whose sound is ENTIRELY WET cannot be rendered dry.
+        //
+        // preprocess() zeroes reverb and chorus level so the samples carry no
+        // effect and DecentSampler can rebuild it. That assumes the patch has
+        // a dry component. SR-JV80-01's "Snow Bells" has none: its dry output
+        // is digital silence and everything audible is the effect return.
+        // Zeroing reverb OR chorus alone leaves it sounding; zeroing both, as
+        // preprocess does, leaves nothing at all -- the patch rendered silent
+        // across every key from 0 to 127 at velocity 127.
+        //
+        // For such a patch the effects are BAKED IN instead, since a patch
+        // that sounds with its own reverb is worth far more than 75 files of
+        // silence. Detected by rendering one loud note and checking: costs a
+        // single extra note per patch, and only 1 of 4,197 needs the
+        // fallback.
+        bool effects_baked = false;
+        {
+            r.load_patch_bytes(bytes, grid);
+            std::vector<int16_t> t = r.render_note(60, 127, grid);
+            bool dry_sounds = false;
+            for (int16_t v : t) if (std::abs((int)v) > 64) { dry_sounds = true; break; }
+            if (!dry_sounds) {
+                std::vector<uint8_t> wet(pr.data, pr.data + PATCH_SIZE);
+                r.load_patch_bytes(wet, grid);
+                std::vector<int16_t> w = r.render_note(60, 127, grid);
+                for (int16_t v : w) {
+                    if (std::abs((int)v) > 64) {
+                        effects_baked = true;
+                        bytes = wet;
+                        fprintf(stderr,
+                                "%03d_%s: silent when rendered dry -- baking its "
+                                "effects in instead (wholly-wet patch)\n",
+                                (int)pi, pr.name.c_str());
+                        break;
+                    }
+                }
+            }
+        }
 
         // Adaptive velocity layers: derive this patch's own layer count and
         // boundaries from its tones' velocity-switch points (jv_patch.h),
@@ -447,6 +497,7 @@ int main(int argc, char **argv) {
                 // place) -- simple, deterministic, and centered so a
                 // single sample best represents the whole band it covers.
                 int velocity = region.lo + (region.hi - region.lo) / 2;
+                if (velocity_override >= 0) velocity = velocity_override;
 
                 std::vector<int16_t> pcm = r.render_note(key, velocity, grid);
                 int frames = (int)(pcm.size() / 2);
@@ -500,8 +551,10 @@ int main(int argc, char **argv) {
             "  \"zones\": [%s]\n"
             "}\n",
             json_escape(pr.name).c_str(), json_escape(pr.bank).c_str(), pr.index, SAMPLE_RATE,
-            reverb_type_name(fx.reverb_type), fx.reverb_level, fx.reverb_time, fx.reverb_feedback,
-            chorus_type_name(fx.chorus_type), fx.chorus_level, fx.chorus_depth, fx.chorus_rate,
+            effects_baked ? "Off" : reverb_type_name(fx.reverb_type),
+            fx.reverb_level, fx.reverb_time, fx.reverb_feedback,
+            effects_baked ? "Off" : chorus_type_name(fx.chorus_type),
+            fx.chorus_level, fx.chorus_depth, fx.chorus_rate,
             fx.chorus_feedback, fx.chorus_output ? "Reverb" : "Mix",
             fx.reverb_send[0], fx.reverb_send[1], fx.reverb_send[2], fx.reverb_send[3],
             fx.chorus_send[0], fx.chorus_send[1], fx.chorus_send[2], fx.chorus_send[3],

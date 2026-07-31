@@ -280,6 +280,16 @@ def main() -> None:
                 errors.append(
                     f"{pdir.name}: {n // EXPECTED_KEYS} velocity layers, "
                     f"expected {MIN_LAYERS}-{MAX_LAYERS}")
+            # A patch in which EVERY zone is silent produces nothing at all,
+            # anywhere on the keyboard. One shipped that way -- SR-JV80-01's
+            # "Snow Bells", whose sound is entirely wet, so zeroing reverb and
+            # chorus to render it dry left digital silence. Nothing caught it:
+            # each zone was individually valid, just empty.
+            playable = [z for z in zones if z.get("kind") not in ("missing", "error")]
+            if playable and all(z.get("kind") == "silent" for z in playable):
+                errors.append(
+                    f"{pdir.name}: every one of its {len(playable)} zones is "
+                    f"silent -- this preset makes no sound at all")
             check_release_consistency(pdir, meta)
             l, t, s, sus = check_audio(pdir, meta)
             looped += l
